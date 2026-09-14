@@ -66,3 +66,32 @@ evidence, not on whether the author shows up.
 
 `docs/docs/governance/delivery.mdx`: new rows for *Merge bar — value + diff accepted* (**have**,
 CI) and *Contributor onboarding* (**have**, templates + CI).
+
+## Amended 2026-09-14 (DEC-2026-09-14-7) — D9 retired; the label leaves the merge bar
+
+**This section amends the Decision above; the text above is left as the July record.**
+
+`state: value-signed` is no longer a term of the merge card. The bar is now:
+
+- **runtime PR** — `value-fsm` GREEN on the head sha **and** a fresh non-author diff approval
+- **non-runtime PR** — a fresh non-author diff approval; `value-fsm` is absent for these (its path
+  filter does not match them) and that is fine, but a **RED** `value-fsm` still blocks — if the two
+  runtime classifications disagree we fail closed
+
+**Why.** The July decision predates NBO's uniform PR contract (`DEC-2026-09-01-2`), under which
+every PR already carries a posted non-author reviewer PASS before it can merge. Against that
+contract the label added a second human stamp on top of the review for runtime PRs — and for
+docs/CI PRs it *was* the whole value bar: with no `pr-value` leg to be green, a non-runtime PR
+merged on the CEO's label alone, which put the scarcest human input on the changes least able to
+justify spending it, and made the CEO a single point of blockage for documentation.
+
+**What is unchanged.** `value-fsm` is still never waived by anything. The four-state verdict
+(absent / pending / success / failure) and the bounded wait for a terminal read (#655) are
+unchanged. The diff row is unchanged, maintainer self-review included. The acceptance row (#712)
+is unchanged. `labeled`/`unlabeled` remain workflow triggers — re-firing the card on a label
+change is harmless and keeps the card fresh.
+
+Implemented in `merge-card-gate.mjs` by the exported pure `valueRow` (the value verdict) and
+`freshApproval` (the diff scan, now shared with the release-time gate so both ends of the pipe
+read the same fact). See the sibling amendment in
+[ADR-0029](0029-release-witness-and-value-gates-enforced.md).
