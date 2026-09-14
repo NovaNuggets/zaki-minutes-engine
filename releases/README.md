@@ -68,7 +68,10 @@ Release happens before the witness pass is signed.
    version)`. If those diverge, the receipt is describing a release that isn't the one shipping.
 
 3. **Promote** — dispatch `release-validate` with `promote: true`. Two gates run first:
-   - **`value-gate`** (guarantee 8) — every batch PR is `pr-value`-green on its head or `state: value-signed`.
+   - **`value-gate`** (guarantee 8) — every batch PR is `pr-value`-green on its head, or — for a PR
+     touching no runtime surface — merged gates-green with a non-author approval on its merged head
+     (or a maintainer author). D9's `state: value-signed` label is no longer a term: retired
+     2026-09-14, `DEC-2026-09-14-7`.
    - **`witness-gate`** (guarantee 7) — `releases/vX.Y.Z/witness.json` is present, well-formed, version-matched.
 
    Then the `promote` job pauses on the **`release-promote` Environment** for the owner's approval.

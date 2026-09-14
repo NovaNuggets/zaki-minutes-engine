@@ -15,6 +15,8 @@ import {
   waitForTerminalValueFsm,
   openAcceptanceLegs,
   acceptanceFromIssues,
+  valueRow,
+  freshApproval,
 } from "./merge-card-gate.mjs";
 
 const run = (o) => ({ name: "value-fsm", started_at: "2026-07-16T20:07:14Z", ...o });
@@ -166,4 +168,61 @@ test("precision control: an unchecked box OUTSIDE the Acceptance section does no
   ].join("\n");
   assert.equal(openAcceptanceLegs(body), 0);
   assert.equal(acceptanceFromIssues([{ number: 903, body }]).ok, true);
+});
+
+// ── the merge bar after D9 retired (DEC-2026-09-14-7) ───────────────────────────────────────────
+//
+// The `state: value-signed` label is no longer a term of the card. The bar is: runtime PRs need
+// value-fsm green on head plus a reviewed diff; non-runtime PRs need the reviewed diff alone
+// (value-fsm absent is expected — pr-value's path filter does not match them — but a RED one still
+// blocks, because that means the two runtime classifications disagree and we fail closed).
+
+test("D9 retired: non-runtime PR, non-author approval, NO label → mergeable", () => {
+  const value = valueRow({ runtime: false, vf: "absent" });
+  assert.equal(value.ok, true, "no label is needed for the value row any more");
+  const by = freshApproval(
+    [{ state: "APPROVED", user: { login: "reviewer" }, commit_id: "headsha" }],
+    "author",
+    "headsha",
+  );
+  assert.equal(by, "reviewer");
+  assert.equal(value.ok && !!by, true); // the card's verdict: both rows accepted, nothing closed
+});
+
+test("D9 retired: runtime PR with RED value-fsm and an approval → NOT mergeable (nothing waives value-fsm)", () => {
+  const value = valueRow({ runtime: true, vf: "failure" });
+  assert.equal(value.ok, false);
+  assert.match(value.why, /nothing waives it/);
+  const by = freshApproval([{ state: "APPROVED", user: { login: "reviewer" }, commit_id: "headsha" }], "author", "headsha");
+  assert.equal(by, "reviewer");           // the diff row is green …
+  assert.equal(value.ok && !!by, false);  // … and the card is still red on value
+});
+
+test("runtime PR, value-fsm green → value row accepted; pending/absent still block", () => {
+  assert.equal(valueRow({ runtime: true, vf: "success" }).ok, true);
+  for (const vf of ["pending", "absent"]) {
+    const r = valueRow({ runtime: true, vf });
+    assert.equal(r.ok, false, `${vf} must not be read as accepted`);
+    assert.match(r.why, new RegExp(`still ${vf}`));
+  }
+});
+
+test("non-runtime PR with a RED value-fsm blocks (classification disagreement fails closed)", () => {
+  const r = valueRow({ runtime: false, vf: "failure" });
+  assert.equal(r.ok, false);
+  assert.match(r.why, /never waived/);
+});
+
+test("freshApproval: a stale approval (older head), a self-approval, and a later CHANGES_REQUESTED all fail", () => {
+  const stale = [{ state: "APPROVED", user: { login: "reviewer" }, commit_id: "oldsha" }];
+  assert.equal(freshApproval(stale, "author", "headsha"), null);
+  const self = [{ state: "APPROVED", user: { login: "author" }, commit_id: "headsha" }];
+  assert.equal(freshApproval(self, "author", "headsha"), null);
+  const flipped = [
+    { state: "APPROVED", user: { login: "reviewer" }, commit_id: "headsha" },
+    { state: "CHANGES_REQUESTED", user: { login: "reviewer" }, commit_id: "headsha" },
+  ];
+  assert.equal(freshApproval(flipped, "author", "headsha"), null); // latest review per user wins
+  const commentedOnly = [{ state: "COMMENTED", user: { login: "reviewer" }, commit_id: "headsha" }];
+  assert.equal(freshApproval(commentedOnly, "author", "headsha"), null);
 });

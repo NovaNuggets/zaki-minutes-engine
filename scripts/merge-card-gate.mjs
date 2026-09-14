@@ -2,12 +2,19 @@
 // on different axes; MAIN accepts it only when BOTH are accepted (delivery constitution, merge bar):
 //
 //   • VALUE accepted  — the observation bundle is real. Runtime PRs: `value-fsm` (pr-value L3)
-//     GREEN on the head sha AND `state: value-signed` (the D9 human sign-off). Non-runtime PRs
-//     (no pr-value leg): `state: value-signed` alone. Because `labeled` also re-triggers value-fsm,
-//     its newest run on head is often still non-terminal when the card fires: the card WAITS for a
-//     terminal verdict (success/failure) rather than reading an in-flight run as failure (#655). A
-//     value-fsm that never settles within the wait budget stays not-mergeable — a label can never
-//     waive value-fsm; success must be positively observed.
+//     GREEN on the head sha. Non-runtime PRs have no pr-value leg, so an ABSENT value-fsm is fine
+//     for them — but a RED one still blocks (fail closed when the classifications disagree). The
+//     head's newest value-fsm run is often still non-terminal when the card fires, so on a runtime
+//     PR the card WAITS for a terminal verdict (success/failure) rather than reading an in-flight
+//     run as failure (#655); a value-fsm that never settles within the wait budget stays
+//     not-mergeable — nothing waives value-fsm, success must be positively observed.
+//
+//     D9 RETIRED 2026-09-14 (DEC-2026-09-14-7): the `state: value-signed` human sign-off is no
+//     longer a term of this gate. The July constitution predates the uniform PR contract
+//     (DEC-2026-09-01-2) under which every PR already carries a non-author reviewer PASS; under
+//     D9 a docs/CI PR needed nothing but that label, which made the label the whole bar for the
+//     changes least able to justify it. The common merge bar is value-fsm (where it applies) plus
+//     the reviewed diff below.
 //   • DIFF accepted   — the code was reviewed. Either the PR author is a MAINTAINER (holds the
 //     commit bit — a maintainer reviewing their own work is allowed; the mandatory-review rule is
 //     the quality gate for CONTRIBUTOR PRs), OR a GitHub review APPROVAL from a NON-AUTHOR whose
@@ -124,7 +131,7 @@ export async function waitForTerminalValueFsm(
 // maintainer's own PR does not require a separate non-author review: the mandatory-review rule is
 // the quality gate for CONTRIBUTOR PRs, not for a maintainer reviewing their own work (D-R0 — a
 // maintainer's exclusive authorities are the ready-stamp and the merge).
-function authorIsMaintainer(login) {
+export function authorIsMaintainer(login) {
   if (!login) return false;
   try {
     const p = ghj(`repos/${REPO}/collaborators/${login}/permission`);
@@ -135,20 +142,29 @@ function authorIsMaintainer(login) {
 // DIFF accepted when EITHER the author is a maintainer (self-review, above) OR a fresh, non-author
 // APPROVED review exists: the reviewer's latest review is APPROVED and was submitted against the
 // current head sha (a later push moves the head and invalidates the approval).
-function diffAccepted(pr) {
-  const author = pr.user?.login;
-  if (authorIsMaintainer(author)) return { ok: true, maintainer: true };
-  const head = pr.head?.sha;
-  const reviews = ghj(`repos/${REPO}/pulls/${pr.number}/reviews?per_page=100`);
+// The review scan, pure over a reviews array: is there a FRESH non-author approval on `head`?
+// Each reviewer's LATEST review wins (a later CHANGES_REQUESTED or DISMISSED cancels their earlier
+// approval); COMMENTED is not a verdict and is ignored. Returns the approving login, or null.
+// Exported because the release-time value gate re-derives the same fact on merged PRs — since D9
+// retired (DEC-2026-09-14-7) the approval IS the bar for non-runtime changes, so both ends of the
+// pipe must read it identically.
+export function freshApproval(reviews, author, head) {
   const latestByUser = new Map();
-  for (const r of reviews) {
+  for (const r of reviews || []) {
     if (!["APPROVED", "CHANGES_REQUESTED", "DISMISSED"].includes(r.state)) continue; // ignore COMMENTED
     latestByUser.set(r.user?.login, r);
   }
   for (const [login, r] of latestByUser) {
-    if (login && login !== author && r.state === "APPROVED" && r.commit_id === head) return { ok: true, by: login };
+    if (login && login !== author && r.state === "APPROVED" && r.commit_id === head) return login;
   }
-  return { ok: false };
+  return null;
+}
+
+function diffAccepted(pr) {
+  const author = pr.user?.login;
+  if (authorIsMaintainer(author)) return { ok: true, maintainer: true };
+  const by = freshApproval(ghj(`repos/${REPO}/pulls/${pr.number}/reviews?per_page=100`), author, pr.head?.sha);
+  return by ? { ok: true, by } : { ok: false };
 }
 
 // The Acceptance SECTION of an issue body: from the first heading matching /acceptance/i to the
@@ -230,25 +246,35 @@ function readClosingIssues(num) {
   throw last;
 }
 
+// The VALUE row, pure over the PR's runtime classification and the value-fsm verdict on head.
+// Runtime PRs must positively show value-fsm green — absent/pending/failure all block, and nothing
+// waives it. Non-runtime PRs have no pr-value leg (its path filter does not match them), so absent
+// is the expected reading and passes; a RED value-fsm on a PR we classified non-runtime means the
+// two classifications disagree, and it blocks — fail closed.
+export function valueRow({ runtime, vf }) {
+  if (runtime) {
+    if (vf === "success") return { ok: true, why: "value-fsm green on head" };
+    if (vf === "pending" || vf === "absent")
+      return { ok: false, why: `value-fsm did not reach a terminal verdict on head within the wait budget (still ${vf}) — value-fsm must be green, nothing waives it` };
+    return { ok: false, why: "value-fsm is RED on head — value-fsm must be green, nothing waives it" };
+  }
+  if (vf === "failure") return { ok: false, why: "value-fsm is RED on head — a red value-fsm is never waived, even on a PR classified non-runtime" };
+  return { ok: true, why: vf === "success" ? "non-runtime PR, value-fsm green anyway" : "non-runtime PR — no pr-value leg; the reviewed diff carries the bar" };
+}
+
 async function card(num, { readClosing = readClosingIssues } = {}) {
   const pr = ghj(`repos/${REPO}/pulls/${num}`);
   if (pr.draft) return { num, ok: true, skip: "draft" };
-  const labels = (pr.labels || []).map((l) => l.name);
-  const signed = labels.includes("state: value-signed");
   const head = pr.head?.sha;
   const runtime = touchesRuntime(num);
-  // Only a runtime PR has a value-fsm leg, and only then do we pay the wait. A non-terminal
-  // value-fsm is waited out to its real verdict rather than sampled once mid-run (the #655 race).
-  const vf = runtime && head ? await waitForTerminalValueFsm(head) : "absent";
+  // Only a runtime PR has a value-fsm leg, and only then do we pay the wait: its non-terminal run
+  // is waited out to its real verdict rather than sampled once mid-run (the #655 race). A
+  // non-runtime PR gets ONE read (attempts: 1, no sleep) — absent is the expected answer and is
+  // fine, we only need to notice a RED one.
+  const vf = head ? await waitForTerminalValueFsm(head, runtime ? {} : { attempts: 1 }) : "absent";
 
   // VALUE
-  let valueOk = false, valueWhy;
-  if (!signed) valueWhy = "missing `state: value-signed` (the value sign-off)";
-  else if (runtime && vf === "success") { valueOk = true; valueWhy = "value-fsm green + value-signed"; }
-  else if (runtime && (vf === "pending" || vf === "absent"))
-    valueWhy = `value-signed but value-fsm did not reach a terminal verdict on head within the wait budget (still ${vf}) — value-fsm must be green (a label cannot waive it)`;
-  else if (runtime) valueWhy = `value-signed but value-fsm is ${vf} on head — value-fsm must be green (a label cannot waive it)`;
-  else { valueOk = true; valueWhy = "non-runtime + value-signed"; }
+  const { ok: valueOk, why: valueWhy } = valueRow({ runtime, vf });
 
   // DIFF
   const d = diffAccepted(pr);

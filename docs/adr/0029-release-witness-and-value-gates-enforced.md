@@ -73,3 +73,14 @@ against the real v0.12.3 batch (5/5 accepted) and the v0.12.4 batch (all heads `
 
 `docs/docs/governance/delivery.mdx` enforcement map: rows D9/D10/D15 move from **TO BUILD** to
 **have (CI)** for the release-time gates, with a pointer to this ADR.
+
+## Amended 2026-09-14 (DEC-2026-09-14-7) — D9 retired; `value-gate` drops the label term
+
+`value-gate` (item 3 above) no longer accepts a batch change on `state: value-signed`. A change is
+accepted when `value-fsm` is green on its head sha (runtime), or — for a PR touching no runtime
+surface — it merged through the full `gates` suite **and** its diff was accepted at merge: a fresh
+non-author approval on the merged head, or a maintainer author, the same rule the merge card
+applies (`scripts/merge-card-gate.mjs` `freshApproval`). A RED `value-fsm` is still never waived.
+Reason and detail: [ADR-0030](0030-merge-card-value-and-diff-gate.md) §Amended 2026-09-14 — the
+July constitution predates NBO's uniform PR contract (`DEC-2026-09-01-2`), and under D9 a docs/CI
+change entered a release batch on the CEO's label alone.

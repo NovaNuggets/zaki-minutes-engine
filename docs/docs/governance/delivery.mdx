@@ -57,7 +57,7 @@ one arc, and each arc has a gate.
                     │  6. PROVE (D8 · D9 · D10 · D12│  non-author witnesses value; channels
                     │     ) + SECURE (D-S)          │  corroborate; diff passes review+security
                     └───────────────┬───────────────┘
-                                    │  value-signed + acceptance floor met
+                                    │  value + diff accepted, acceptance floor met
                     ┌───────────────▼───────────────┐
                     │  7. RELEASE   (D15)           │  batch signed PRs → ship → credit signers
                     └───────────────┬───────────────┘
@@ -342,8 +342,13 @@ so the human's observation carries no distinctive authority — it is harnessed 
 as every other channel**: a green PR requires the channels to *corroborate*, not the human to
 *assert*, and a human/instrument divergence is a first-class finding that blocks merge until
 reconciled. · *Source:* triangulation / converging evidence; segregation of duties; no single
-oracle. · *Gate:* `gate:value-signed` — green only on a non-author attestation whose multichannel
-bundle is internally consistent. **[TO BUILD: value-gate bot]**
+oracle. · *Gate:* the `merge-card` required check — a fresh non-author review approval on the head
+sha, plus `value-fsm` green where there is a runtime surface to be green about.
+**[AMENDED 2026-09-14 (`DEC-2026-09-14-7`): D9's `state: value-signed` label is retired as a gate
+term.** It predated the uniform PR contract under which every PR already carries a non-author
+reviewer PASS; for a docs/CI PR with no `pr-value` leg the label *was* the whole value bar, which
+spent the scarcest human input on the changes least able to justify it. The non-author requirement
+survives in the diff approval; multichannel corroboration of the attestation remains **TO BUILD**.]
 
 **D10 — Acceptance is a pre-declared experiment that guarantees merge — a floor, never a ceiling
 on value.** Each issue publishes observations that, if presented, **guarantee** the PR merges — a
@@ -431,8 +436,9 @@ production-critical, `good-first` only when truly zero-prerequisite.**
 | flags | `P0` · `good-first` | strict meanings; never inflate |
 
 Invariants the bots enforce: one `state:` at all times; illegal transitions reverted; `ready`
-maintainer-only on a passing template check; `claimed` only with a live lease; a PR merges only if
-its issue is `value-signed` + security green; `incoming` >3 days alarms; `needs-info` quiet 14
+maintainer-only on a passing template check; `claimed` only with a live lease; a PR merges only on
+a green `merge-card` (non-author approval, `value-fsm` green where it applies) + security green;
+`incoming` >3 days alarms; `needs-info` quiet 14
 days → proposed `declined: stale`; every closed-without-merge issue carries one `declined:` reason.
 
 ## 10. Release and closure
@@ -523,7 +529,7 @@ Every open issue carries exactly one `state:` label:
 | `state: ready` | Maintainer-stamped — claimable now |
 | `state: claimed` | Someone is on it (heartbeat lease, D14b: renew by activity; ~4h silence releases) |
 | `state: awaiting-evaluation` | Delivered — waiting for a non-author to validate the value live |
-| `state: value-signed` | A non-author witnessed the value; merge proceeds |
+| `state: value-signed` | A non-author witnessed the value — the issue's lifecycle state. Since `DEC-2026-09-14-7` it is a record, not a gate: the merge bar is the `merge-card` check |
 | `state: accepted` | Feature acknowledged into the queue, not yet prepared |
 | `state: incident-thread` | User-facing thread of a hosted/ops incident — open for the reporter; fix tracked in the ops lane |
 | `state: needs-info` | A real, dated question pending; ~14 quiet days → honest stale-close |
@@ -1042,9 +1048,9 @@ silence is released, never punished · every decline names its reopen condition 
 | D-L4 human placement — exactly twice + rehearsal | agent-rehearsable probe is the rehearsal; choke point 2 names the witness moment | **have** (choke point 2 named) / **TO BUILD** (#690 agent-rehearsable probe) |
 | D8 bundle + diff | PR template requires the observation bundle | **have** (`.github/pull_request_template.md`) |
 | D-S security lanes | contributor security status + maintainer bundle | **TO BUILD** (status) / **have** (maintainer practice) |
-| D9 value-signed, corroborated | `gate:value-signed` checks non-author + channel consistency (merge-time) · **release-time:** `value-gate` requires every batch PR pr-value-green/value-signed | **have** (CI: `merge-card-gate` merge-time, `release-value-gate` release-time; [ADR-0029](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0029-release-witness-and-value-gates-enforced.md)/[ADR-0030](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0030-merge-card-value-and-diff-gate.md)) |
+| D9 non-author validation, corroborated (label retired `DEC-2026-09-14-7`) | `merge-card` requires a fresh non-author approval + `value-fsm` green where applicable (merge-time) · **release-time:** `value-gate` requires every batch PR pr-value-green, or non-runtime + reviewed at merge · channel-consistency checking still **TO BUILD** | **have** (CI: `merge-card-gate` merge-time, `release-value-gate` release-time; [ADR-0029](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0029-release-witness-and-value-gates-enforced.md)/[ADR-0030](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0030-merge-card-value-and-diff-gate.md)) |
 | D10 acceptance floor | bundle-vs-table check (merge-time) · **release-time:** guarantee line 8 enforced by `value-gate` | **TO BUILD** (bundle checker) / **have** (CI: `release-value-gate`) |
-| Merge bar — value + diff accepted (choke point 1) | `merge-card` required status check: value-fsm green + `state: value-signed` (value) AND a fresh non-author review approval (diff) | **have** (CI: `merge-card-gate`, [ADR-0030](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0030-merge-card-value-and-diff-gate.md)) |
+| Merge bar — value + diff accepted (choke point 1) | `merge-card` required status check: value-fsm green on head for a runtime PR (value) AND a fresh non-author review approval (diff); no label term since `DEC-2026-09-14-7` | **have** (CI: `merge-card-gate`, [ADR-0030](https://github.com/Vexa-ai/vexa/blob/main/docs/adr/0030-merge-card-value-and-diff-gate.md)) |
 | Contributor onboarding — explain the change | PR template + CONTRIBUTING recommend Discord; `pr-welcome` nudges first-timers (recommended, never a gate) | **have** (templates + CI) |
 | D11 both verdicts credited | release-notes generation from bundles | **TO BUILD** |
 | D12 altitude-scaled validation | stated live bar in every prepared issue | **have** (manual review) |
