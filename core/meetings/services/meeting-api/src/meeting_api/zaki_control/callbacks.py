@@ -79,11 +79,11 @@ _REASON_TO_FAILURE_CODE: dict[str, str] = {
 #   prod     1x awaiting_admission_timeout @ awaiting_admission
 #            1x left_alone @ requested
 #
-# `stopped` pre-active is a capture ABANDONED IN THE LOBBY — the sealed user-terminal reason
-# (`lifecycle.stop.classify_user_stop`: "a user stop is NEVER a failure regardless of stage", but
-# the bot FSM has no terminal other than `failed` before `active`, so a pre-active cancellation
-# lands here).  `zaki-control.v1` has no `cancelled` member, so it gets the closest TRUE sealed
-# code: the notetaker was never admitted.  It stays distinguishable from the timeout in
+# `stopped` pre-active is a capture ABANDONED IN THE LOBBY — the sealed user-terminal reason. The
+# engine records that run `completed(stopped)` with the stage it reached (L-0165: a user stop is
+# not a failure), but `zaki-control.v1` reaches `completed` only through `active` and has no
+# `cancelled` member, so the Hub is still told `failed` (`hub_state_for`) with the closest TRUE
+# sealed code: the notetaker was never admitted.  It stays distinguishable from the timeout in
 # `completion_reason`, which the README's diagnostic join surfaces — the sealed code is the
 # user-facing bucket, not the forensic record.  `data['stop_requested']` is NOT used to narrow this
 # further: only 2 of the 5 live `stopped` rows carry it, so it is not a reliable discriminator.
@@ -103,6 +103,27 @@ _SPAWN_REASON_TO_FAILURE_CODE: dict[str, str] = {
 }
 # Stages at which the bot had not reached the meeting yet.
 _PRE_ACTIVE_STAGES = frozenset({"requested", "joining", "awaiting_admission", "runtime_spawn"})
+
+
+def hub_state_for(status: object, data: object) -> object:
+    """The lifecycle state the Hub is told for a meeting row.
+
+    The engine ends a capture the user stopped before admission as ``completed(stopped)`` with the
+    stage it reached in ``failure_stage`` (L-0165: a user stop is not a failure). The sealed
+    ``zaki-control.v1`` graph reaches ``completed`` only through ``active`` (``_ADJACENCY``, pinned
+    by the conformance suite), so forwarded as-is that terminal is refused by the adjacency guard
+    and the Hub's capture never settles. Until the contract gains the edge, the Hub is told what it
+    was told before L-0165 — ``failed`` — and ``failure_code_from_meeting_data`` names the same
+    code (``join_denied``) from the same row. Every other row passes through unchanged.
+    """
+    if (
+        status == "completed"
+        and isinstance(data, dict)
+        and data.get("completion_reason") == "stopped"
+        and data.get("failure_stage") in _PRE_ACTIVE_STAGES
+    ):
+        return "failed"
+    return status
 
 
 def failure_code_from_meeting_data(data: object) -> str | None:
@@ -416,6 +437,7 @@ class ControlCallbackDispatcher:
         capture = await self._store.get_capture_for_meeting(str(meeting_id))
         if capture is None:
             return
+        state = hub_state_for(state, meeting_row.get("data"))
         failure = failure_code_from_meeting_data(meeting_row.get("data"))
         await self.record_capture_status(capture, state=state, failure_code=failure)
 
@@ -433,7 +455,7 @@ class ControlCallbackDispatcher:
         capture = await self._store.get_capture_for_meeting(str(meeting_id))
         if capture is None:
             return
-        state = meeting_row.get("status")
+        state = hub_state_for(meeting_row.get("status"), meeting_row.get("data"))
         if not isinstance(state, str) or state == "requested":
             return
         failure = failure_code_from_meeting_data(meeting_row.get("data"))

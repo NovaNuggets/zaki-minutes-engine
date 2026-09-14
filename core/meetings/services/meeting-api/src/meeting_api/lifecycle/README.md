@@ -35,7 +35,11 @@ parent's FM-003 discipline). `active → joining` (and any re-open of a terminal
   `webhook.v1` `Envelope` (`event_type=meeting.status_change`), validated at the seam.
 - `stop.py` (P3b) — the user-stop path: `request_stop(record, publisher, meeting_id)` sets
   `stop_requested` + publishes the `bot_commands:meeting:{id}` `{action:"leave"}` command;
-  `classify_user_stop` / `stop_event_for` resolve the bot's exit to an ATTRIBUTED terminal.
+  `classify_user_stop` / `stop_event_for` resolve the bot's exit to an ATTRIBUTED terminal —
+  `completed(stopped)` at every stage (L-0165: a user stop is not a failure). Before `active` the
+  bot itself can only report `failed`; `LifecycleSink.apply_change` classifies that off the record's
+  `stop_requested` (read from the durable row by the callback) and keeps the stage reached in
+  `failure_stage`, so the run is never mistaken for one that delivered a meeting (#807).
 - `retry.py` (P3d) — `JoinRetryController` + the transient/permanent taxonomy
   (`classify_retry` / `is_transient`): on a TRANSIENT join-failure schedule a fresh re-spawn (a new
   `meeting_session`) through the runtime scheduler with bounded exponential backoff; a PERMANENT

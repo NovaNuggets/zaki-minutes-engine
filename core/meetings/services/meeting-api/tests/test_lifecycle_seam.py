@@ -1384,16 +1384,21 @@ def _stop_then_destroy(status: str):
     return repo._meetings[m["id"]]
 
 
-def test_user_stop_of_a_never_admitted_bot_is_failed_not_completed():
-    """A bot the user abandoned in the waiting room produced NOTHING. Reporting it `completed` is a
-    silent value failure — the system claiming success for a run with no transcript."""
+def test_user_stop_of_a_never_admitted_bot_is_not_a_failure_and_not_a_bare_completion():
+    """A bot the user abandoned in the waiting room produced NOTHING — but nothing FAILED either: the
+    user cancelled (L-0165). Recording it `failed` counted every lobby cancellation as a product
+    failure (5 of the 10 failures behind L-0020's "1 in 3 captures fail" were exactly this). It lands
+    `completed(stopped)` and KEEPS the stage it reached — #807's invariant — so it is never mistaken
+    for a run that delivered a meeting (a `completed` with no `failure_stage`)."""
     row = _stop_then_destroy("awaiting_admission")
-    assert row["status"] == "failed", (
-        "a bot that was never admitted must not be reported as a completed meeting"
+    assert row["status"] == "completed", (
+        "a capture the user cancelled before admission is not a failed capture (L-0165)"
     )
+    assert row["data"].get("completion_reason") == "stopped"
     assert row["data"].get("failure_stage") == "awaiting_admission", (
-        "the stage the bot actually died in must survive the stop"
+        "the stage the bot actually reached must survive the stop (#807)"
     )
+    assert row["data"].get("stop_requested") is True
 
 
 def test_user_stop_before_admission_is_never_retried():
@@ -1438,3 +1443,93 @@ def test_user_stop_of_a_live_bot_still_completes():
     row = _stop_then_destroy("active")
     assert row["status"] == "completed"
     assert row["data"].get("completion_reason") == "stopped"
+
+
+# ── L-0165: a user stop before admission is NOT a failure — and is told apart from a completion ──
+# #807 fixed the stage being overwritten (a lobby stop laundered into `completed` with the stage
+# lost). Its `failed` half is what L-0165 overturns: the user cancelled, nothing failed, and counting
+# the cancellation as a failure is what made "1 in 3 captures fail" (L-0020) a false statistic. The
+# run lands `completed(stopped)` and KEEPS the stage it reached (#807's real invariant), so it is
+# never mistaken for a run that delivered a meeting. The classification happens at the JOIN — the
+# one in-process entry every terminal flows through — because the bot's sealed FSM cannot express
+# it: before `active` the bot can only report `failed`.
+
+
+def _seed_lobby_stop(status: str = "awaiting_admission"):
+    """Seed a meeting AT `status` with a workload and stop it through the real DELETE route (which
+    keeps the stage and records `stop_requested`, #807). Returns (client, repo, meeting)."""
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
+
+    repo, pub = _ReconcileRepo(), InMemoryCommandPublisher()
+    m = _seed(repo, status=status)
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lobby"
+    client = TestClient(create_app(meeting_repo=repo, command_publisher=pub))
+    r = client.delete("/bots/google_meet/m1", headers={"x-user-id": "1"})
+    assert r.status_code == 200, r.text
+    assert repo._meetings[m["id"]]["status"] == status  # the stage survives the stop (#807)
+    return client, repo, m
+
+
+@pytest.mark.parametrize("status", ["joining", "awaiting_admission"])
+def test_the_bots_own_stopped_callback_after_a_lobby_stop_is_not_a_failure(status):
+    """THE JOIN, on the path prod actually takes. The stop tears the workload down; the bot withdraws
+    its join request and reports the only terminal its sealed FSM has before `active` — `failed` with
+    `completion_reason=stopped` — and it carries NO `stop_requested`: the bot cannot know who sent the
+    SIGTERM. The control plane can: the durable row records the user's intent, and it — not the
+    bot's word — classifies the exit as `completed(stopped)` with the stage kept."""
+    client, repo, m = _seed_lobby_stop(status)
+    r = _post(client, connection_id="sess-uid", status="failed", completion_reason="stopped",
+              failure_stage=status, exit_code=0,
+              reason="stopped while awaiting admission (withdrew the join request)")
+    assert r.status_code == 200, r.text
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "completed", "a capture the user cancelled is not a failed capture"
+    assert row["data"].get("completion_reason") == "stopped"
+    assert row["data"].get("failure_stage") == status, (
+        "the stage the bot reached must survive (#807) — it is what tells this run apart from a "
+        "completion that delivered a meeting"
+    )
+    assert row["data"].get("stop_requested") is True
+    # The bot retries its terminal callback (up to 3x): the SAME `failed(stopped)` again is an
+    # idempotent 200 against the record it just landed — not a 409 for a different terminal.
+    r2 = _post(client, connection_id="sess-uid", status="failed", completion_reason="stopped",
+               failure_stage=status, exit_code=0)
+    assert r2.status_code == 200, r2.text
+    assert repo._meetings[m["id"]]["status"] == "completed"
+
+
+def test_a_stopped_report_without_the_users_intent_is_still_a_failure():
+    """The discriminator is the USER's recorded intent, not the bot's word. `stopped` is also what the
+    bot reports when infrastructure SIGTERMs it in the lobby (a node drain, an operator delete): with
+    no `stop_requested` on the row that run is still a failure — ours — and still counts as one."""
+    repo = _ReconcileRepo()
+    m = _seed(repo, status="awaiting_admission")
+    client = TestClient(create_app(meeting_repo=repo))
+    r = _post(client, connection_id="sess-uid", status="failed", completion_reason="stopped",
+              failure_stage="awaiting_admission", exit_code=0)
+    assert r.status_code == 200, r.text
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "failed"
+    assert row["data"].get("completion_reason") == "stopped"
+    assert row["data"].get("stop_requested") is None
+
+
+def test_general_sweep_reaps_a_stopped_lobby_bot_as_a_user_stop_not_a_lost_workload():
+    """SIBLING — the same defect in the backstop. A pre-active row the user stopped, whose bot never
+    sent its terminal and whose workload the runtime confirms gone, is reaped by the general sweep.
+    It reaped it as `failed` with `left_alone` — a LOST workload — although the row says the user
+    stopped it. It is a user stop: `completed(stopped)`, stage kept."""
+    repo = InMemoryMeetingRepo()
+    m = _seed(repo, status="awaiting_admission")
+    repo._meetings[m["id"]]["bot_container_id"] = "wl-lobby"
+    repo._meetings[m["id"]]["data"]["stop_requested"] = True   # the DELETE route set this (#807)
+    runtime = FakeRuntimeClient(
+        workloads={"wl-lobby": {"workloadId": "wl-lobby", "state": "destroyed"}}
+    )
+    client = TestClient(create_app(meeting_repo=repo))
+
+    assert _run_general_sweep_rt(client, repo, runtime) == 1
+    row = repo._meetings[m["id"]]
+    assert row["status"] == "completed"
+    assert row["data"].get("completion_reason") == "stopped"
+    assert row["data"].get("failure_stage") == "awaiting_admission"

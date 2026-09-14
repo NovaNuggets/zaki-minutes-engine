@@ -249,7 +249,9 @@ async def reconcile_stale_nonterminal_sweep(
       * `active` / `stopping` (the bot WAS live) → `completed`. `stop_requested` is preserved (carried
         back into `meeting.data`) so the UI's derived `stopped` still shows.
       * `requested` / `joining` / `awaiting_admission` / `needs_help` (never reached `active`) → `failed`,
-        attributed to the stage it died in.
+        attributed to the stage it died in — unless the USER stopped it (`stop_requested`): then it is
+        the user's stop, not a lost workload, and the FSM lands it `completed(stopped)` with the stage
+        kept (L-0165).
 
     Two grace windows (env-configurable): ``stop_grace`` for `stopping` (a stop was requested — clear it
     fast), ``active_grace`` for everything else (a longer idle so a momentarily-quiet live bot is not
@@ -326,13 +328,18 @@ async def reconcile_stale_nonterminal_sweep(
             continue
         terminal = "failed" if status in _PRE_ACTIVE_NONTERMINAL else "completed"
         body: dict[str, Any] = {"connection_id": session_uid, "status": terminal}
-        if terminal == "completed":
-            body["completion_reason"] = "stopped" if stop_requested else "left_alone"
-            if stop_requested:
-                body["data"] = {"stop_requested": True}
-        else:
-            body["completion_reason"] = "left_alone"
-            body["reason"] = f"bot gone while {status}; reconciled to failed (never reached active)"
+        body["completion_reason"] = "stopped" if stop_requested else "left_alone"
+        if stop_requested:
+            # The user's stop, not a lost workload. A pre-active row can only be REPORTED `failed`
+            # (the bot FSM's lone terminal there); the FSM classifies it `completed(stopped)` off
+            # this flag (L-0165) — the same way it does the bot's own callback.
+            body["data"] = {"stop_requested": True}
+        if terminal == "failed":
+            body["reason"] = (
+                f"stopped by the user at {status}; bot gone (never reached active)"
+                if stop_requested
+                else f"bot gone while {status}; reconciled to failed (never reached active)"
+            )
         try:
             result = await post_lifecycle(body)
             reconciled += 1
@@ -449,7 +456,8 @@ async def synthesize_terminal_for_dead_workload(
       * PRE-ACTIVE (``requested``/``joining``/``awaiting_admission``) — the bot never reported ``active`` and
         never will (image-pull fail, OOM, crash on boot, or a stop that killed it in the waiting room
         before it sent its own terminal callback) → synthetic ``failed`` attributed to the stage it died in
-        (CC5).
+        (CC5). When the USER stopped it (``stop_requested`` rides in ``data``) the FSM classifies that
+        report ``completed(stopped)``, stage kept — a user stop is not a failure (L-0165).
       * WAS-ACTIVE (``stopping``/``active``/``needs_help``) — the bot reached the meeting, but its workload
         is now confirmed gone WITHOUT its own terminal callback having landed (e.g. it was SIGKILLed at
         teardown before it could POST ``completed``). This is exactly the reaper-loop incident: DELETE
@@ -475,6 +483,8 @@ async def synthesize_terminal_for_dead_workload(
     if status in _PRE_ACTIVE_STATUSES:
         body = {
             "connection_id": info["session_uid"],
+            # The bot FSM's lone pre-active terminal. With `stop_requested` in `data` below, the FSM
+            # lands it `completed(stopped)` instead — a user stop is not a failure (L-0165).
             "status": "failed",
             "failure_stage": status,                    # the stage the bot died IN (requested/joining/…)
             "completion_reason": _pre_active_completion_reason(status, stop_requested),

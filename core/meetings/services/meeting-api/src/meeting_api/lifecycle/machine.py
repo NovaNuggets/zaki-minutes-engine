@@ -376,6 +376,27 @@ class LifecycleSink:
         to = BotStatus(event["status"])
         rec = self.store.get_or_create(connection_id)
 
+        # The user's intent rides the synthetic terminals (`reconcile.py` copies the durable row's
+        # `stop_requested` into `data`); for the bot's own callback the HTTP handler sets it on the
+        # record from the durable row. Either way it is the RECORD's flag the classification reads.
+        if (event.get("data") or {}).get("stop_requested"):
+            rec.stop_requested = True
+
+        # L-0165 — a user stop is not a failure, whatever stage it lands in. The sealed bot FSM has
+        # no non-failure terminal before `active`, so a bot stopped in the lobby (and every synthetic
+        # terminal that stands in for it) can only REPORT `failed`; the classification is the
+        # server's (FM-003 — the parent's `_classify_stopped_exit`, which reads `stop_requested`
+        # first): the user asked for the stop, so the run ends `completed(stopped)`, keeping the
+        # stage it reached (below) so it is never mistaken for a run that delivered a meeting (#807).
+        # A record that already ended `failed` is terminal and stays so; on a record already
+        # `completed` the reclassified redelivery is the no-op it should be.
+        if (
+            to is BotStatus.FAILED
+            and rec.stop_requested
+            and rec.status not in (BotStatus.ACTIVE, BotStatus.FAILED)
+        ):
+            to = BotStatus.COMPLETED
+
         # IDEMPOTENCY (LIFECYCLE-409 fix): a redelivery of the record's CURRENT status is a no-op
         # 200, not a 409. The bot retries its terminal callback up to 3x; a second `completed` after
         # the first one landed (or after rehydration seeded `completed`) must succeed, not error.
@@ -405,8 +426,10 @@ class LifecycleSink:
         # synthetic `completed`/`failed` the runtime-callback drives is rejected 409, the meeting stays
         # `stopping`, and the stop-reconcile sweep re-DELETEs (now 404) every ~15s FOREVER (the reaper
         # loop). Guarded: ONLY a terminal target, ONLY this source — never loosens bot-driven edges.
-        if (force_terminal_on_destroy or force_terminal_after_stop) and to in _TERMINAL:
-            pass  # legal after a confirmed stop; fall through to the terminal advance
+        if (
+            force_terminal_on_destroy or force_terminal_after_stop or rec.stop_requested
+        ) and to in _TERMINAL:
+            pass  # legal after a confirmed or requested stop; fall through to the terminal advance
         elif not can_transition(rec.status, to):
             raise IllegalTransition(connection_id, rec.status, to)
 
@@ -424,6 +447,14 @@ class LifecycleSink:
         if to is BotStatus.COMPLETED:
             raw = event.get("completion_reason")
             rec.completion_reason = CompletionReason(raw) if raw else None
+            if rec.stop_requested and frm is not BotStatus.ACTIVE:
+                # A user stop that landed before `active` (L-0165): the reason is the user's,
+                # whatever the bot or a sweep reported, and the stage reached is kept in the same
+                # field a `failed` would carry — so `completed` + `failure_stage` reads "stopped
+                # before it got in" (#807: the stage survives the stop), distinct from a completion
+                # that delivered a meeting.
+                rec.completion_reason = CompletionReason.STOPPED
+                rec.failure_stage = _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)
         elif to is BotStatus.FAILED:
             # FM-003: derive failure_stage from the stage we were IN, not the payload.
             rec.failure_stage = _STATUS_TO_FAILURE_STAGE.get(frm, FailureStage.ACTIVE)

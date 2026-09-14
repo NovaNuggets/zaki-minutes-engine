@@ -299,6 +299,13 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(sess["meeting_id"])
         return row["status"] if row else None
 
+    async def get_stop_requested_by_session(self, *, session_uid) -> bool:
+        sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
+        if sess is None:
+            return False
+        row = self._meetings.get(sess["meeting_id"])
+        return bool(row and (row.get("data") or {}).get("stop_requested"))
+
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         row = next(
             (m for m in self._meetings.values() if m.get("bot_container_id") == bot_container_id), None

@@ -259,3 +259,54 @@ def test_an_explicit_sealed_code_is_honoured():
     assert failure_code_from_meeting_data({"failure_code": "kicked"}) == "kicked"
     # ...but a free-form value in that key is not a code, and must not be laundered into one.
     assert failure_code_from_meeting_data({"failure_code": "boom"}) is None
+
+
+# ── L-0165: the engine records a lobby cancellation `completed(stopped)`; the Hub's graph cannot ──
+
+
+def _lobby_cancellation_row() -> dict:
+    """The row L-0165 writes for a capture the user stopped before admission: not a failure in the
+    engine (`completed`, reason `stopped`), with the stage it reached kept so it is never mistaken
+    for a run that delivered a meeting."""
+    return _meeting(
+        {"completion_reason": "stopped", "failure_stage": "awaiting_admission", "stop_requested": True},
+        status="completed",
+    )
+
+
+async def test_a_lobby_cancellation_still_reaches_the_hub_as_the_same_failed_join_denied():
+    """`zaki-control.v1` reaches `completed` only through `active` — its graph has no non-failure
+    terminal before admission (`_ADJACENCY`, pinned by the conformance suite). So the engine's
+    `completed(stopped)` for a lobby cancellation must not be forwarded as `completed`: the
+    adjacency guard would drop it and the Hub's capture would sit at `awaiting_admission` forever,
+    never settling. The Hub is told what it was told before L-0165 — `failed` / `join_denied` —
+    until the contract gains the edge."""
+    store, dispatcher = _dispatcher("awaiting_admission")
+    await dispatcher.record_lifecycle(_lobby_cancellation_row(), state="completed")
+    capture = store.captures["cap-1"]
+    assert capture.state == "failed", "the terminal was dropped by the adjacency guard — Hub stranded"
+    assert capture.failure_code == "join_denied"
+
+
+async def test_a_lobby_cancellation_replayed_by_recovery_takes_the_same_path():
+    """Crash recovery replays a row's terminal from the Hub's `requested`. A `completed` row walks
+    `joining → active → completed` and would assert an `active` that never happened; the lobby
+    cancellation replays as the same `failed` / `join_denied` the live path reports."""
+    store, dispatcher = _dispatcher("requested")
+    store.reconcile_meetings = [_lobby_cancellation_row()]
+    assert await dispatcher.reconcile_once() == 1
+    capture = store.captures["cap-1"]
+    assert capture.state == "failed"
+    assert capture.failure_code == "join_denied"
+
+
+async def test_a_completion_that_went_active_is_still_forwarded_as_completed():
+    """No-regression: a run that reached `active` and was then stopped by the user is a real
+    completion (a delivered, possibly partial, meeting) and reaches the Hub as `completed`."""
+    store, dispatcher = _dispatcher("active")
+    await dispatcher.record_lifecycle(
+        _meeting({"completion_reason": "stopped", "stop_requested": True}, status="completed"),
+        state="completed",
+    )
+    assert store.captures["cap-1"].state == "completed"
+    assert store.captures["cap-1"].failure_code is None

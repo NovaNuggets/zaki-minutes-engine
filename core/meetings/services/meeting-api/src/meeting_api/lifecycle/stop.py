@@ -11,7 +11,10 @@ Port of the parent ``meetings.stop_bot`` control-plane behaviour, reduced to the
   * **classify_user_stop(record)** — the parent's Pack-C/Pack-J rule, reduced: a user stop is NEVER
     a failure regardless of stage. While the meeting was still ``joining``/``awaiting_admission`` the
     bot is asked to leave; its terminal exit lands as ``completed(stopped)`` — a TERMINAL state with
-    the ``stopped`` reason, attributed to ``transition_source=user_stop`` — not a silent jump.
+    the ``stopped`` reason, attributed to ``transition_source=user_stop`` — not a silent jump. The
+    bot itself can only REPORT ``failed`` before ``active`` (its sealed FSM has no other terminal
+    there); ``LifecycleSink.apply_change`` applies this classification to that report off the
+    record's ``stop_requested`` and keeps the stage reached in ``failure_stage`` (L-0165, #807).
 
 The leave command + the ``stop_requested`` flag are the two effects the eval asserts. The publisher
 is a port (``LeaveCommandPublisher``) so the eval drives it with fakeredis / an in-memory capture.
@@ -70,30 +73,32 @@ async def request_stop(
 
 
 def classify_user_stop(record: MeetingRecord) -> tuple[BotStatus, CompletionReason]:
-    """The reduced Pack-C/Pack-J rule: a user stop terminates WITH the ``stopped`` reason.
+    """The reduced Pack-C/Pack-J rule: a user stop terminates ``completed`` WITH the ``stopped`` reason.
 
     The parent's ``_classify_stopped_exit`` short-circuits on ``stop_requested`` → a user DELETE is
-    never a *misattributed* failure regardless of stage; the reason is always ``stopped``.
+    never a failure regardless of stage; the reason is always ``stopped``. This holds BEFORE
+    ``active`` too (L-0165): a user who cancels while the bot is still ``joining`` /
+    ``awaiting_admission`` cancelled — nothing failed — and recording that ``failed`` counted every
+    lobby cancellation as a capture failure (5 of the 10 failures behind L-0020 were this).
 
-    The bot's DOMAIN FSM (lifecycle.v1) only reaches ``completed`` from ``active``; a pre-active
-    stop can only legally terminate as ``failed`` (the lone terminal reachable from
-    joining/awaiting_admission). So the TERMINAL STATUS is FSM-legal (``completed`` once active,
-    ``failed`` before), but the REASON is always ``stopped`` and the source is ``user_stop`` — the
-    exit is ATTRIBUTED, never a silent jump. This is the faithful reduction of the parent's
-    "user stop is not a failure" intent onto the narrower bot-domain machine.
+    The bot's DOMAIN FSM (lifecycle.v1) only reaches ``completed`` from ``active``, so before
+    ``active`` the bot can only REPORT ``failed``; the classification is the server's.
+    ``LifecycleSink.apply_change`` applies this rule to that report off the record's
+    ``stop_requested`` (the terminal edge is legal after a requested stop) and keeps the stage the
+    bot reached in ``failure_stage`` — so ``completed`` + ``failure_stage`` reads "stopped before it
+    got in", never mistaken for a run that delivered a meeting (#807: the stage survives the stop).
     """
-    if record.status is BotStatus.ACTIVE:
-        return (BotStatus.COMPLETED, CompletionReason.STOPPED)
-    return (BotStatus.FAILED, CompletionReason.STOPPED)
+    return (BotStatus.COMPLETED, CompletionReason.STOPPED)
 
 
 def stop_event_for(record: MeetingRecord, *, exit_code: int = 0) -> dict:
-    """Build the terminal lifecycle.v1 event the bot emits after honouring a leave command.
+    """Build the terminal lifecycle.v1 event a user stop resolves to, as the server classifies it.
 
-    The FSM-legal terminal for the record's CURRENT stage (``completed`` if active, else
-    ``failed``), always carrying ``completion_reason=stopped`` — the attributable terminal a user
-    stop resolves to. The caller feeds this through
-    ``LifecycleSink.apply_change(..., transition_source=user_stop)``.
+    ``completed`` at every stage, carrying ``completion_reason=stopped`` — the attributable terminal
+    a user stop resolves to. The caller feeds this through
+    ``LifecycleSink.apply_change(..., transition_source=user_stop)`` on a record whose
+    ``stop_requested`` was set by ``request_stop`` (which is what makes the pre-active
+    ``completed`` edge legal there, and what stamps the stage reached).
     """
     status, reason = classify_user_stop(record)
     return {

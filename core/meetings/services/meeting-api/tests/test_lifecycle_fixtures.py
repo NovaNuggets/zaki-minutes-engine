@@ -95,13 +95,18 @@ async def test_fixture_user_stop_publishes_leave_and_terminates_with_reason(fake
     assert json.loads(msg["data"]) == {"action": "leave", "meeting_id": meeting_id}
 
     # (c)+(d): the bot honours the leave and emits its terminal event → classified WITH a reason,
-    # the transition stamped user_stop (not a silent jump to terminal). A pre-active stop lands on
-    # the FSM-legal terminal `failed` (the only terminal reachable from joining/awaiting_admission)
-    # but ALWAYS carries completion_reason=stopped — an ATTRIBUTED terminal, never silent.
+    # the transition stamped user_stop (not a silent jump to terminal). A pre-active stop is NOT a
+    # failure (L-0165): the user cancelled, nothing failed. The sealed bot FSM has no non-failure
+    # terminal before `active`, so the SERVER classifies the exit — `completed(stopped)` — and keeps
+    # the stage the bot reached, so the run is never mistaken for one that delivered a meeting
+    # (#807: the stage survives the stop).
     change = sink.apply_change(stop_event_for(rec), transition_source=TransitionSource.USER_STOP)
     assert change.record.is_terminal                              # TERMINAL
-    assert change.record.status is BotStatus.FAILED              # FSM-legal pre-active terminal
+    assert change.record.status is BotStatus.COMPLETED, (
+        "a capture the user cancelled before admission is not a failed capture (L-0165)"
+    )
     assert change.record.completion_reason is CompletionReason.STOPPED  # WITH a reason (attributed)
+    assert change.record.failure_stage is FailureStage(stop_at)   # the stage reached survives (#807)
     assert change.transition_source is TransitionSource.USER_STOP
     assert change.to_webhook_payload()["transition_source"] == "user_stop"
     assert change.record.status_transition[-1]["source"] == "user_stop"

@@ -406,6 +406,20 @@ def _mount_lifecycle(
                               span="lifecycle.callback", fields={"error": str(e)})
                 if needs_rehydrate and persisted:
                     sink.store.rehydrate(connection_id, persisted)
+            if needs_stop_reconcile:
+                # The user's intent lives on the durable row: `stop_router` writes `stop_requested`
+                # and, for a bot still in the lobby, KEEPS its stage (#807). The bot's own terminal
+                # cannot carry it (it does not know who sent the SIGTERM) and the in-process record
+                # only has it when the stop went through this process. Read it here so the FSM
+                # classifies a `failed(stopped)` from the lobby as the user's stop it is (L-0165).
+                # Best-effort, like the rehydration above.
+                try:
+                    if await meeting_repo.get_stop_requested_by_session(session_uid=connection_id):
+                        sink.store.get_or_create(connection_id).stop_requested = True
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    log_event("lifecycle_stop_intent_read_failed", audience="system",
+                              level="warning", span="lifecycle.callback",
+                              fields={"error": str(e)})
         accepted_record = deepcopy(sink.store.get(connection_id)) if connection_id else None
         try:
             change = sink.apply_change(

@@ -157,6 +157,22 @@ class SqlAlchemyMeetingRepo:
             ).scalars().first()
             return status
 
+    async def get_stop_requested_by_session(self, *, session_uid) -> bool:
+        from sqlalchemy import select
+
+        from ..sessions.models import Meeting, MeetingSession
+
+        async with self._session_factory() as db:
+            sess = (
+                await db.execute(select(MeetingSession).where(MeetingSession.session_uid == session_uid))
+            ).scalars().first()
+            if sess is None:
+                return False
+            data = (
+                await db.execute(select(Meeting.data).where(Meeting.id == sess.meeting_id))
+            ).scalars().first()
+            return bool(isinstance(data, dict) and data.get("stop_requested"))
+
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         """The meeting + latest session for a workload id — used by the runtime callback (CC5) to drive a
         synthetic ``failed`` for a workload that died before the bot reported. ``{meeting_id, status,

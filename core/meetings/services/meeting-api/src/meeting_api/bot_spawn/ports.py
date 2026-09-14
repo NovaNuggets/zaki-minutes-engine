@@ -147,6 +147,14 @@ class MeetingRepo(Protocol):
         bot's event (else a terminal event on an empty store creates a status=None record and 409s)."""
         ...
 
+    async def get_stop_requested_by_session(self, *, session_uid: str) -> bool:
+        """Whether the USER asked to stop the meeting behind ``session_uid`` — ``meeting.data
+        .stop_requested``, written by the DELETE route (which keeps a lobby bot's stage, #807) and by
+        consent withdrawal. Read by the lifecycle callback before a TERMINAL event is classified: a
+        bot stopped before ``active`` can only report ``failed``, and the user's intent is what makes
+        that a stop rather than a failure (L-0165). ``False`` for an unknown session."""
+        ...
+
     async def update_meeting_status(
         self,
         *,
