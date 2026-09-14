@@ -74,14 +74,14 @@ async function main() {
       got === "AdmissionError:denial", got);
   }
 
-  console.log("\n=== lobby forever → typed TRANSIENT lobby_timeout ===");
+  console.log("\n=== lobby forever → typed lobby_timeout (PERMANENT downstream since L-0166) ===");
   {
     resetEscalation();
     // timeout=0: the admission poll loop is never entered; the final still-in-lobby check must
     // throw the typed timeout, not the old plain Error the outer catch then re-wrapped.
     const page = makePage((sel) => sel.includes(LOBBY));
     const got = await outcomeOf(waitForTeamsMeetingAdmission(page, 0, cfg));
-    check("lobby timeout → AdmissionError('lobby_timeout') — the legit retry stays a retry",
+    check("lobby timeout → AdmissionError('lobby_timeout') — nobody clicked Admit: PERMANENT downstream (L-0166), never a retried join_failure",
       got === "AdmissionError:lobby_timeout", got);
   }
 

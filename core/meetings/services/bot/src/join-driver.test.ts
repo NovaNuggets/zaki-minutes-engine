@@ -18,14 +18,16 @@ const check = (name: string, cond: boolean) => {
 };
 
 // JoinOutcomes the orchestrator (OUTCOME_FAIL) + retry.py treat as PERMANENT (no retry):
-// 'rejected' → awaiting_admission_rejected. Transient (retried): 'timeout' → awaiting_admission_timeout,
-// 'error'/'blocked' → join_failure.
-const PERMANENT_OUTCOMES = new Set<JoinOutcome>(['rejected', 'auth_missing']);
+// 'rejected' → awaiting_admission_rejected, 'auth_missing' → auth_session_missing, and since L-0166
+// 'timeout' → awaiting_admission_timeout (nobody clicked Admit — a decision, not a fault that clears).
+// Transient (retried): 'error'/'blocked' → join_failure.
+const PERMANENT_OUTCOMES = new Set<JoinOutcome>(['rejected', 'auth_missing', 'timeout']);
 
 console.log('\n=== join-driver: AdmissionError outcome → JoinOutcome (G1) ===');
 
 check('denial → rejected (permanent, not retried)', admissionOutcomeToJoinOutcome('denial') === 'rejected');
-check('lobby_timeout → timeout (transient retry)', admissionOutcomeToJoinOutcome('lobby_timeout') === 'timeout');
+check('lobby_timeout → timeout (PERMANENT since L-0166: nobody clicked Admit, not re-spawned)', admissionOutcomeToJoinOutcome('lobby_timeout') === 'timeout');
+check('a lobby timeout is PERMANENT — the host never answered; a re-spawn would wait the same window on the same door', PERMANENT_OUTCOMES.has(admissionOutcomeToJoinOutcome('lobby_timeout')));
 check('join_failure → error', admissionOutcomeToJoinOutcome('join_failure') === 'error');
 
 // The bug, end to end at the boundary: a real AdmissionError('denial') must NOT surface transient.
@@ -33,7 +35,7 @@ const denial = new AdmissionError('denial', 'Bot admission was rejected by meeti
 const mapped = admissionOutcomeToJoinOutcome(denial.outcome);
 check('AdmissionError("denial").outcome maps to rejected', mapped === 'rejected');
 check('a denial is PERMANENT (not a retried join_failure)', PERMANENT_OUTCOMES.has(mapped));
-check('a denial does NOT map to the transient/retried classes', mapped !== 'error' && mapped !== 'timeout');
+check('a denial is recorded as a denial, not as a join error or a lobby timeout', mapped !== 'error' && mapped !== 'timeout');
 
 // A signed-out profile in authenticated mode: AuthSessionError IS an AdmissionError (the driver's
 // single `instanceof` catch maps it — no re-raise → no blanket transient join_failure), and its
@@ -44,7 +46,7 @@ check('AuthSessionError instanceof AdmissionError (driver catches, does not re-r
 const authMapped = admissionOutcomeToJoinOutcome(authErr.outcome);
 check('AuthSessionError.outcome maps to auth_missing', authMapped === 'auth_missing');
 check('a missing auth session is PERMANENT (not a retried join_failure)', PERMANENT_OUTCOMES.has(authMapped));
-check('auth failure does NOT map to the transient/retried classes', authMapped !== 'error' && authMapped !== 'timeout');
+check('a missing auth session is recorded as such, not as a join error or a lobby timeout', authMapped !== 'error' && authMapped !== 'timeout');
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

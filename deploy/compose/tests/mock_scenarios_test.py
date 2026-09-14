@@ -162,8 +162,8 @@ def test_mock_failure_attribution(stack, scenario, want_reason, want_stage):
 
 @mock_only
 def test_mock_join_timeout_fails_with_reason(stack):
-    """A transient timeout: the control plane records the timeout reason (the deterministic backoff
-    re-spawn is proven offline by P3 test_join_retry.py — forcing it on a live bot is slow/flaky)."""
+    """Nobody admits the bot: the control plane records the timeout reason. Its retry class is
+    PERMANENT (L-0166) — no re-spawn; proven offline by P3 test_join_retry.py."""
     user_id = _create_user(stack, max_bots=5)
     native_id, _ = _spawn(stack, user_id, "join-timeout")
     m = _wait_meeting(stack, user_id, native_id, statuses={"failed"}, timeout=150)
@@ -171,7 +171,7 @@ def test_mock_join_timeout_fails_with_reason(stack):
         _diag(stack, native_id, m)
     assert m and m["status"] == "failed", f"join-timeout did not terminate: {m}"
     assert m["reason"] == "awaiting_admission_timeout", f"timeout reason={m['reason']!r}"
-    print(f"\n[mock/join-timeout] failed · reason={m['reason']} (re-spawn backoff: offline P3)")
+    print(f"\n[mock/join-timeout] failed · reason={m['reason']} (PERMANENT, no re-spawn: offline P3)")
 
 
 # ── emit-n-segments: transcript dataflow under volume ──────────────────────────────────────────────

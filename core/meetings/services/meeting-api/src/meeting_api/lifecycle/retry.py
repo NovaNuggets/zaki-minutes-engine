@@ -9,10 +9,14 @@ classification — NB: the PARENT meeting-api has no join-retry; this is NEW con
 modelled on the parent's closest precedent, ``post_meeting.AggregationFailureClass``'s
 transient/permanent split):
 
-  * **TRANSIENT → retry**: ``awaiting_admission_timeout``, ``join_failure`` (network / transient error).
-  * **PERMANENT → no retry → failed**: ``awaiting_admission_rejected``, ``evicted``,
-    ``validation_error``, ``max_bot_time_exceeded``, ``auth_session_missing`` (a re-spawn hits the
-    same signed-out profile), and the user terminal ``stopped``.
+  * **TRANSIENT → retry**: ``join_failure`` (network / transient error — the bot could not drive
+    the join; a fresh attempt may).
+  * **PERMANENT → no retry → failed**: ``awaiting_admission_timeout`` (the bot reached the waiting
+    room and nobody admitted it for the whole window — the host's decision, not a fault that clears;
+    a re-spawn waits the same window on the same door, one full bot lifetime per attempt),
+    ``awaiting_admission_rejected``, ``evicted``, ``validation_error``, ``max_bot_time_exceeded``,
+    ``auth_session_missing`` (a re-spawn hits the same signed-out profile), and the user terminal
+    ``stopped``.
 
 Bounded to a few attempts (config, default 3). Each attempt is its OWN ``meeting_session`` (a fresh
 ``connectionId``) — the scheduler fires a ``POST /bots`` re-spawn request for the next attempt.
@@ -36,12 +40,14 @@ class RetryClass(str, Enum):
 # The P3d taxonomy, keyed by the sealed lifecycle.v1 CompletionReason.
 _TRANSIENT: frozenset[CompletionReason] = frozenset(
     {
-        CompletionReason.AWAITING_ADMISSION_TIMEOUT,
         CompletionReason.JOIN_FAILURE,
     }
 )
 _PERMANENT: frozenset[CompletionReason] = frozenset(
     {
+        # Nobody clicked Admit for the whole waiting-room window. That is a decision, not a fault:
+        # a re-spawn knocks on the same door and waits the same window for the same host.
+        CompletionReason.AWAITING_ADMISSION_TIMEOUT,
         CompletionReason.AWAITING_ADMISSION_REJECTED,
         CompletionReason.EVICTED,
         CompletionReason.VALIDATION_ERROR,

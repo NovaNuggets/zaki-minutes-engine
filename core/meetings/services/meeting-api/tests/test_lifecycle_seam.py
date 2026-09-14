@@ -1397,9 +1397,10 @@ def test_user_stop_of_a_never_admitted_bot_is_failed_not_completed():
 
 
 def test_user_stop_before_admission_is_never_retried():
-    """The reason must be the USER-terminal one. `awaiting_admission_timeout` is TRANSIENT
-    (retry.py), so attributing a deliberate cancellation to it would re-spawn the bot three times
-    against a meeting the user already walked away from — spending their quota to do it."""
+    """The reason must be the USER-terminal one. `stopped` is PERMANENT (retry.py) and, since
+    L-0166, so is `awaiting_admission_timeout` — the retry class no longer tells them apart, the
+    attribution does: a deliberate cancellation recorded as a host timeout would misreport who
+    ended the run. The class assertion below pins that a user stop is never re-spawned."""
     from meeting_api.lifecycle.retry import RetryClass, classify_retry
     from meeting_api.lifecycle.machine import CompletionReason
 
@@ -1411,9 +1412,11 @@ def test_user_stop_before_admission_is_never_retried():
         assert row["data"].get("stop_requested") is True
 
 
-def test_a_timed_out_admission_is_still_transient_and_still_retried():
-    """No-regression: without a user stop, an admission wait that dies on its own keeps the
-    TRANSIENT reason — the retry behaviour this fix must not disturb."""
+def test_a_timed_out_admission_keeps_its_reason_and_is_not_retried():
+    """Attribution is unchanged: without a user stop, an admission wait that dies on its own keeps
+    the `awaiting_admission_timeout` reason. Its retry class is PERMANENT (L-0166): nobody clicking
+    Admit is the host's decision, not a fault that clears — a re-spawn would wait the same window
+    on the same door, one full bot lifetime per attempt."""
     from meeting_api.lifecycle.retry import RetryClass, classify_retry
     from meeting_api.lifecycle.machine import CompletionReason
 
@@ -1426,7 +1429,7 @@ def test_a_timed_out_admission_is_still_transient_and_still_retried():
     row = repo._meetings[m["id"]]
     assert row["status"] == "failed"
     assert row["data"].get("completion_reason") == "awaiting_admission_timeout"
-    assert classify_retry(CompletionReason("awaiting_admission_timeout")) is RetryClass.TRANSIENT
+    assert classify_retry(CompletionReason("awaiting_admission_timeout")) is RetryClass.PERMANENT
 
 
 def test_user_stop_of_a_live_bot_still_completes():

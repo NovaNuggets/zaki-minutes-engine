@@ -27,7 +27,6 @@ MEETING_ID = 99
 # ── the taxonomy ─────────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("reason", [
-    CompletionReason.AWAITING_ADMISSION_TIMEOUT,
     CompletionReason.JOIN_FAILURE,
 ])
 def test_transient_reasons(reason):
@@ -36,6 +35,7 @@ def test_transient_reasons(reason):
 
 
 @pytest.mark.parametrize("reason", [
+    CompletionReason.AWAITING_ADMISSION_TIMEOUT,
     CompletionReason.AWAITING_ADMISSION_REJECTED,
     CompletionReason.EVICTED,
     CompletionReason.VALIDATION_ERROR,
@@ -129,7 +129,7 @@ def test_transient_retries_with_backoff_until_cap():
 def test_transient_then_success_stops_retrying():
     """If a retry succeeds, no further retry is scheduled (the caller stops on success)."""
     controller, scheduler, clock, fired = _build(max_attempts=3)
-    out = controller.on_join_failure(MEETING_ID, CompletionReason.AWAITING_ADMISSION_TIMEOUT, attempt=0)
+    out = controller.on_join_failure(MEETING_ID, CompletionReason.JOIN_FAILURE, attempt=0)
     assert out.action == "scheduled_retry"
     clock.advance(30)
     scheduler.tick()  # retry #1 fires and (in this scenario) succeeds
@@ -158,6 +158,24 @@ def test_user_stop_is_permanent():
     assert out.action == "permanent"
     clock.advance(10_000)
     assert scheduler.tick() == 0
+
+
+def test_nobody_clicking_admit_is_a_decision_not_a_transient_fault_so_it_is_never_retried():
+    """`awaiting_admission_timeout` means the bot reached the waiting room and no human admitted it
+    for the whole window. That is not a fault that clears on its own: a re-spawn knocks on the same
+    door and waits the same window for the same host. Retrying it spends one full bot lifetime per
+    attempt (three at the default cap) on an outcome that will not change, so it is PERMANENT —
+    one bot, one wait, one answer."""
+    assert classify_retry(CompletionReason.AWAITING_ADMISSION_TIMEOUT) is RetryClass.PERMANENT
+    controller, scheduler, clock, fired = _build(max_attempts=3)
+    out = controller.on_join_failure(
+        MEETING_ID, CompletionReason.AWAITING_ADMISSION_TIMEOUT, attempt=0
+    )
+    assert out.action == "permanent"
+    assert out.job_id is None
+    clock.advance(10_000)
+    assert scheduler.tick() == 0
+    assert fired == [], "a second bot was sent to wait on the same host"
 
 
 def test_each_attempt_is_a_distinct_idempotent_job():

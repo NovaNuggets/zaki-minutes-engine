@@ -24,11 +24,13 @@ import type { JoinDriver, JoinOutcome } from './ports.js';
  * orchestrator's catch blanket-maps every throw to a transient `join_failure` → the retry classifier
  * (`lifecycle/retry.py`) RE-SPAWNS a bot that was actually DENIED, burning quota. Mapping the outcome
  * keeps the truth: a `denial` → `rejected` → `awaiting_admission_rejected` (PERMANENT, no retry); a
- * `lobby_timeout` → `timeout` → `awaiting_admission_timeout` (transient, a legit retry); a `join_failure`
- * stays `error` → `join_failure` (transient); an `auth_session_missing` (signed-out profile in
- * authenticated mode) → `auth_missing` → `auth_session_missing` (PERMANENT — a re-spawn against a dead
- * profile can never succeed). NB: a distinct `blocked` reason needs a sealed-contract
- * `CompletionReason` value (lane:contract) — until then a detected block surfaces via this same path.
+ * `lobby_timeout` → `timeout` → `awaiting_admission_timeout` (PERMANENT since L-0166: nobody clicking
+ * Admit for the whole window is the host's decision, not a fault that clears — a re-spawn would wait
+ * the same window on the same door); a `join_failure` stays `error` → `join_failure` (transient); an
+ * `auth_session_missing` (signed-out profile in authenticated mode) → `auth_missing` →
+ * `auth_session_missing` (PERMANENT — a re-spawn against a dead profile can never succeed). NB: a
+ * distinct `blocked` reason needs a sealed-contract `CompletionReason` value (lane:contract) — until
+ * then a detected block surfaces via this same path.
  */
 export function admissionOutcomeToJoinOutcome(outcome: AdmissionOutcome): JoinOutcome {
   switch (outcome) {

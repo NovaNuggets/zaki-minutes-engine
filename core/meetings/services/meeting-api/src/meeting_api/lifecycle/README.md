@@ -51,7 +51,9 @@ the parent persists. Each advance returns a `StatusChange` carrying the `meeting
 webhook body `{old_status, new_status, reason, transition_source ∈ user_stop|bot_callback|scheduler_timeout}`.
 
 ## P3d taxonomy
-TRANSIENT → retry: `awaiting_admission_timeout`, `join_failure`. PERMANENT → no retry → failed:
+TRANSIENT → retry: `join_failure` (the bot could not drive the join — a fresh attempt may).
+PERMANENT → no retry → failed: `awaiting_admission_timeout` (the bot reached the waiting room and
+nobody admitted it — the host's decision; a re-spawn waits the same window on the same door),
 `awaiting_admission_rejected`, `evicted`, `validation_error`, `max_bot_time_exceeded`, user `stopped`
 (+ `left_alone`/`startup_alone`, which are normal outcomes). Unknown/None → PERMANENT (fail-safe).
 

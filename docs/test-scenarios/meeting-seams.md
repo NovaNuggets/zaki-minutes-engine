@@ -20,14 +20,19 @@ Add a row per known failure class; a row is "done" when every named probe is gre
     The admission wait THROWS a typed AdmissionError(outcome); the join-driver now maps the outcome
     instead of letting it fall through to the orchestrator's blanket transient join_failure.
 
-- id: admission-lobby-timeout-is-transient
+- id: admission-lobby-timeout-is-permanent-not-retried
   status: green
   seam: "@vexa/join AdmissionError -> join-driver -> orchestrator -> lifecycle -> retry"
-  module_probe: core/meetings/services/bot/src/join-driver.test.ts
+  module_probe: core/meetings/services/bot/src/join-driver.test.ts   # lobby_timeout -> timeout; PERMANENT_OUTCOMES has it
+  seam_probe: core/meetings/services/meeting-api/tests/test_join_retry.py  # test_nobody_clicking_admit_is_a_decision_not_a_transient_fault_so_it_is_never_retried
   expected:
     join_outcome: timeout
     completion_reason: awaiting_admission_timeout
-    retry_class: transient          # a waiting-room timeout is a legit retry
+    retry_class: permanent          # lifecycle/retry.py (L-0166, #59): NOT re-spawned (was: transient, retried up to 3x)
+  note: >
+    Nobody clicking Admit for the whole waiting-room window is the host's decision, not a fault that
+    clears: a re-spawn waits the same window on the same door, one full bot lifetime per attempt.
+    Attribution pinned by test_lifecycle_seam.py test_a_timed_out_admission_keeps_its_reason_and_is_not_retried.
 
 - id: gmeet-error-page-is-blocked-not-host-denial
   status: open                      # lane:contract + detection follow-up

@@ -415,12 +415,15 @@ def _pre_active_completion_reason(status: Optional[str], stop_requested: bool = 
     ``awaiting_admission_timeout``; any earlier pre-active stage (``requested``/``joining``) died
     before it could join → ``join_failure``. Keyed on ``awaiting_admission`` EXPLICITLY: an
     escalation state like ``needs_help`` is not an admission wait and must never earn the
-    admission-timeout reason. Both values are TRANSIENT (see ``retry.py``).
+    admission-timeout reason. The two differ in retry class (``retry.py``): ``join_failure`` is
+    TRANSIENT (our side — a fresh attempt may get in), ``awaiting_admission_timeout`` is PERMANENT
+    (the host's side — nobody clicked Admit, and a re-spawn would wait the same window on the same
+    door).
 
     ``stop_requested`` overrides both: the workload died because the USER stopped it, so the run
     ended for a reason no re-spawn can improve on. ``stopped`` is the sealed user-terminal reason
-    and is PERMANENT, which is what keeps a deliberate cancellation from being re-spawned three
-    times (#807 — the stage still lands in ``failure_stage``, so no attribution is lost)."""
+    and is PERMANENT, so a deliberate cancellation is never re-spawned (#807 — the stage still lands
+    in ``failure_stage``, so no attribution is lost)."""
     if stop_requested:
         return "stopped"
     return "awaiting_admission_timeout" if status == "awaiting_admission" else "join_failure"

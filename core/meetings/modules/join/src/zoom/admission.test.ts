@@ -58,12 +58,12 @@ async function main() {
   // and the rejection flips on the second iteration (~4s of logical unknown time, under the 10s
   // bar). resetEscalation() between cases keeps the latch from leaking across them.
 
-  console.log("\n=== admission never granted → typed TRANSIENT lobby_timeout ===");
+  console.log("\n=== admission never granted → typed lobby_timeout (PERMANENT downstream since L-0166) ===");
   {
     resetEscalation();
     const page = makePage(() => "");
     const got = await outcomeOf(waitForZoomMeetingAdmission(page, 0, cfg));
-    check("timeout → AdmissionError('lobby_timeout') — the legit retry case stays a retry",
+    check("timeout → AdmissionError('lobby_timeout') — nobody clicked Admit: PERMANENT downstream (L-0166), never a retried join_failure",
       got === "AdmissionError:lobby_timeout", got);
   }
 
