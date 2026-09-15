@@ -147,13 +147,87 @@ function chunkToBotSegment(speaker: string, c: ChunkSegment, completed: boolean)
   };
 }
 
+/** The lost-audio span a lane reports when a turn dies on an STT fault (wall-clock ms). */
+export interface GapSpan { startMs: number; endMs: number }
+
+/** Two losses closer than this with no transcript in between are ONE outage, so the reader
+ *  gets one marker instead of one per dropped window (the 09-15 incident dropped ~40). */
+const GAP_MERGE_MS = 15_000;
+/** Below this a "hole" is a rounding artefact of turn gating, not a missing minute. */
+const GAP_MIN_MS = 1_000;
+/** Marker ids are `gap:<startMs>` — the prefix IS the wire marker the summariser reads
+ *  (`collector/summarizer.py:GAP_PREFIX`). `source` stays unset: transcript.v1's Source enum
+ *  is sealed and a new member is a contract change, not a fix. */
+const GAP_ID_PREFIX = 'gap:';
+
+/** UTC wall clock of an epoch-ms instant, to the second — the reader's "when". */
+const hms = (ms: number): string => new Date(ms).toISOString().slice(11, 19);
+
+/** Name the provider failure from the typed STT fault (kind + status, never the provider's
+ *  response body — it is untrusted text that would land in the stored transcript). */
+function gapReason(fault: unknown): string {
+  const f = fault as { kind?: unknown; status?: unknown } | null | undefined;
+  const kind = typeof f?.kind === 'string' ? f.kind.replace(/_/g, ' ') : 'unavailable';
+  return `provider ${kind}${typeof f?.status === 'number' ? ` (HTTP ${f.status})` : ''}`;
+}
+
+/**
+ * THE GAP MARKER (L-0270). When the STT provider is down the lanes drop the audio: the
+ * chunk is retried, thrown, and freed — and the stored transcript closes over the hole as
+ * if nobody spoke. The reader gets a transcript that LOOKS complete and a summary written
+ * from two thirds of a meeting.
+ *
+ * So a lost span becomes a segment on the SAME transcript.v1 egress as any other: persisted,
+ * reloadable, and visible to the summariser. Contiguous losses extend the SAME segment id
+ * (the sink upserts by id) so an outage is one marker, and each outage logs exactly ONE warn
+ * line — not one per failed attempt.
+ *
+ * Lane-agnostic on purpose: both lanes report spans, so the marker is written once, here.
+ */
+function createGapPublisher(sink: TranscriptSink, warn: (msg: string) => void = (m) => console.warn(m)) {
+  let open: { startMs: number; endMs: number; segmentId: string } | null = null;
+  let textSinceGap = false;
+
+  return {
+    /** Real transcript text landed — the next loss starts a NEW marker (never merge across it). */
+    sawText(): void { textSinceGap = true; },
+
+    mark(fault: unknown, span: GapSpan): void {
+      const startMs = Math.min(span.startMs, span.endMs);
+      const endMs = Math.max(span.startMs, span.endMs);
+      // A non-finite span would throw out of toISOString and into the lane's fault path;
+      // a sub-second one is turn-gating noise. Neither becomes a marker.
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs - startMs < GAP_MIN_MS) return;
+      if (open && !textSinceGap && startMs <= open.endMs + GAP_MERGE_MS) {
+        open = { ...open, startMs: Math.min(open.startMs, startMs), endMs: Math.max(open.endMs, endMs) };
+      } else {
+        open = { startMs, endMs, segmentId: `${GAP_ID_PREFIX}${Math.round(startMs)}` };
+        textSinceGap = false;
+        warn(`[bot] transcript gap from ${hms(startMs)}Z — ${gapReason(fault)}; marking ${open.segmentId} (extends while the outage lasts)`);
+      }
+      const marker: TranscriptSegment = {
+        segment_id: open.segmentId,
+        speaker: 'system',
+        speaker_key: 'gap',
+        text: `[transcription unavailable ${hms(open.startMs)}–${hms(open.endMs)} UTC — ${gapReason(fault)}]`,
+        start: open.startMs / 1000,
+        end: open.endMs / 1000,
+        completed: true,
+        absolute_start_time: isoFromEpochSeconds(open.startMs / 1000),
+        absolute_end_time: isoFromEpochSeconds(open.endMs / 1000),
+      };
+      void sink.publish(marker).catch((e) => console.error(`[bot] gap marker publish rejected: ${String(e)}`));
+    },
+  };
+}
+
 /** Build the gmeet (per-channel) BotPipeline. The lane is lazy — it begins on the first fed
  *  frame (post-admission), so start() is a no-op and stop() disposes (flush every turn → finalize). */
 function createGmeetBotPipeline(
   transcribe: Transcribe,
   sink: TranscriptSink,
   config?: SpeakerStreamManagerConfig,
-  onError?: (e: unknown) => void,
+  onError?: (e: unknown, span?: GapSpan) => void,
 ): BotPipeline {
   const lane = createGmeetPipeline({ transcribe, sink: laneSink(sink.publish, onError), config, onError });
   return {
@@ -174,7 +248,7 @@ function createMixedBotPipeline(
   sink: TranscriptSink,
   hintKind: HintKind,
   language?: string,
-  onError?: (e: unknown) => void,
+  onError?: (e: unknown, span?: GapSpan) => void,
   createTranscriber: MixedTranscriberFactory = (cb) => ChunkedTranscriber.create(cb),
 ): BotPipeline {
   let transcriber: MixedTranscriber | null = null;
@@ -259,13 +333,24 @@ export function createBotPipeline(
   } = {},
 ): BotPipeline {
   const transcribe = opts.transcribe ?? createTranscribe(inv);
+  // L-0270 — the gap marker, wired ONCE for both lanes: a lane reports a span only when its
+  // audio is gone for good, and that becomes a marker segment on the transcript. The lanes see
+  // a sink that watches text go by (so a marker never merges across real transcript).
+  const gap = createGapPublisher(sink);
+  const gapAwareSink: TranscriptSink = {
+    publish: (seg) => { if ((seg.text ?? '').trim()) gap.sawText(); return sink.publish(seg); },
+  };
+  const onError = (fault: unknown, span?: GapSpan): void => {
+    opts.onError?.(fault);
+    if (span) gap.mark(fault, span);
+  };
   if (isMixedLanePlatform(inv.platform)) {
     return createMixedBotPipeline(
-      transcribe, sink, hintKindForPlatform(inv.platform),
-      inv.language ?? undefined, opts.onError, opts.createMixedTranscriber,
+      transcribe, gapAwareSink, hintKindForPlatform(inv.platform),
+      inv.language ?? undefined, onError, opts.createMixedTranscriber,
     );
   }
-  return createGmeetBotPipeline(transcribe, sink, opts.config, opts.onError);
+  return createGmeetBotPipeline(transcribe, gapAwareSink, opts.config, onError);
 }
 
 /** The post-admission subsystem stages createLivePipeline sequences (used in fault labels). */

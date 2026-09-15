@@ -171,3 +171,55 @@ async def test_real_token_still_sends_authorization_header():
         await llm([{"role": "user", "content": "hi"}])
 
     assert seen == ["Bearer sk-live-123"]
+
+
+# ── L-0270: a transcript with provider gaps must never read as complete ──────────
+# Staging meeting 49 (2026-09-15): the STT provider 503'd for 14 minutes, the bot
+# dropped the audio, and the summary of the surviving two thirds read as if it were
+# the whole meeting. The bot now marks each lost span with a ``gap:`` segment; the
+# summariser must carry that truth into the prompt as ONE explicit notice.
+
+def _gap_seg(segment_id, start, end):
+    return {
+        "segment_id": segment_id, "speaker": "system", "completed": True,
+        "start": start, "end": end,
+        "text": "[transcription unavailable 09:03:50-09:05:50 UTC - provider unavailable (HTTP 503)]",
+    }
+
+
+def test_gap_markers_put_a_not_transcribed_notice_in_the_prompt():
+    segments = [
+        {"segment_id": "s1", "speaker": "Al", "text": "Opening.", "start": 0.0, "end": 10.0},
+        _gap_seg("gap:10000", 10.0, 130.0),          # 2 minutes lost
+        {"segment_id": "s2", "speaker": "Al", "text": "Closing.", "start": 130.0, "end": 140.0},
+    ]
+    body = build_summary_messages(segments)[-1]["content"]
+    assert "2 minutes not transcribed (provider unavailable)" in body
+    # the marker stays inline too, so the model can see WHERE the hole is
+    assert "[transcription unavailable" in body
+    # and the real speech is still there
+    assert "Al: Opening." in body and "Al: Closing." in body
+
+
+def test_a_gapless_transcript_carries_no_notice():
+    body = build_summary_messages(
+        [{"segment_id": "s1", "speaker": "Al", "text": "All good.", "start": 0.0, "end": 10.0}]
+    )[-1]["content"]
+    assert "not transcribed" not in body
+
+
+def test_a_sub_minute_gap_is_still_declared():
+    body = build_summary_messages([
+        {"segment_id": "s1", "speaker": "Al", "text": "Opening.", "start": 0.0, "end": 10.0},
+        _gap_seg("gap:10000", 10.0, 40.0),
+    ])[-1]["content"]
+    assert "less than a minute not transcribed (provider unavailable)" in body
+
+
+async def test_a_meeting_that_is_only_gaps_is_not_summarized():
+    """A total outage has no minutes to write — the marker text is not content."""
+    store = _store(segments=[_gap_seg("gap:0", 0.0, 600.0)])
+    calls: list = []
+    assert await summarize_tick(store, await _llm_recording(calls), model="m-1") == 0
+    assert calls == []
+    assert "summary" not in store._meetings[1]["data"]

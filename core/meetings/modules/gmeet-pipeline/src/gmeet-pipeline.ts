@@ -37,8 +37,14 @@ export interface GmeetPipelineOptions {
   /** Surface a transcribe FAILURE (P18: fail loud + attributable). The pipeline still
    *  degrades gracefully (empty turn) so it doesn't wedge, but it reports the fault here
    *  so the host can make it observable (a /ws health frame, telemetry, lifecycle) instead
-   *  of a silent "no transcript". Receives the thrown value (e.g. a TranscriptionError). */
-  onError?: (fault: unknown) => void;
+   *  of a silent "no transcript". Receives the thrown value (e.g. a TranscriptionError).
+   *
+   *  `span` (L-0270) is present ONLY when the audio is GONE: the channel turn closed
+   *  having confirmed nothing after at least one fault, so [startMs, endMs] (wall-clock
+   *  ms) will never reach the transcript. The host turns that into a gap marker — without
+   *  it a dead STT is indistinguishable from silence in the stored transcript. A fault on
+   *  a LIVE turn carries no span: the buffer keeps the audio and re-submits it. */
+  onError?: (fault: unknown, span?: { startMs: number; endMs: number }) => void;
 }
 
 export interface GmeetPipeline {
@@ -51,6 +57,7 @@ export interface GmeetPipeline {
 export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const UNKNOWN = opts.unknownLabel ?? 'Speaker';
   const ONSET_GAP = opts.onsetGapMs ?? 1000;
+  const SAMPLE_RATE = opts.config?.sampleRate ?? 16000;   // submitted samples → the window's ms
   const mgr = new SpeakerStreamManager(opts.config);
   const inflight = new Set<Promise<void>>();
   // Per channel: the CURRENT turn's stream key, bound name, last-audio time, turn counter.
@@ -77,7 +84,21 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const langOf = (l: string | undefined): string | undefined =>
     l && l !== 'unknown' ? l : undefined;
 
+  // L-0270: per-stream fault memory. A failed submission is NOT yet a hole — the buffer keeps
+  // the audio and the next window re-submits it. It becomes a hole when the TURN closes without
+  // ever confirming anything, so we accumulate the faulted window here and adjudicate at close.
+  const faulted = new Map<string, { fault: unknown; startMs: number; endMs: number }>();
+  const reportLostAudio = (key: string): void => {
+    const f = faulted.get(key);
+    if (!f) return;
+    faulted.delete(key);
+    if (f.endMs > f.startMs) opts.onError?.(f.fault, { startMs: f.startMs, endMs: f.endMs });
+  };
+
   mgr.onSegmentReady = (speakerId, _name, audio) => {
+    // Captured BEFORE the round-trip: on failure the manager frees the turn and the window moves.
+    const startMs = mgr.getBufferStartMs(speakerId);
+    const endMs = startMs + (audio.length / SAMPLE_RATE) * 1000;
     const p = (async () => {
       try {
         const r = await opts.transcribe(audio, mgr.getLastConfirmedText(speakerId) || undefined);
@@ -85,6 +106,12 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
         mgr.handleTranscriptionResult(speakerId, (r?.text || '').trim(), segs?.[segs.length - 1]?.end, segs, langOf(r?.language));
       } catch (e) {
         opts.onError?.(e);                          // P18: report the fault, don't swallow it…
+        const prev = faulted.get(speakerId);        // …remember the window it cost us (L-0270)…
+        faulted.set(speakerId, {
+          fault: e,
+          startMs: prev ? Math.min(prev.startMs, startMs) : startMs,
+          endMs: Math.max(prev?.endMs ?? 0, endMs),
+        });
         mgr.handleTranscriptionResult(speakerId, '');   // …but still free the turn (graceful degrade)
       }
     })();
@@ -94,6 +121,8 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
 
   mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang) => {
     if (!text.trim()) return;
+    // The stream recovered and emitted the audio it was holding — no hole to report (L-0270).
+    faulted.delete(speakerId);
     opts.sink.segment(segOf(speakerName, speakerId, text, startMs, endMs, true, lang));
   };
   mgr.onSegmentPending = (speakerId, speakerName, text, startMs, lang) => {
@@ -104,7 +133,14 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   // Close a finished turn: final-submit + emit (name is fixed on the key, so the late
   // transcribe can't be mislabeled), then free the stream after it has long settled.
   const closeTurn = (key: string) => {
-    void mgr.flushSpeaker(key, true).catch(() => { /* nothing owed */ });
+    void mgr.flushSpeaker(key, true)
+      .catch(() => { /* nothing owed */ })
+      // The final submit may still be in flight; adjudicate the hole once it has settled (L-0270).
+      // settle() waits on EVERY stream, so under continuous cross-channel load the marker can be
+      // published late — never wrong (the span is audio time), and dispose() backstops it.
+      .then(settle)
+      .then(() => reportLostAudio(key))
+      .catch(() => { /* reporting must never wedge a close */ });
     const t = setTimeout(() => mgr.removeSpeaker(key), 12000);
     (t as { unref?: () => void }).unref?.();   // don't keep the process alive for cleanup
   };
@@ -140,6 +176,8 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
     dispose: async () => {
       for (const st of chan.values()) await mgr.flushSpeaker(st.key, true);
       await settle();
+      // The session ends here: every still-faulted stream is a hole nobody will fill (L-0270).
+      for (const key of [...faulted.keys()]) reportLostAudio(key);
       mgr.removeAll();
       await opts.sink.finalize();
     },

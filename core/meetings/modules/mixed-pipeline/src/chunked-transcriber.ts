@@ -142,8 +142,15 @@ export interface ChunkedTranscriberCallbacks {
   log?: (msg: string) => void;
   /** Surface a transcribe FAILURE (P18: fail loud + attributable). The turn still
    *  degrades gracefully, but the host gets the fault to make it observable instead of
-   *  a silent "no transcript". Receives the thrown value (e.g. a TranscriptionError). */
-  onError?: (fault: unknown) => void;
+   *  a silent "no transcript". Receives the thrown value (e.g. a TranscriptionError).
+   *
+   *  `span` (L-0270) is present ONLY when the audio is GONE: the turn closed having
+   *  confirmed nothing after at least one fault, so nothing will ever be published for
+   *  [startMs, endMs] (audio time). The host turns that into a transcript gap marker —
+   *  without it a dead STT is indistinguishable from silence in the stored transcript.
+   *  A fault on an OPEN turn carries no span: that window is re-submitted on the next
+   *  tick, so it is not (yet) a hole. */
+  onError?: (fault: unknown, span?: { startMs: number; endMs: number }) => void;
   /** Instantaneous per-hint outcome (the hint-hop instrument): 'matched' when the
    *  hint names/claims a turn at the moment it arrives (or re-asserts the open
    *  turn's already-resolved name); 'missed' when no turn overlaps it yet. A
@@ -193,6 +200,9 @@ interface Turn {
   /** Names this turn must NOT be (re)claimed to — a short-UI-switch hint that was
    *  held provisional, so a later claim/rename can't resurrect the bad name. */
   blockedNames?: Set<string>;
+  /** L-0270: the last STT fault this turn suffered. If the turn closes having published
+   *  nothing, this audio is LOST and the close reports the span (see closeOut). */
+  faulted?: unknown;
 }
 /** A committed turn whose hint hasn't arrived yet (provisional segmentation id) —
  *  re-resolved when a later hint produces a window match. Segments live in
@@ -576,6 +586,7 @@ export class ChunkedTranscriber {
     } catch (e: any) {
       this.cb.onError?.(e);                                            // P18: surface the fault…
       this.log(`[ChunkedTranscriber] transcribe failed: ${e?.message}`);   // …keep the local log too
+      turn.faulted = e;                                                // …and remember it for closeOut (L-0270)
     }
     const gated = result ? this.applyGates(result, spanEnd - spanStart) : null;
     if (!gated || gated.length === 0) {
@@ -689,6 +700,14 @@ export class ChunkedTranscriber {
       // the same sentence appears under two turns.
       this.confirmedHighWaterMs = Math.max(this.confirmedHighWaterMs, promoted[promoted.length - 1].endMs);
       this.log(`[ChunkedTranscriber] turn ${turn.turnId}: promoted ${promoted.length} draft segment(s) on close`);
+    }
+    // L-0270: the turn is over and NOTHING was published for it after at least one STT
+    // fault — this audio is gone for good. Report the LOST SPAN (not just the fault, which
+    // carries no time) so the host can mark the hole in the transcript instead of letting a
+    // dead provider look like silence. A turn that simply held no speech has no `faulted`.
+    if (turn.allConfirmed.length === 0 && turn.faulted !== undefined && turn.t1 > turn.t0) {
+      this.log(`[ChunkedTranscriber] turn ${turn.turnId}: LOST ${(turn.t1 - turn.t0).toFixed(0)}ms of audio to an STT fault`);
+      this.cb.onError?.(turn.faulted, { startMs: turn.t0, endMs: turn.t1 });
     }
     if (turn.pendingName) this.cb.clearPending(turn.pendingName);
     // Register a name vote for the closed turn. If no hint overlaps yet
