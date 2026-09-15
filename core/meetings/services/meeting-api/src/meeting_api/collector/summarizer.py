@@ -84,6 +84,42 @@ class SummaryStore(Protocol):
         ...
 
 
+#: L-0270 — the bot marks audio it LOST to a dead STT provider with a segment whose
+#: ``segment_id`` starts with this prefix (see the bot's ``pipeline.ts``
+#: ``GAP_ID_PREFIX``). It is a marker, not speech: it must never be summarised as
+#: content, and its minutes must be declared so a summary of two thirds of a meeting
+#: never reads as the whole meeting.
+GAP_PREFIX = "gap:"
+
+
+def is_gap_marker(seg: dict) -> bool:
+    return str(seg.get("segment_id") or "").startswith(GAP_PREFIX)
+
+
+def gap_notice(segments: list[dict]) -> Optional[str]:
+    """The one-line truth about what the transcript is missing, or ``None`` when it
+    is whole. Derived from the gap markers themselves — never from a provider health
+    signal the summariser cannot see."""
+    lost = 0.0
+    for seg in segments:
+        if not is_gap_marker(seg):
+            continue
+        try:
+            lost += max(0.0, float(seg["end"]) - float(seg["start"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if lost <= 0:
+        return None
+    minutes = round(lost / 60)
+    amount = f"{minutes} minutes" if minutes >= 1 else "less than a minute"
+    return (
+        f"NOTICE — this transcript is INCOMPLETE: {amount} not transcribed "
+        "(provider unavailable). The missing stretches are marked inline as "
+        "[transcription unavailable …]. Say so plainly in the TL;DR and never "
+        "present these minutes as covering the whole meeting."
+    )
+
+
 #: Share of transcribed characters one language must carry before the prompt NAMES it. Below this
 #: the meeting is genuinely mixed and ``SUMMARY_SYSTEM``'s own mixed-language rule decides.
 SUMMARY_LANGUAGE_DOMINANCE = 0.6
@@ -139,6 +175,9 @@ def build_summary_messages(segments: list[dict]) -> list[dict]:
         text = (seg.get("text") or "").strip()
         if not text:
             continue
+        if is_gap_marker(seg):
+            lines.append(text)  # the transcript's own hole, not an utterance by anyone
+            continue
         speaker = (seg.get("speaker") or "").strip() or "Speaker"
         lines.append(f"{speaker}: {text}")
     transcript = "\n".join(lines)
@@ -155,9 +194,15 @@ def build_summary_messages(segments: list[dict]) -> list[dict]:
         if language
         else ""
     )
+    # The gap notice rides ABOVE the (possibly elided) transcript so it always survives (L-0270).
+    notice = gap_notice(segments)
     return [
         {"role": "system", "content": SUMMARY_SYSTEM},
-        {"role": "user", "content": f"Transcript:\n\n{transcript}\n\n{held}Write the minutes."},
+        {
+            "role": "user",
+            "content": (f"{notice}\n\n" if notice else "")
+            + f"Transcript:\n\n{transcript}\n\n{held}Write the minutes.",
+        },
     ]
 
 
@@ -209,8 +254,14 @@ async def summarize_tick(
         try:
             doc = await store.get_transcript_by_id(int(candidate["user_id"]), meeting_id)
             segments = (doc or {}).get("segments") or []
-            if not any((seg.get("text") or "").strip() for seg in segments):
-                continue  # rows may exist with empty text only — nothing to summarize
+            if not any(
+                (seg.get("text") or "").strip() and not is_gap_marker(seg)
+                for seg in segments
+            ):
+                # Rows may exist with empty text only — nothing to summarize. A transcript
+                # of nothing but gap markers is the same case: a total STT outage has no
+                # minutes to write, and the markers are not content (L-0270).
+                continue
             text = await llm(build_summary_messages(segments))
             stamp = (now or datetime.now(timezone.utc)).isoformat()
             await store.write_summary(
