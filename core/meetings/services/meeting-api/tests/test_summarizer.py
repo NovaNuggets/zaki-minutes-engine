@@ -227,6 +227,23 @@ async def test_a_meeting_that_is_only_gaps_is_not_summarized():
     assert "summary" not in store._meetings[1]["data"]
 
 
+def test_a_gap_line_is_never_attributed_to_a_speaker():
+    """The marker is the transcript's own hole: rendered bare, so the model cannot credit it
+    to a person (the bot stores it under speaker "system"; a store may also drop the name)."""
+    named = _gap_seg("gap:10000", 10.0, 130.0)
+    unnamed = {**_gap_seg("gap:200000", 200.0, 260.0), "speaker": None}
+    body = build_summary_messages([
+        {"segment_id": "s1", "speaker": "Al", "text": "Opening.", "start": 0.0, "end": 10.0},
+        named,
+        unnamed,
+    ])[-1]["content"]
+    lines = body.splitlines()
+    gap_lines = [ln for ln in lines if "UTC - provider unavailable (HTTP 503)]" in ln]  # the markers, not the NOTICE
+    assert len(gap_lines) == 2
+    assert all(ln.startswith("[transcription unavailable") for ln in gap_lines), gap_lines
+    assert "system:" not in body and "Speaker: [transcription" not in body
+
+
 # ── L-0271: the summary must be written in the meeting's own language ────────────────────────────
 # Staging meeting 49 (German, 09-15) produced a German transcript and an ENGLISH summary:
 # SUMMARY_SYSTEM asks for "the MEETING'S OWN dominant language" but nothing ever told the model
@@ -299,3 +316,18 @@ def test_the_dominance_threshold_is_the_one_constant():
     assert dominant_language([_seg(1, "d" * at, "de"), _seg(2, "f" * (total - at), "fr")]) == "de"
     assert dominant_language([_seg(1, "d" * (at - 1), "de"),
                               _seg(2, "f" * (total - at + 1), "fr")]) is None
+
+
+def test_language_sentence_and_gap_notice_ride_the_same_prompt():
+    """L-0270 × L-0271 (#63): both user-message additions survive together, and a gap marker
+    (stored with no language) casts no language vote."""
+    segments = [
+        _seg(1, GERMAN, "de"),
+        _gap_seg("gap:2000", 2.0, 182.0),                      # 3 minutes lost
+        _seg(200, "Wir brauchen noch einen Termin für die Freigabe.", "de"),
+    ]
+    body = build_summary_messages(segments)[-1]["content"]
+    assert body.startswith("NOTICE — this transcript is INCOMPLETE: 3 minutes not transcribed (provider unavailable).")
+    assert "The meeting was held in de. Write the summary in de." in body
+    assert body.index("NOTICE") < body.index("Transcript:") < body.index("The meeting was held in de.")
+    assert dominant_language(segments) == "de"

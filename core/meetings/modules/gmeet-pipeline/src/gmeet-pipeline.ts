@@ -39,11 +39,12 @@ export interface GmeetPipelineOptions {
    *  so the host can make it observable (a /ws health frame, telemetry, lifecycle) instead
    *  of a silent "no transcript". Receives the thrown value (e.g. a TranscriptionError).
    *
-   *  `span` (L-0270) is present ONLY when the audio is GONE: the channel turn closed
-   *  having confirmed nothing after at least one fault, so [startMs, endMs] (wall-clock
-   *  ms) will never reach the transcript. The host turns that into a gap marker — without
-   *  it a dead STT is indistinguishable from silence in the stored transcript. A fault on
-   *  a LIVE turn carries no span: the buffer keeps the audio and re-submits it. */
+   *  `span` (L-0270) is present ONLY when the audio is GONE: faulted audio the STT never
+   *  heard afterwards — because the buffer discarded it before the next successful
+   *  round-trip, or because the turn closed first — so [startMs, endMs] (wall-clock ms)
+   *  will never reach the transcript. The host turns that into a gap marker; without it a
+   *  dead STT is indistinguishable from silence in the stored transcript. The per-failure
+   *  report carries no span: the buffer normally keeps the audio and re-submits it. */
   onError?: (fault: unknown, span?: { startMs: number; endMs: number }) => void;
 }
 
@@ -84,15 +85,23 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
   const langOf = (l: string | undefined): string | undefined =>
     l && l !== 'unknown' ? l : undefined;
 
-  // L-0270: per-stream fault memory. A failed submission is NOT yet a hole — the buffer keeps
-  // the audio and the next window re-submits it. It becomes a hole when the TURN closes without
-  // ever confirming anything, so we accumulate the faulted window here and adjudicate at close.
+  // L-0270: per-stream fault memory — the audio span the STT failed on and has not heard since.
+  // A failed submission is NOT yet a hole: the buffer normally keeps the audio and re-submits it.
+  // It is adjudicated on the stream's next SUCCESSFUL round-trip — never on a confirm, because a
+  // confirm can be a flush of a stale pre-outage draft that the manager stamps over the whole window:
+  //   • that window starts where the fault did → the STT has now heard the audio → nothing lost;
+  //   • it starts LATER → the manager discarded the head in between (SpeakerStreamManager.trySubmit's
+  //     maxBufferDuration hard cap → fullReset) → [fault start, window start] is gone: report it now.
+  // Faults no success ever follows are reported when the turn closes (closeTurn) or at dispose.
   const faulted = new Map<string, { fault: unknown; startMs: number; endMs: number }>();
+  const reportLost = (fault: unknown, startMs: number, endMs: number): void => {
+    if (endMs > startMs) opts.onError?.(fault, { startMs, endMs });
+  };
   const reportLostAudio = (key: string): void => {
     const f = faulted.get(key);
     if (!f) return;
     faulted.delete(key);
-    if (f.endMs > f.startMs) opts.onError?.(f.fault, { startMs: f.startMs, endMs: f.endMs });
+    reportLost(f.fault, f.startMs, f.endMs);
   };
 
   mgr.onSegmentReady = (speakerId, _name, audio) => {
@@ -102,6 +111,11 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
     const p = (async () => {
       try {
         const r = await opts.transcribe(audio, mgr.getLastConfirmedText(speakerId) || undefined);
+        const f = faulted.get(speakerId);           // L-0270: the STT heard [startMs, endMs] — adjudicate
+        if (f) {
+          faulted.delete(speakerId);
+          reportLost(f.fault, f.startMs, startMs);  // only the head this window no longer holds
+        }
         const segs = r?.segments;
         mgr.handleTranscriptionResult(speakerId, (r?.text || '').trim(), segs?.[segs.length - 1]?.end, segs, langOf(r?.language));
       } catch (e) {
@@ -121,8 +135,6 @@ export function createGmeetPipeline(opts: GmeetPipelineOptions): GmeetPipeline {
 
   mgr.onSegmentConfirmed = (speakerId, speakerName, text, startMs, endMs, _segmentId, lang) => {
     if (!text.trim()) return;
-    // The stream recovered and emitted the audio it was holding — no hole to report (L-0270).
-    faulted.delete(speakerId);
     opts.sink.segment(segOf(speakerName, speakerId, text, startMs, endMs, true, lang));
   };
   mgr.onSegmentPending = (speakerId, speakerName, text, startMs, lang) => {

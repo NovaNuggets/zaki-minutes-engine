@@ -163,12 +163,15 @@ const GAP_ID_PREFIX = 'gap:';
 /** UTC wall clock of an epoch-ms instant, to the second — the reader's "when". */
 const hms = (ms: number): string => new Date(ms).toISOString().slice(11, 19);
 
-/** Name the provider failure from the typed STT fault (kind + status, never the provider's
- *  response body — it is untrusted text that would land in the stored transcript). */
+/** Name the provider failure from the typed STT fault: kind + status ONLY. Never the provider's
+ *  response body or the error message (TranscriptionError.message embeds the body) — it is
+ *  untrusted text that would land in the stored transcript and the warn line (content-free rule).
+ *  A `kind` that is not a bare enum token (a foreign error object) is not trusted either. */
 function gapReason(fault: unknown): string {
   const f = fault as { kind?: unknown; status?: unknown } | null | undefined;
-  const kind = typeof f?.kind === 'string' ? f.kind.replace(/_/g, ' ') : 'unavailable';
-  return `provider ${kind}${typeof f?.status === 'number' ? ` (HTTP ${f.status})` : ''}`;
+  const kind = typeof f?.kind === 'string' && /^[a-z_]{1,32}$/.test(f.kind) ? f.kind.replace(/_/g, ' ') : 'unavailable';
+  const status = typeof f?.status === 'number' ? ` (HTTP ${f.status})` : '';
+  return `provider ${kind}${status}`;
 }
 
 /**
@@ -340,9 +343,11 @@ export function createBotPipeline(
   const gapAwareSink: TranscriptSink = {
     publish: (seg) => { if ((seg.text ?? '').trim()) gap.sawText(); return sink.publish(seg); },
   };
+  // A span report re-delivers a fault the lane ALREADY surfaced when it happened: it becomes a
+  // marker, not a second host fault (index.ts would log `[bot] pipeline fault` twice per lost turn).
   const onError = (fault: unknown, span?: GapSpan): void => {
-    opts.onError?.(fault);
     if (span) gap.mark(fault, span);
+    else opts.onError?.(fault);
   };
   if (isMixedLanePlatform(inv.platform)) {
     return createMixedBotPipeline(

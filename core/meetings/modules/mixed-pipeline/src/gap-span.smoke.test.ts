@@ -103,6 +103,97 @@ type Span = { startMs: number; endMs: number } | undefined;
     JSON.stringify(faults.map((f) => f.span)));
 }
 
+const seg = (text: string, start: number, end: number): any =>
+  ({ text, start, end, no_speech_prob: 0.01, avg_logprob: -0.1, compression_ratio: 1.0 });
+const said = (segs: any[]) =>
+  ({ text: segs.map((s) => s.text).join(' '), language: 'en', language_probability: 0.99, duration: 2, segments: segs });
+
+async function harness(transcribe: () => Promise<any>) {
+  let emit: (ev: BoundaryEvent) => void = () => {};
+  const faults: Array<{ fault: unknown; span: Span }> = [];
+  const published: Array<{ startMs: number; endMs: number; text: string }> = [];
+  const tc = await ChunkedTranscriber.create({
+    language: 'en',
+    transcribe,
+    publish: (_speaker, confirmed) => { published.push(...confirmed); },
+    publishPending: () => {},
+    clearPending: () => {},
+    rename: () => {},
+    onError: (fault, span) => { faults.push({ fault, span }); },
+    log: () => {},
+    makeSegmenter: async (onBoundary): Promise<BoundarySource> => {
+      emit = onBoundary;
+      return { appendFrame: async () => {}, reset() {} };
+    },
+  });
+  const feed = (fromMs: number, toMs: number) => {
+    const halfSecond = new Float32Array(SAMPLE_RATE / 2).fill(0.1);
+    for (let t = fromMs; t < toMs; t += 500) tc.feedAudio(halfSecond, t);
+  };
+  return { tc, faults, published, feed, emit: (kind: BoundaryEvent['kind'], tMs: number) => emit({ tMs, kind, confidence: 0.9 }) };
+}
+const down = () => new TranscriptionError('unavailable', 503, 'Service unavailable', true);
+
+// ── 3) a fault the turn RECOVERS from reports no lost span ─────────────────────
+// A tick fails, then the closing pass (same window, from the same confirmed edge) succeeds with
+// speech ending at 1.2 s of a 3 s turn: the STT heard all of it, so nothing is lost — not even the
+// silent 1.8 s after the last word.
+{
+  let up = false;
+  const h = await harness(async () => {
+    if (!up) throw down();
+    return said([seg('alpha beta', 0, 1.2)]);
+  });
+  h.emit('silence→speaker', 0);
+  await sleep(25);
+  h.feed(0, 3000);
+  await sleep(2300);                       // one heartbeat tick submits [0, 3000] — and fails
+  const faultsBeforeRecovery = h.faults.length;
+  up = true;
+  h.emit('speaker→silence', 3000);
+  await sleep(200);
+  await h.tc.dispose();
+  check('[recovered] the tick did fail before the close (the case is exercised)', faultsBeforeRecovery >= 1, `${faultsBeforeRecovery}`);
+  check('[recovered] the closing pass published the speech', h.published.some((p) => p.text === 'alpha beta'), JSON.stringify(h.published));
+  check('[recovered] a turn that faulted and then was heard reports NO lost span',
+    h.faults.filter((f) => !!f.span).length === 0, JSON.stringify(h.faults.map((f) => f.span)));
+}
+
+// ── 4) a turn that confirmed speech, THEN lost its tail to the outage ───────────
+// Three stable ticks confirm the leading words, the provider dies, the turn closes: the lost span
+// is exactly the unpublished tail [confirmed edge, t1] — not the whole turn, and not nothing.
+{
+  let calls = 0;
+  let up = true;
+  const h = await harness(async () => {
+    if (!up) throw down();
+    calls++;
+    return said([seg('alpha', 0, 0.8), seg('beta', 0.8, 1.6), seg('gamma', 1.6, 2.4), seg(`tail${calls}`, 2.4, 2.8)]);
+  });
+  h.emit('silence→speaker', 0);
+  await sleep(25);
+  let edge = 0;
+  for (let pass = 0; pass < 4 && h.published.length === 0; pass++) {
+    h.feed(edge, edge + 2500); edge += 2500;
+    await sleep(1100);                    // one heartbeat → one tick (≥2 s of new audio each)
+  }
+  const confirmed = h.published.slice();
+  const confirmedEdge = Math.max(0, ...confirmed.map((p) => p.endMs));
+  up = false;                             // the provider dies mid-turn
+  h.feed(edge, edge + 2500); edge += 2500;
+  await sleep(1100);
+  h.emit('speaker→silence', edge);
+  await sleep(300);
+  await h.tc.dispose();
+  const spanned = h.faults.filter((f) => !!f.span);
+  const span = spanned[0]?.span;
+  check('[tail] speech was confirmed before the outage (the case is exercised)', confirmed.length >= 1, JSON.stringify(h.published));
+  check('[tail] the lost tail is reported exactly once', spanned.length === 1, JSON.stringify(spanned.map((f) => f.span)));
+  check('[tail] the span starts at the confirmed edge — the transcribed head is not claimed',
+    !!span && Math.abs(span.startMs - confirmedEdge) < 50, `${span?.startMs} vs ${confirmedEdge}`);
+  check('[tail] the span runs to the turn close', !!span && Math.abs(span.endMs - edge) <= 500, `${span?.endMs} vs ${edge}`);
+}
+
 if (failed) {
   console.error(`\n❌ gap-span: ${failed} check(s) FAILED.`);
   process.exit(1);
