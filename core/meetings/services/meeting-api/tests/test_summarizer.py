@@ -9,7 +9,9 @@ import pytest
 from meeting_api.collector.fakes import InMemoryTranscriptStore
 from meeting_api.collector.summarizer import (
     MAX_PROMPT_CHARS,
+    SUMMARY_LANGUAGE_DOMINANCE,
     build_summary_messages,
+    dominant_language,
     openai_chat_llm,
     summarize_tick,
 )
@@ -223,3 +225,77 @@ async def test_a_meeting_that_is_only_gaps_is_not_summarized():
     assert await summarize_tick(store, await _llm_recording(calls), model="m-1") == 0
     assert calls == []
     assert "summary" not in store._meetings[1]["data"]
+
+
+# ── L-0271: the summary must be written in the meeting's own language ────────────────────────────
+# Staging meeting 49 (German, 09-15) produced a German transcript and an ENGLISH summary:
+# SUMMARY_SYSTEM asks for "the MEETING'S OWN dominant language" but nothing ever told the model
+# which language that was, so the model guessed and defaulted to English.
+
+GERMAN = "Wir haben beschlossen, den Zusammenfassungsgenerator diese Woche auszuliefern."
+
+
+def _seg(i: int, text: str, language, speaker: str = "Al") -> dict:
+    return {"segment_id": f"s{i}", "start": float(i), "end": float(i) + 1.0, "speaker": speaker,
+            "text": text, "language": language, "completed": True}
+
+
+def test_german_majority_states_the_language_in_the_user_message():
+    segments = [_seg(1, GERMAN, "de"),
+                _seg(2, "Wir brauchen noch einen Termin für die Freigabe.", "de"),
+                _seg(3, "Okay.", "en")]
+
+    body = build_summary_messages(segments)[-1]["content"]
+
+    assert "The meeting was held in de." in body
+    assert "Write the summary in de." in body
+
+
+def test_dominance_is_by_transcribed_characters_not_by_turn_count():
+    # twelve one-word turns must not outvote two long ones: turn count is not the measure
+    segments = [_seg(i, "Okay.", "en") for i in range(12)]
+    segments += [_seg(98, GERMAN, "de"), _seg(99, GERMAN, "de")]
+
+    assert dominant_language(segments) == "de"
+
+
+def test_blank_turns_and_out_of_bound_languages_do_not_vote():
+    """Blank text carries no language, and the read plane's sealed bounds (2..35 chars,
+    ``zaki_read/router.py``) decide what counts as a language at all."""
+    segments = [_seg(1, GERMAN, "de"),
+                _seg(2, "", "fr"), _seg(3, "   ", "fr"),
+                _seg(4, "x" * 400, "x"), _seg(5, "y" * 400, ""),
+                _seg(6, "z" * 400, "x" * 36), _seg(7, "q" * 400, None)]
+
+    assert dominant_language(segments) == "de"
+
+
+def test_mixed_below_the_threshold_keeps_the_system_mixed_language_rule():
+    segments = [_seg(1, "Wir sprechen über den Zeitplan. " * 4, "de"),
+                _seg(2, "Nous parlons du calendrier maintenant. " * 4, "fr")]
+
+    messages = build_summary_messages(segments)
+
+    assert dominant_language(segments) is None
+    assert "The meeting was held in" not in messages[-1]["content"]
+    assert "mixes languages" in messages[0]["content"]  # the system rule still decides
+
+
+def test_the_en_default_is_never_asserted_as_the_meeting_language():
+    """``chunked-transcriber.ts`` labels an UNDETECTED chunk 'en'
+    (``this.cb.language || result.language || 'en'``) and the probability that would separate a
+    real detection from that fallback is not persisted — so 'en' is never claimed with confidence."""
+    segments = [_seg(1, "We agreed to ship the summary generator this week.", "en"),
+                _seg(2, "Nova owns the deploy.", "en")]
+
+    assert dominant_language(segments) is None
+    assert "The meeting was held in" not in build_summary_messages(segments)[-1]["content"]
+
+
+def test_the_dominance_threshold_is_the_one_constant():
+    total = 1000
+    at = int(total * SUMMARY_LANGUAGE_DOMINANCE)
+
+    assert dominant_language([_seg(1, "d" * at, "de"), _seg(2, "f" * (total - at), "fr")]) == "de"
+    assert dominant_language([_seg(1, "d" * (at - 1), "de"),
+                              _seg(2, "f" * (total - at + 1), "fr")]) is None

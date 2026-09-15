@@ -120,8 +120,56 @@ def gap_notice(segments: list[dict]) -> Optional[str]:
     )
 
 
+#: Share of transcribed characters one language must carry before the prompt NAMES it. Below this
+#: the meeting is genuinely mixed and ``SUMMARY_SYSTEM``'s own mixed-language rule decides.
+SUMMARY_LANGUAGE_DOMINANCE = 0.6
+
+#: The transcriber's fallback label, NOT a detection: ``chunked-transcriber.ts`` writes
+#: ``this.cb.language || result.language || 'en'``, so every chunk Whisper could not identify is
+#: stored as 'en'. ``language_probability`` — the only thing that would separate the two — is
+#: dropped before the segment is persisted (``collector/ingest.py`` keeps ``language`` alone), so a
+#: dominant 'en' is never asserted: the model keeps its own default instead of being told a guess.
+#: Deliberately coarse, with a known ceiling: an English meeting is simply not named (the model
+#: defaults there anyway). Upgrade path: persist ``language_probability`` through ingest and weight
+#: by it, then English can be asserted like any other language.
+UNRELIABLE_DEFAULT_LANGUAGE = "en"
+
+#: The read plane's sealed bounds for a segment language (``zaki_read/router.py``): anything else is
+#: not a language and does not vote.
+_LANGUAGE_BOUNDS = (2, 35)
+
+
+def dominant_language(segments: list[dict]) -> Optional[str]:
+    """The meeting's own language, or ``None`` when the transcript does not settle one.
+
+    Weighted by TRANSCRIBED CHARACTERS, not by turn count — a dozen "okay"s must not outvote the
+    substantive discussion. Blank turns and languages outside the sealed bounds do not vote, and the
+    transcriber's ``'en'`` fallback is never returned (see ``UNRELIABLE_DEFAULT_LANGUAGE``)."""
+    chars: dict[str, int] = {}
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        language = seg.get("language")
+        if not text or not isinstance(language, str):
+            continue
+        language = language.strip().lower()
+        if not _LANGUAGE_BOUNDS[0] <= len(language) <= _LANGUAGE_BOUNDS[1]:
+            continue
+        chars[language] = chars.get(language, 0) + len(text)
+    if not chars:
+        return None
+    language, count = max(chars.items(), key=lambda item: item[1])
+    if count / sum(chars.values()) < SUMMARY_LANGUAGE_DOMINANCE:
+        return None
+    return None if language == UNRELIABLE_DEFAULT_LANGUAGE else language
+
+
 def build_summary_messages(segments: list[dict]) -> list[dict]:
-    """One prompt from speaker-attributed segments, head+tail bounded."""
+    """One prompt from speaker-attributed segments, head+tail bounded, in the meeting's language.
+
+    ``SUMMARY_SYSTEM`` has always asked for "the MEETING'S OWN dominant language" — but the model was
+    never TOLD what that was, so it guessed and defaulted to English (staging meeting 49, German
+    transcript, English minutes). The segments carry the detection; ``dominant_language`` reads it and
+    the user message states it. A meeting that does not settle one keeps the system's mixed rule."""
     lines = []
     for seg in segments:
         text = (seg.get("text") or "").strip()
@@ -140,14 +188,20 @@ def build_summary_messages(segments: list[dict]) -> list[dict]:
             + "\n[… middle of the meeting elided for length …]\n"
             + transcript[-half:]
         )
-    # The notice rides ABOVE the (possibly elided) transcript so it always survives.
+    language = dominant_language(segments)
+    held = (
+        f"The meeting was held in {language}. Write the summary in {language}.\n\n"
+        if language
+        else ""
+    )
+    # The gap notice rides ABOVE the (possibly elided) transcript so it always survives (L-0270).
     notice = gap_notice(segments)
     return [
         {"role": "system", "content": SUMMARY_SYSTEM},
         {
             "role": "user",
             "content": (f"{notice}\n\n" if notice else "")
-            + f"Transcript:\n\n{transcript}\n\nWrite the minutes.",
+            + f"Transcript:\n\n{transcript}\n\n{held}Write the minutes.",
         },
     ]
 
