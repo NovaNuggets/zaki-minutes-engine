@@ -150,8 +150,9 @@ pulled as a public Vexa bot image.
 ## Kubernetes bot Pod contract
 
 For a ZAKI Kubernetes deployment, the runtime accepts `ZAKI_MINUTES_BOT_CONTRACT_JSON` only for
-the `meeting-bot` profile. The contract pins the ProjectNuggets GHCR bot image by source SHA and
-digest and carries the restricted Pod settings: non-root UID/GID, RuntimeDefault seccomp, dropped
+the `meeting-bot` profile. The contract pins the GHCR bot image (owner `projectnuggets` or
+`novanuggets`, both accepted during the image move) by source SHA and digest and carries the
+restricted Pod settings: non-root UID/GID, RuntimeDefault seccomp, dropped
 Linux capabilities, read-only root filesystem, dedicated service account with token mounting off,
 bounded resources, and the `/tmp` and `/dev/shm` writable volumes. A supplied contract is validated
 at boot; a malformed or broadened document prevents the runtime from starting rather than creating

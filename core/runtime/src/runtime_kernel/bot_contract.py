@@ -17,8 +17,10 @@ from typing import Any, Mapping
 
 
 BOT_CONTRACT_ENV = "ZAKI_MINUTES_BOT_CONTRACT_JSON"
+# Both GHCR owners while images move from projectnuggets to the novanuggets org (same digests);
+# drop projectnuggets once no pin references it.
 _BOT_IMAGE = re.compile(
-    r"^ghcr\.io/projectnuggets/zaki-minutes-bot:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$"
+    r"^ghcr\.io/(?:projectnuggets|novanuggets)/zaki-minutes-bot:sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}$"
 )
 _RESOURCE_KEYS = {"cpu", "memory", "ephemeral-storage"}
 _POD_VOLUME_NAMES = {"tmp", "dshm"}
@@ -102,7 +104,8 @@ class BotPodContract:
         if not _BOT_IMAGE.fullmatch(image):
             _error(
                 "image",
-                "must be the immutable ghcr.io/projectnuggets/zaki-minutes-bot source tag and digest",
+                "must be the immutable ghcr.io/(projectnuggets|novanuggets)/zaki-minutes-bot "
+                "source tag and digest",
             )
 
         image_pull_policy = _string(doc.get("imagePullPolicy"), "imagePullPolicy")

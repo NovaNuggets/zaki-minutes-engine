@@ -99,6 +99,37 @@ def test_contract_rejects_a_public_or_mutable_bot_image():
         BotPodContract.from_document(document)
 
 
+# GHCR image move: the bot image is re-pinned from the projectnuggets owner to the novanuggets org
+# with the same digest, so the contract must accept both owners and still refuse every other one.
+ORG_BOT_IMAGE = f"ghcr.io/novanuggets/zaki-minutes-bot:sha-{SOURCE_SHA}@sha256:{DIGEST}"
+
+
+@pytest.mark.parametrize("image", [BOT_IMAGE, ORG_BOT_IMAGE], ids=["projectnuggets", "novanuggets"])
+def test_contract_accepts_the_bot_image_under_either_ghcr_owner(image):
+    document = _contract_document()
+    document["image"] = image
+
+    assert BotPodContract.from_document(document).image == image
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        f"ghcr.io/someoneelse/zaki-minutes-bot:sha-{SOURCE_SHA}@sha256:{DIGEST}",
+        f"docker.io/novanuggets/zaki-minutes-bot:sha-{SOURCE_SHA}@sha256:{DIGEST}",
+        f"novanuggets/zaki-minutes-bot:sha-{SOURCE_SHA}@sha256:{DIGEST}",
+        f"ghcr.io/novanuggets/zaki-minutes-bot:sha-{SOURCE_SHA}",
+    ],
+    ids=["other-owner", "docker-hub", "no-registry", "no-digest"],
+)
+def test_contract_rejects_any_other_owner_registry_or_a_missing_digest(image):
+    document = _contract_document()
+    document["image"] = image
+
+    with pytest.raises(BotPodContractError, match="immutable ghcr"):
+        BotPodContract.from_document(document)
+
+
 @pytest.mark.parametrize(
     ("path", "value"),
     [
