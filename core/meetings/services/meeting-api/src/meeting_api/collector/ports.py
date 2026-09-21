@@ -197,7 +197,10 @@ class TranscriptStore(Protocol):
         self, user_id: int, meeting_id: int, updates: dict
     ) -> Optional[dict]:
         """OWNER-scoped, ROW-id-addressed edit of a PLANNED meeting. Refused unless the row's
-        status is an intent status (``idle``/``scheduled``) — the bot FSM is never fought.
+        status is an intent status (``idle``/``scheduled``) — the bot FSM is never fought —
+        with ONE exception: a rename. A patch touching only ``title`` is allowed on an
+        FSM-owned row too, because the title is a user-facing label, not lifecycle state
+        (L-0188). Any other key — including one smuggled alongside a title — still 409s.
 
         ``updates`` carries only the keys the caller sent (PATCH semantics): ``title`` (None
         clears), ``scheduled_at`` (ISO8601; None clears → status flips to ``idle``; a value flips
@@ -205,8 +208,9 @@ class TranscriptStore(Protocol):
         parsed ``meeting_url``), ``workspace_id`` (None unbinds), ``auto_join`` (bool).
 
         Returns the updated row (``list_meetings`` shape), ``None`` when the user owns no such
-        row (→ 404), ``{"error": "conflict"}`` when the row advanced into the FSM (→ 409), or
-        ``{"error": "duplicate"}`` when a new native id collides with another non-terminal row."""
+        row (→ 404), ``{"error": "conflict"}`` when the row advanced into the FSM and the patch
+        is not a pure rename (→ 409), or ``{"error": "duplicate"}`` when a new native id collides
+        with another non-terminal row."""
         ...
 
     async def delete_planned_meeting(self, user_id: int, meeting_id: int) -> Optional[bool]:

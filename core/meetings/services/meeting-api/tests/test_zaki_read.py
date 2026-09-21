@@ -177,6 +177,101 @@ def test_index_orders_by_update_time_so_reprocessing_floats_to_the_top():
     assert occurred != sorted(occurred, reverse=True)
 
 
+def test_index_title_falls_back_to_platform_and_start_not_a_row_number():
+    """A capture the user never titled must not be named by its row id — "Meeting 41"
+    reads as a database artifact, which is the defect L-0188 reports. The fallback names
+    the platform and the UTC start instant: both are top-level meeting fields already in
+    the owner-scoped metadata projection, and neither leaks the native meeting id (a join
+    credential the read plane deliberately never serves)."""
+    store = InMemoryTranscriptStore()
+    data = _meeting_data()
+    del data["title"]
+    store.seed_meeting(
+        meeting_id=41,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-native-id",
+        status="completed",
+        start_time="2026-07-16T09:00:00+00:00",
+        end_time="2026-07-16T10:00:00+00:00",
+        created_at="2026-07-16T08:59:00+00:00",
+        updated_at="2026-07-16T10:06:00+00:00",
+        data=data,
+        segments=_segments(),
+    )
+    teams_data = _meeting_data()
+    del teams_data["title"]
+    store.seed_meeting(
+        meeting_id=42,
+        user_id=USER_ID,
+        platform="teams",
+        native_meeting_id="private-teams-id",
+        status="completed",
+        start_time="2026-07-15T14:30:00+00:00",
+        end_time="2026-07-15T15:00:00+00:00",
+        data=teams_data,
+        segments=_segments(),
+    )
+    named_data = _meeting_data()
+    named_data["title"] = "   "
+    named_data["name"] = "Calendar-invite name"
+    store.seed_meeting(
+        meeting_id=43,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-named-id",
+        status="completed",
+        start_time="2026-07-14T11:00:00+00:00",
+        end_time="2026-07-14T11:30:00+00:00",
+        data=named_data,
+        segments=_segments(),
+    )
+    long_data = _meeting_data()
+    long_data["title"] = "x" * 600
+    store.seed_meeting(
+        meeting_id=44,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-long-id",
+        status="completed",
+        start_time="2026-07-13T11:00:00+00:00",
+        end_time="2026-07-13T11:30:00+00:00",
+        data=long_data,
+        segments=_segments(),
+    )
+
+    response = _client(store).get(
+        f"/api/zaki/read/v1/{USER_ID}/index?limit=50",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    titles = {item["id"]: item["title"] for item in response.json()["items"]}
+    assert titles["meeting:41"] == "Google Meet · 2026-07-16 09:00 UTC"
+    assert titles["transcript:41"] == "Google Meet · 2026-07-16 09:00 UTC transcript"
+    assert titles["summary:41"] == "Google Meet · 2026-07-16 09:00 UTC summary"
+    assert titles["meeting:42"] == "Microsoft Teams · 2026-07-15 14:30 UTC"
+    # data.name is still honored as the secondary explicit candidate,
+    # and user titles stay bounded at the read contract's 500 chars.
+    assert titles["meeting:43"] == "Calendar-invite name"
+    assert titles["meeting:44"] == "x" * 500
+    # The join credential stays out of the label — and out of the response entirely.
+    assert "private-native-id" not in response.text
+    assert "private-teams-id" not in response.text
+    assert "private-named-id" not in response.text
+    assert "private-long-id" not in response.text
+
+    # The DETAIL endpoint projects the full meeting row (native id included) — the
+    # fallback label must hold there too, without leaking the join credential.
+    detail = _client(store).get(
+        f"/api/zaki/read/v1/{USER_ID}/item/meeting:41",
+        headers=HEADERS,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["item"]["title"] == "Google Meet · 2026-07-16 09:00 UTC"
+    assert "private-native-id" not in detail.text
+
+
 def test_index_never_rises_in_update_time_within_one_occurrence():
     """A page whose ``updated_at`` ever rises is refused by the read client.
 

@@ -1301,7 +1301,9 @@ class SqlAlchemyTranscriptStore:
             )).scalars().first()
             if meeting is None:
                 return None
-            if meeting.status not in ("idle", "scheduled"):
+            # Once the bot FSM owns the row every lifecycle field is locked — except
+            # "title", the one user-facing label a rename may still touch (L-0188).
+            if meeting.status not in ("idle", "scheduled") and set(updates) - {"title"}:
                 return {"error": "conflict"}
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
 

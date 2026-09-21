@@ -246,7 +246,7 @@ def _capture_evidence(
     metadata["zaki_read"] = {"enabled": agent_read_enabled}
     # Human meeting title (a calendar event summary or a user-typed name), surfaced by
     # the read plane's _title() from data['title']. Bounded to the read contract's 1..500;
-    # blank/absent leaves the synthesized "Meeting N".
+    # blank/absent leaves the read plane's platform+start fallback (L-0188).
     title = (meeting_title or "").strip()
     if title:
         metadata["title"] = title[:500]
