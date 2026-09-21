@@ -1368,6 +1368,15 @@ class SqlAlchemyTranscriptStore:
 
             meeting.data = data
             flag_modified(meeting, "data")
+            if meeting.status not in ("idle", "scheduled", "completed", "failed"):
+                # A rename-only patch on a LIVE FSM-owned row (the guard above refused every
+                # non-title key): ``updated_at`` is the FSM's staleness clock —
+                # ``list_stale_stopping`` / ``list_stale_nonterminal`` read it to drive the
+                # stop backstop and the general reap — and the column's
+                # ``onupdate=func.now()`` would push it one window forward per rename.
+                # Flagging the attribute rewrites the SAME loaded value, so the UPDATE lands
+                # with the clock untouched (L-0188).
+                flag_modified(meeting, "updated_at")
             try:
                 await db.commit()
             except IntegrityError:

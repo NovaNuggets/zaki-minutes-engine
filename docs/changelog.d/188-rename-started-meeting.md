@@ -5,4 +5,6 @@
   native meeting id. And `PATCH /meetings/{id}` now accepts a **title-only** patch on a row
   the bot FSM already owns — a rename is a label, not lifecycle state — while every other
   field of a started meeting still returns 409, including a patch that mixes title with
-  another key.
+  another key. A rename on a live (non-terminal) row writes only `data.title` — it does NOT
+  move `updated_at`, the FSM's staleness clock, so renaming a stuck `stopping`/`active`
+  meeting can no longer delay the stop backstop or the reconcile reap by a window.
