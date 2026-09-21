@@ -59,6 +59,24 @@ jobs:
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    services:
+      # Throwaway PG for the real-adapter conformance tests (meeting-api
+      # tests/test_update_planned_meeting_pg.py — the PATCH guard + the FSM staleness-clock
+      # pin, which the in-memory fakes cannot exercise; zaki-minutes-engine#67 gate-1 bounce).
+      # Same postgres:17-alpine the compose stack runs; CI-local credentials, no secrets.
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -71,6 +89,17 @@ jobs:
       # which (unlike `docker run`) does NOT implicit-pull — pre-pull its fixture image
       - run: docker pull alpine
       - run: pnpm gate:python
+      # The production-adapter conformance leg: SQLAlchemy/asyncpg are layered on top of the
+      # project venv (they stay OUT of pyproject — the offline suite must never touch them),
+      # pinned to the Dockerfile's versions. Runs the PG-gated tests the `uv run pytest -q`
+      # above skipped, incl. the previously-dormant advisory-lock conformance.
+      - name: meeting-api adapter conformance on real Postgres
+        working-directory: core/meetings/services/meeting-api
+        env:
+          MEETING_API_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:55432/postgres
+        run: >-
+          uv run --with 'sqlalchemy[asyncio]==2.0.36' --with 'asyncpg==0.30.0'
+          pytest -q tests/test_update_planned_meeting_pg.py tests/test_single_flight.py
 
   node:
     runs-on: ubuntu-latest
