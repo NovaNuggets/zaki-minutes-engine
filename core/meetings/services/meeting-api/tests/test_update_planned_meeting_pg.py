@@ -19,8 +19,16 @@ What is pinned here — each bullet names the mutant it kills:
   and E3 (``workspace_id`` / ``auto_join`` also exempted);
 - a rename on a NON-TERMINAL FSM row does not move ``meetings.updated_at`` — the FSM's
   staleness clock — so a row past its grace stays in ``list_stale_stopping`` /
-  ``list_stale_nonterminal``. That is the defect gate 1 reproduced on the unfixed head: a
+  ``list_stale_nonterminal``. Parametrized over ALL SIX live statuses: the first pin seeded
+  only `stopping` + `active`, so single-site mutants returning `needs_help` / `joining` /
+  `requested` / `awaiting_admission` to the clock-moving side passed the full suite (gate 1's
+  N7–N10 on the ESCALATE). That is the defect gate 1 reproduced on the unfixed head: a
   `stopping` row quiet 30 min went ``[178] → []`` after one title-only PATCH.
+- the boundary the pin stops at: a rename DOES move ``updated_at`` on ``completed`` /
+  ``failed`` rows (the CoS's Q2 ruling on the ESCALATE — the read index sorts and
+  ``since``-filters on it, so a renamed finished meeting floats to the top) and on the intent
+  statuses ``idle`` / ``scheduled`` (not FSM-owned; the base behaviour). Kills N3 (pin the
+  terminal rows too), N11 (pin ``failed`` only) and N4 (pin the intent rows too).
 """
 from __future__ import annotations
 
@@ -52,6 +60,17 @@ FSM_OWNED = [
     "requested", "joining", "awaiting_admission", "active",
     "needs_help", "stopping", "completed", "failed",
 ]
+
+# The six LIVE FSM-owned statuses — the domain of the staleness-clock pin (the ruling's
+# "non-terminal FSM rows"). Mirrors ``list_stale_nonterminal``'s ``non_terminal`` list.
+LIVE_FSM = [
+    "requested", "joining", "awaiting_admission", "active", "needs_help", "stopping",
+]
+# Terminal FSM rows: a rename DOES move ``updated_at`` (the CoS's Q2 ruling — the archive
+# index sorts and ``since``-filters on it).
+TERMINAL_FSM = ["completed", "failed"]
+# Intent rows are not FSM-owned; a PATCH there keeps the base behaviour and moves the clock.
+INTENT = ["idle", "scheduled"]
 
 
 async def _schema(engine) -> None:
@@ -165,11 +184,15 @@ async def test_pg_adapter_lock_matrix_every_fsm_status():
         await engine.dispose()
 
 
-async def test_pg_rename_keeps_the_fsm_staleness_clock():
-    """A title-only rename on a NON-TERMINAL FSM row must not move ``meetings.updated_at``:
-    that column is the staleness clock ``list_stale_stopping`` (stop backstop) and
+@pytest.mark.parametrize("status", LIVE_FSM)
+async def test_pg_rename_keeps_the_fsm_staleness_clock(status):
+    """A title-only rename on a LIVE FSM row must not move ``meetings.updated_at``: that
+    column is the staleness clock ``list_stale_stopping`` (stop backstop) and
     ``list_stale_nonterminal`` (general reap) read. Gate 1's repro on the unfixed head: one
-    rename pushed the clock one window forward and the sweeps lost the rows."""
+    rename pushed the clock one window forward and the sweeps lost the rows. Parametrized
+    over all six live statuses — seeding only `stopping` + `active` let the N7–N10 single-site
+    mutants (one of `needs_help`/`joining`/`requested`/`awaiting_admission` back on the
+    clock-moving side) pass the full suite."""
     engine = _engine()
     try:
         await _schema(engine)
@@ -180,47 +203,127 @@ async def test_pg_rename_keeps_the_fsm_staleness_clock():
         seeded: list[int] = []
         try:
             stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=3600)
-            mid_stop = await _seed(sf, user_id=uid, status="stopping", updated_at=stale)
-            mid_active = await _seed(sf, user_id=uid, status="active", updated_at=stale)
-            seeded += [mid_stop, mid_active]
+            mid = await _seed(sf, user_id=uid, status=status, updated_at=stale)
+            seeded.append(mid)
 
             # Past grace before the rename — gate 1's `before` state ([178], [178,179]).
-            assert mid_stop in [
-                t[0] for t in await repo.list_stale_stopping(older_than_seconds=45)
-            ]
+            if status == "stopping":
+                assert mid in [
+                    t[0] for t in await repo.list_stale_stopping(older_than_seconds=45)
+                ]
             nt_before = [
                 t[0] for t in await repo.list_stale_nonterminal(stop_grace=45, active_grace=300)
             ]
-            assert mid_stop in nt_before and mid_active in nt_before
+            assert mid in nt_before
 
             res = await store.update_planned_meeting(
-                uid, mid_stop, {"title": "renamed while stopping"}
+                uid, mid, {"title": f"renamed while {status}"}
             )
-            assert res.get("data", {}).get("title") == "renamed while stopping", res
-            res = await store.update_planned_meeting(
-                uid, mid_active, {"title": "renamed while active"}
-            )
-            assert res.get("data", {}).get("title") == "renamed while active", res
+            assert res.get("data", {}).get("title") == f"renamed while {status}", res
 
-            # The sweeps still see both rows — the rename did not buy them another window.
-            assert mid_stop in [
-                t[0] for t in await repo.list_stale_stopping(older_than_seconds=45)
-            ], "the stop backstop lost a stuck `stopping` row to a rename"
+            # The sweeps still see the row — the rename did not buy it another window.
+            # Kills N7–N10: under a mutant the status returns to the clock-moving side, the
+            # pinned instant is overwritten by ``onupdate``, and the row drops out here.
+            if status == "stopping":
+                assert mid in [
+                    t[0] for t in await repo.list_stale_stopping(older_than_seconds=45)
+                ], "the stop backstop lost a stuck `stopping` row to a rename"
             nt_after = [
                 t[0] for t in await repo.list_stale_nonterminal(stop_grace=45, active_grace=300)
             ]
-            assert mid_stop in nt_after and mid_active in nt_after, (
-                "the general reap lost stale non-terminal rows to a rename"
+            assert mid in nt_after, (
+                f"the general reap lost a stale `{status}` row to a rename"
             )
 
             # And the column itself is untouched — the pinned instant survives verbatim.
             async with sf() as db:
                 upd = (
                     await db.execute(
-                        select(Meeting.updated_at).where(Meeting.id == mid_stop)
+                        select(Meeting.updated_at).where(Meeting.id == mid)
                     )
                 ).scalar_one()
             assert upd == stale, f"updated_at moved on a rename: {stale} -> {upd}"
+        finally:
+            await _cleanup(engine, seeded)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("status", TERMINAL_FSM)
+async def test_pg_rename_moves_the_clock_on_terminal_rows(status):
+    """The pin stops AT the terminal boundary (the CoS's Q2 ruling on gate 1's ESCALATE): a
+    rename on a ``completed``/``failed`` row DOES move ``meetings.updated_at`` — the zaki-read
+    index sorts on it and ``since``-filters on it, so a renamed finished meeting floats to the
+    top and ``since`` readers see the new title. Kills N3 (``flag_modified`` extended to the
+    terminal rows) and N11 (extended to ``failed`` only): under either mutant the pinned
+    instant survives and the ``upd > stale`` assertion goes red."""
+    engine = _engine()
+    try:
+        await _schema(engine)
+        sf = async_sessionmaker(engine, expire_on_commit=False)
+        store = SqlAlchemyTranscriptStore(sf)
+        uid = secrets.randbelow(600_000_000) + 1_500_000_000
+        seeded: list[int] = []
+        try:
+            stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=3600)
+            mid = await _seed(sf, user_id=uid, status=status, updated_at=stale)
+            seeded.append(mid)
+
+            res = await store.update_planned_meeting(
+                uid, mid, {"title": f"renamed after {status}"}
+            )
+            assert res.get("data", {}).get("title") == f"renamed after {status}", res
+
+            async with sf() as db:
+                upd = (
+                    await db.execute(
+                        select(Meeting.updated_at).where(Meeting.id == mid)
+                    )
+                ).scalar_one()
+            assert upd > stale, (
+                f"a rename on a `{status}` row must move updated_at "
+                f"(archive order + `since` readers): {stale} -> {upd}"
+            )
+        finally:
+            await _cleanup(engine, seeded)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("status", INTENT)
+async def test_pg_rename_moves_the_clock_on_intent_rows(status):
+    """``idle``/``scheduled`` rows are not FSM-owned — ``update_planned_meeting`` is their
+    normal full-PATCH path — so a rename there keeps the base behaviour and moves
+    ``updated_at`` (the head's reading of the ruling's "non-terminal FSM rows": the pin's
+    domain is exactly the six live statuses). Kills N4 (``flag_modified`` extended to the
+    intent rows)."""
+    engine = _engine()
+    try:
+        await _schema(engine)
+        sf = async_sessionmaker(engine, expire_on_commit=False)
+        store = SqlAlchemyTranscriptStore(sf)
+        uid = secrets.randbelow(600_000_000) + 1_500_000_000
+        seeded: list[int] = []
+        try:
+            stale = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=3600)
+            mid = await _seed(sf, user_id=uid, status=status, updated_at=stale)
+            seeded.append(mid)
+
+            res = await store.update_planned_meeting(
+                uid, mid, {"title": f"renamed while {status}"}
+            )
+            assert res.get("data", {}).get("title") == f"renamed while {status}", res
+
+            async with sf() as db:
+                upd = (
+                    await db.execute(
+                        select(Meeting.updated_at).where(Meeting.id == mid)
+                    )
+                ).scalar_one()
+            assert upd > stale, (
+                f"a rename on an `{status}` (intent) row must move updated_at "
+                f"(base behaviour, unchanged): {stale} -> {upd}"
+            )
         finally:
             await _cleanup(engine, seeded)
     finally:
