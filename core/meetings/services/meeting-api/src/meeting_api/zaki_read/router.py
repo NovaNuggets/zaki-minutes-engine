@@ -114,12 +114,31 @@ def _decode_cursor(value: str, *, route: str, user_id: int, controls: dict, toke
     return decoded["offset"], snapshot
 
 
+# Human-facing platform labels for the untitled-meeting fallback. The native meeting id
+# is deliberately NOT part of it: that id is a join credential, and the read plane never
+# serves it (the index tests assert it never appears in a response body).
+_PLATFORM_LABELS = {
+    "google_meet": "Google Meet",
+    "teams": "Microsoft Teams",
+    "zoom": "Zoom",
+    "jitsi": "Jitsi Meet",
+}
+
+
 def _title(meeting: dict) -> str:
     data = meeting.get("data") if isinstance(meeting.get("data"), dict) else {}
     for candidate in (data.get("title"), data.get("name")):
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()[:500]
-    return f"Meeting {meeting['id']}"
+    # No user-set title: a bare row id ("Meeting 41") reads as a database artifact in the
+    # archive. Name the capture by the two facts the owner already recognizes — platform
+    # and start instant — both top-level fields that survive the body-free metadata
+    # projection. The row id remains only as the last resort for a time-less row.
+    label = _PLATFORM_LABELS.get(meeting.get("platform"), "Meeting")
+    when = _parse_time(meeting.get("start_time") or meeting.get("created_at"))
+    if when is None:
+        return f"{label} {meeting['id']}"
+    return f"{label} · {when:%Y-%m-%d %H:%M} UTC"
 
 
 def _capture_notice(data: dict, now: datetime) -> dict | None:

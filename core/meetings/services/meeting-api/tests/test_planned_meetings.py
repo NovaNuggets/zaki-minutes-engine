@@ -4,7 +4,8 @@ A planned meeting is a normal ``meetings`` row born in an INTENT status (`schedu
 time, else `idle`). It can be created from a pasted link (platform/native parsed server-side) or
 link-less (platform='unknown', NULL native — addressed by ROW id). It carries `data.title`,
 `data.scheduled_at`, `data.workspace_id` (the sharing bind), and `data.auto_join`. PATCH/DELETE are
-refused (409) once the bot FSM owns the row. Members of the bound workspace see the row via
+refused (409) once the bot FSM owns the row — except a title-only PATCH, which is a rename of a
+user-facing label and stays allowed (L-0188). Members of the bound workspace see the row via
 GET /meetings (x-user-workspaces) — sharing needs no new authz.
 
 Drives the collector ``create_app`` over the in-memory fake, OFFLINE (TestClient, no docker/DB).
@@ -160,12 +161,43 @@ def test_patch_workspace_bind_and_unbind():
     assert "workspace_id" not in row["data"]
 
 
-def test_patch_fsm_row_409():
+def test_patch_fsm_row_title_rename():
+    """A started (FSM-owned) meeting may still be RENAMED — the title is a user-facing
+    label, not lifecycle state, so a title-only PATCH is the one edit the FSM shares."""
     client, store, _redis = _client()
     mid = store.seed_meeting(user_id=USER, platform="google_meet",
                              native_meeting_id="xxx-xxxx-xxx", status="active")
-    r = client.patch(f"/meetings/{mid}", json={"title": "nope"}, headers=H)
-    assert r.status_code == 409
+    r = client.patch(f"/meetings/{mid}", json={"title": "Renamed sync"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["title"] == "Renamed sync"
+    assert r.json()["status"] == "active"
+
+
+def test_patch_fsm_row_title_clear():
+    client, store, _redis = _client()
+    mid = store.seed_meeting(user_id=USER, platform="google_meet",
+                             native_meeting_id="xxx-xxxx-xxx", status="completed",
+                             data={"title": "Old name"})
+    r = client.patch(f"/meetings/{mid}", json={"title": None}, headers=H)
+    assert r.status_code == 200, r.text
+    assert "title" not in r.json()["data"]
+
+
+def test_patch_fsm_row_every_other_field_stays_locked():
+    """The relaxation is title-ONLY: every other field of a started meeting still 409s,
+    including a payload that smuggles a real field alongside a title."""
+    client, store, _redis = _client()
+    mid = store.seed_meeting(user_id=USER, platform="google_meet",
+                             native_meeting_id="xxx-xxxx-xxx", status="active")
+    for body in (
+        {"scheduled_at": AT},
+        {"meeting_url": URL},
+        {"auto_join": False},
+        {"workspace_id": "ws-9"},
+        {"title": "sneaky", "scheduled_at": AT},
+    ):
+        r = client.patch(f"/meetings/{mid}", json=body, headers=H)
+        assert r.status_code == 409, (body, r.status_code)
 
 
 def test_patch_owner_scoped_404():

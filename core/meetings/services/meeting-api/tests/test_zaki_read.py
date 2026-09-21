@@ -177,6 +177,150 @@ def test_index_orders_by_update_time_so_reprocessing_floats_to_the_top():
     assert occurred != sorted(occurred, reverse=True)
 
 
+def test_index_title_falls_back_to_platform_and_start_not_a_row_number():
+    """A capture the user never titled must not be named by its row id — "Meeting 41"
+    reads as a database artifact, which is the defect L-0188 reports. The fallback names
+    the platform and the UTC start instant: both are top-level meeting fields already in
+    the owner-scoped metadata projection, and neither leaks the native meeting id (a join
+    credential the read plane deliberately never serves)."""
+    store = InMemoryTranscriptStore()
+    data = _meeting_data()
+    del data["title"]
+    store.seed_meeting(
+        meeting_id=41,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-native-id",
+        status="completed",
+        start_time="2026-07-16T09:00:00+00:00",
+        end_time="2026-07-16T10:00:00+00:00",
+        created_at="2026-07-16T08:59:00+00:00",
+        updated_at="2026-07-16T10:06:00+00:00",
+        data=data,
+        segments=_segments(),
+    )
+    teams_data = _meeting_data()
+    del teams_data["title"]
+    store.seed_meeting(
+        meeting_id=42,
+        user_id=USER_ID,
+        platform="teams",
+        native_meeting_id="private-teams-id",
+        status="completed",
+        start_time="2026-07-15T14:30:00+00:00",
+        end_time="2026-07-15T15:00:00+00:00",
+        data=teams_data,
+        segments=_segments(),
+    )
+    named_data = _meeting_data()
+    named_data["title"] = "   "
+    named_data["name"] = "Calendar-invite name"
+    store.seed_meeting(
+        meeting_id=43,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-named-id",
+        status="completed",
+        start_time="2026-07-14T11:00:00+00:00",
+        end_time="2026-07-14T11:30:00+00:00",
+        data=named_data,
+        segments=_segments(),
+    )
+    long_data = _meeting_data()
+    long_data["title"] = "x" * 600
+    store.seed_meeting(
+        meeting_id=44,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-long-id",
+        status="completed",
+        start_time="2026-07-13T11:00:00+00:00",
+        end_time="2026-07-13T11:30:00+00:00",
+        data=long_data,
+        segments=_segments(),
+    )
+    url_data = _meeting_data()
+    del url_data["title"]
+    url_data["constructed_meeting_url"] = "https://meet.google.com/abc-defg-hij"
+    store.seed_meeting(
+        meeting_id=45,
+        user_id=USER_ID,
+        platform="google_meet",
+        native_meeting_id="private-url-id",
+        status="completed",
+        start_time="2026-07-12T08:00:00+00:00",
+        end_time="2026-07-12T09:00:00+00:00",
+        data=url_data,
+        segments=_segments(),
+    )
+    # platform "unknown" (a link-less capture): not a SEALED_MEETING_PLATFORMS member, so no
+    # `meeting:` item renders — but its transcript item still takes `_title`'s fallback,
+    # which must stay the generic "Meeting" label.
+    unknown_data = _meeting_data()
+    del unknown_data["title"]
+    store.seed_meeting(
+        meeting_id=46,
+        user_id=USER_ID,
+        platform="unknown",
+        native_meeting_id=None,
+        status="completed",
+        start_time="2026-07-11T07:00:00+00:00",
+        end_time="2026-07-11T08:00:00+00:00",
+        created_at="2026-07-11T06:59:00+00:00",
+        data=unknown_data,
+        segments=_segments(),
+    )
+
+    response = _client(store).get(
+        f"/api/zaki/read/v1/{USER_ID}/index?limit=50",
+        headers=HEADERS,
+    )
+
+    assert response.status_code == 200
+    titles = {item["id"]: item["title"] for item in response.json()["items"]}
+    assert titles["meeting:41"] == "Google Meet · 2026-07-16 09:00 UTC"
+    assert titles["transcript:41"] == "Google Meet · 2026-07-16 09:00 UTC transcript"
+    assert titles["summary:41"] == "Google Meet · 2026-07-16 09:00 UTC summary"
+    assert titles["meeting:42"] == "Microsoft Teams · 2026-07-15 14:30 UTC"
+    # data.name is still honored as the secondary explicit candidate,
+    # and user titles stay bounded at the read contract's 500 chars.
+    assert titles["meeting:43"] == "Calendar-invite name"
+    assert titles["meeting:44"] == "x" * 500
+    # A stored join URL is never a title source (mutant E9), and an unknown platform keeps
+    # the generic "Meeting" label rather than leaking the raw platform string (mutant E10).
+    assert titles["meeting:45"] == "Google Meet · 2026-07-12 08:00 UTC"
+    assert "meet.google.com/abc-defg-hij" not in titles["meeting:45"]
+    assert titles["transcript:46"] == "Meeting · 2026-07-11 07:00 UTC transcript"
+    assert "unknown" not in titles["transcript:46"]
+    # The join credential stays out of the label — and out of the response entirely.
+    assert "private-native-id" not in response.text
+    assert "private-teams-id" not in response.text
+    assert "private-named-id" not in response.text
+    assert "private-long-id" not in response.text
+    assert "private-url-id" not in response.text
+
+    # The DETAIL endpoint projects the full meeting row (native id included) — the
+    # fallback label must hold there too, without leaking the join credential.
+    detail = _client(store).get(
+        f"/api/zaki/read/v1/{USER_ID}/item/meeting:41",
+        headers=HEADERS,
+    )
+    assert detail.status_code == 200
+    assert detail.json()["item"]["title"] == "Google Meet · 2026-07-16 09:00 UTC"
+    assert "private-native-id" not in detail.text
+
+    # Detail sees the UNPROJECTED data blob (list_meetings, not the index's control
+    # metadata) — so this is where a `constructed_meeting_url` could leak into the
+    # fallback label. It must not (mutant E9).
+    detail_url = _client(store).get(
+        f"/api/zaki/read/v1/{USER_ID}/item/meeting:45",
+        headers=HEADERS,
+    )
+    assert detail_url.status_code == 200
+    assert detail_url.json()["item"]["title"] == "Google Meet · 2026-07-12 08:00 UTC"
+    assert "meet.google.com/abc-defg-hij" not in detail_url.text
+
+
 def test_index_never_rises_in_update_time_within_one_occurrence():
     """A page whose ``updated_at`` ever rises is refused by the read client.
 

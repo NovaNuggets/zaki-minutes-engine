@@ -542,7 +542,10 @@ class InMemoryTranscriptStore:
         m = self._meetings.get(meeting_id)
         if m is None or m["user_id"] != user_id:
             return None
-        if m["status"] not in ("idle", "scheduled"):
+        fields_set = set(updates)
+        # Once the bot FSM owns the row every lifecycle field is locked — except "title",
+        # the one user-facing label a rename may still touch (L-0188).
+        if m["status"] not in ("idle", "scheduled") and fields_set - {"title"}:
             return {"error": "conflict"}
         data = m["data"]
         if "native_meeting_id" in updates:

@@ -69,11 +69,24 @@ def test_native_patch_unknown_native_404():
     assert r.status_code == 404
 
 
-def test_native_patch_fsm_row_409():
+def test_native_patch_fsm_row_title_rename_200():
+    """The title-only relaxation (L-0188) holds under native addressing too — a rename is a
+    rename however the row is addressed."""
+    client, store = _client()
+    mid = store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="active")
+    r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "new name"}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == mid
+    assert r.json()["data"]["title"] == "new name"
+
+
+def test_native_patch_fsm_row_non_title_409():
     client, store = _client()
     store.seed_meeting(user_id=USER, platform=PLAT, native_meeting_id=NATIVE, status="active")
-    r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json={"title": "nope"}, headers=H)
-    assert r.status_code == 409
+    for body in ({"scheduled_at": "2026-07-10T15:00:00Z"}, {"auto_join": False},
+                 {"title": "sneaky", "auto_join": False}):
+        r = client.patch(f"/meetings/{PLAT}/{NATIVE}", json=body, headers=H)
+        assert r.status_code == 409, (body, r.status_code)
 
 
 def test_native_patch_shared_row_not_owned_404():
