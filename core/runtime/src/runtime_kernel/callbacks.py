@@ -4,7 +4,7 @@ making exit-callback delivery eventually-complete across consumer outages. We re
 a small queue + sweep so the kernel's API doesn't fire-once-and-forget.
 
   • enqueue(url, event)  — record a pending delivery.
-  • sweep()              — try every pending delivery once; drop the ones the receiver acked (2xx/3xx),
+  • sweep()              — try every pending delivery once; drop the ones the receiver acked (2xx),
                           KEEP the ones that failed so the next sweep retries them.
 
 The transport is injectable: production posts with httpx; the eval supplies a fake receiver. The
@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Callable, Optional, Protocol
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 logger = logging.getLogger("runtime_kernel.callbacks")
 
@@ -48,7 +50,11 @@ class RedisPendingStore:
 
     PREFIX = "runtime:callback:"
 
-    def __init__(self, redis, ttl: int = 3600) -> None:
+    def __init__(self, redis, ttl: Optional[int] = None) -> None:
+        if ttl is not None and (
+            isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1
+        ):
+            raise ValueError("pending callback TTL must be a positive integer")
         self._r = redis
         self._ttl = ttl
 
@@ -57,7 +63,8 @@ class RedisPendingStore:
         return v.decode() if isinstance(v, (bytes, bytearray)) else v
 
     def put(self, key: str, value: dict) -> None:
-        self._r.set(f"{self.PREFIX}{key}", json.dumps(value), ex=self._ttl)
+        options = {"ex": self._ttl} if self._ttl is not None else {}
+        self._r.set(f"{self.PREFIX}{key}", json.dumps(value), **options)
 
     def get_all(self) -> dict[str, dict]:
         out: dict[str, dict] = {}
@@ -66,7 +73,29 @@ class RedisPendingStore:
             raw = self._r.get(k)
             if raw is None:
                 continue
-            out[k[len(self.PREFIX):]] = json.loads(self._s(raw))
+            try:
+                record = json.loads(self._s(raw))
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                record = None
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"url", "headers", "event", "attempts"}
+                or not isinstance(record.get("url"), str)
+                or not isinstance(record.get("headers"), dict)
+                or not all(
+                    isinstance(name, str) and isinstance(value, str)
+                    for name, value in record.get("headers", {}).items()
+                )
+                or not isinstance(record.get("event"), dict)
+                or type(record.get("attempts")) is not int
+                or record["attempts"] < 0
+            ):
+                # An impossible durable record can never be delivered. Remove only
+                # that record so one corrupt Redis value cannot poison every sweep.
+                logger.error("dropping corrupt pending callback %s", k[len(self.PREFIX):])
+                self._r.delete(k)
+                continue
+            out[k[len(self.PREFIX):]] = record
         return out
 
     def delete(self, key: str) -> None:
@@ -76,7 +105,13 @@ class RedisPendingStore:
 def _http_poster(url: str, payload: dict, headers: dict) -> int:
     import httpx
 
-    return httpx.post(url, json=payload, headers=headers, timeout=10.0).status_code
+    return httpx.post(
+        url,
+        json=payload,
+        headers=headers,
+        timeout=10.0,
+        follow_redirects=False,
+    ).status_code
 
 
 class CallbackQueue:
@@ -85,16 +120,42 @@ class CallbackQueue:
         poster: Optional[Poster] = None,
         store: Optional[PendingStore] = None,
         max_attempts: int = 0,
+        default_headers: Optional[dict[str, str]] = None,
+        trusted_origins: Optional[set[str]] = None,
     ) -> None:
         self.poster = poster or _http_poster
         self.store = store or InMemoryPendingStore()
-        # 0 ⇒ retry forever (until acked or TTL expiry, matching 0.11's durable stance).
+        self.default_headers = dict(default_headers or {})
+        self.trusted_origins = {
+            origin
+            for value in (trusted_origins or set())
+            if (origin := self._origin(value)) is not None
+        }
+        # 0 ⇒ retry until acknowledged (the durable store has no implicit expiry).
         self.max_attempts = max_attempts
-        self._seq = 0
+
+    @staticmethod
+    def _origin(url: str) -> Optional[str]:
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            return None
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        default_port = 80 if parsed.scheme == "http" else 443
+        suffix = "" if port in (None, default_port) else f":{port}"
+        return f"{parsed.scheme}://{parsed.hostname.lower().rstrip('.')}{suffix}"
 
     def enqueue(self, url: str, event: dict, headers: Optional[dict] = None) -> str:
-        self._seq += 1
-        key = f"cb-{self._seq}"
+        # A process-local counter restarts at one and can overwrite an older Redis
+        # callback after a runtime restart. A random key preserves both generations.
+        key = f"cb-{uuid4().hex}"
         self.store.put(key, {"url": url, "headers": headers or {}, "event": event, "attempts": 0})
         # Best-effort immediate attempt; whatever doesn't ack stays queued for the sweep.
         self._attempt(key)
@@ -106,14 +167,28 @@ class CallbackQueue:
             return True
         rec["attempts"] = rec.get("attempts", 0) + 1
         try:
-            code = self.poster(rec["url"], rec["event"], rec.get("headers") or {})
-            if code < 400:
+            # Operator headers are injected at delivery time and never serialized into the pending
+            # store. They override record headers so a caller cannot shadow the runtime credential.
+            operator_headers = (
+                self.default_headers
+                if self._origin(rec["url"]) in self.trusted_origins
+                else {}
+            )
+            headers = {**(rec.get("headers") or {}), **operator_headers}
+            code = self.poster(rec["url"], rec["event"], headers)
+            if 200 <= code < 300:
                 self.store.delete(key)
                 logger.info("callback %s delivered (attempt %d) -> %s", key, rec["attempts"], code)
                 return True
             logger.warning("callback %s got %d (attempt %d)", key, code, rec["attempts"])
-        except Exception as e:  # noqa: BLE001 — transport failures are retryable
-            logger.warning("callback %s delivery failed (attempt %d): %s", key, rec["attempts"], e)
+        except Exception as error:  # noqa: BLE001 — transport failures are retryable
+            # Poster exceptions may retain the callback Request and its process-local credential.
+            logger.warning(
+                "callback %s delivery failed (attempt %d; %s)",
+                key,
+                rec["attempts"],
+                type(error).__name__,
+            )
 
         # Not acked. Give up only if a finite cap is set and reached; else keep for retry.
         if self.max_attempts and rec["attempts"] >= self.max_attempts:

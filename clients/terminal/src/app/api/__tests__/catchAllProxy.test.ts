@@ -10,7 +10,7 @@ vi.mock("next/headers", () => ({
   }),
 }));
 
-import { DELETE as deleteRoute, GET as getRoute } from "../[...path]/route";
+import { DELETE as deleteRoute, GET as getRoute, POST as postRoute } from "../[...path]/route";
 
 function makeReq(method: string, search = ""): import("next/server").NextRequest {
   return {
@@ -32,6 +32,24 @@ afterEach(() => {
 });
 
 describe("catch-all proxy — upstream status passthrough", () => {
+  it.each([
+    ["the managed Minutes root", getRoute, ["minutes"]],
+    ["a nested managed Minutes control", postRoute, ["minutes", "captures"]],
+  ] as const)("rejects %s locally before any upstream fetch", async (_label, route, path) => {
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const res = await route(makeReq(route === postRoute ? "POST" : "GET"), ctx(...path));
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({
+      error: "managed_minutes_unavailable",
+      detail: "Managed Minutes controls are available in the ZAKI Hub, not this reference Terminal.",
+    });
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("forwards a bodyless 204 (successful DELETE) as 204, not 502", async () => {
     const fetchSpy = vi.fn(async () => new Response(null, { status: 204 }));
     vi.stubGlobal("fetch", fetchSpy);

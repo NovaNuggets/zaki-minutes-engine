@@ -24,7 +24,7 @@
   --accentbg: rgba(216, 133, 92, 0.14);
   /* Semantic set (palette A, design-spec meeting-lifecycle-v2): --danger = destructive
    * actions + errors ONLY (never "live" — live is green); --warn = attention-not-error
-   * (needs_help, waiting, behind). --on-* = text on solid semantic fills. The old --live
+   * (needs_human_help, waiting, behind). --on-* = text on solid semantic fills. The old --live
    * token is deliberately GONE so stale usage fails visibly. */
   --danger: #e0645e;
   --dangerbg: rgba(224, 100, 94, 0.12);

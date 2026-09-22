@@ -1,11 +1,11 @@
 """State-aware meeting-chat grounding (design-spec meeting-lifecycle-v2, W4).
 
 _meeting_grounding branches on the meeting status the terminal passes in ``active``:
-prep (idle/scheduled) never reads a stream and steers toward preparation; post
-(completed/failed/stopped) prefers the PROCESSED notes stream, falls back to the raw
-transcript, and says plainly when neither exists; an ABSENT status is the legacy live
-path byte-for-byte. Steering templates are overridable from the _global workspace file
-``agents/meeting-lifecycle.md`` — malformed overrides fail loud and fall back.
+prep (idle/scheduled) never reads a stream and steers toward preparation; live/post
+meeting content is never copied into the durable generic-chat prompt and instead requires
+the dedicated bounded Minutes read path. Steering templates are overridable from the
+_global workspace file ``agents/meeting-lifecycle.md`` — malformed overrides fail loud
+and fall back.
 """
 from __future__ import annotations
 
@@ -69,7 +69,9 @@ def test_prep_grounding_reads_no_stream_and_names_the_workspace(monkeypatch):
 
 def test_prep_grounding_without_workspace_says_so():
     _ctx, _tools, prompt = _meeting_grounding(
-        {"kind": "meeting", "meeting": {"native_id": "n1", "status": "idle", "title": "Untitled"}},
+        {"kind": "meeting", "meeting": {
+            "meeting_id": 1, "native_id": "n1", "status": "idle", "title": "Untitled",
+        }},
         session="s", prompt="hi", redis_url=None)
     assert "No shared prep workspace is bound" in prompt
     assert "user's OWN workspace" in prompt  # own-workspace brief note is the steer, not a dead end
@@ -78,7 +80,7 @@ def test_prep_grounding_without_workspace_says_so():
 
 # ── post branch ──────────────────────────────────────────────────────────────────────
 
-def test_post_grounding_prefers_processed_notes(monkeypatch):
+def test_post_grounding_does_not_copy_processed_or_raw_content_into_durable_chat(monkeypatch):
     url = _fake_redis(monkeypatch, {
         "proc:meeting:46": [_note("s1", "Jane", "we agreed on the Q3 pilot")],
         "tc:meeting:46": [{"payload": json.dumps({"type": "transcription", "segments": [
@@ -88,32 +90,34 @@ def test_post_grounding_prefers_processed_notes(monkeypatch):
         {"kind": "meeting", "meeting": {"native_id": "abc", "meeting_id": 46, "status": "completed",
                                          "title": "Acme kickoff"}},
         session="s", prompt="what was decided?", redis_url=url)
-    assert "has ended" in prompt and "Acme kickoff" in prompt
-    assert "processed notes" in prompt
-    assert "we agreed on the Q3 pilot" in prompt          # cleaned line, not…
-    assert "kinda agreed Q3??" not in prompt              # …the raw one
+    assert "dedicated, bounded Minutes read path" in prompt
+    assert "we agreed on the Q3 pilot" not in prompt
+    assert "kinda agreed Q3??" not in prompt
     assert prompt.endswith("what was decided?")
 
 
-def test_post_grounding_falls_back_to_raw_transcript(monkeypatch):
-    url = _fake_redis(monkeypatch, {
-        "tc:meeting:46": [{"payload": json.dumps({"type": "transcription", "segments": [
-            {"segment_id": "s1", "speaker": "Raj", "text": "SSO first"}]})}],
-    })
+def test_post_grounding_never_reads_the_legacy_redis_transcript_carriers(monkeypatch):
+    import redis
+
+    class RedisMustNotBeOpened:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("meeting grounding reopened a transcript carrier")
+
+    monkeypatch.setattr(redis, "from_url", RedisMustNotBeOpened)
     _ctx, _tools, prompt = _meeting_grounding(
         {"kind": "meeting", "meeting": {"native_id": "abc", "meeting_id": 46, "status": "completed"}},
-        session="s", prompt="recap", redis_url=url)
-    assert "raw transcript" in prompt and "Raj: SSO first" in prompt
+        session="s", prompt="recap", redis_url="redis://must-not-open")
+    assert "dedicated, bounded Minutes read path" in prompt
+    assert "Raj: SSO first" not in prompt
 
 
-def test_post_grounding_with_no_record_is_honest(monkeypatch):
+def test_post_grounding_without_the_safe_read_path_is_honest(monkeypatch):
     url = _fake_redis(monkeypatch, {})
     _ctx, _tools, prompt = _meeting_grounding(
         {"kind": "meeting", "meeting": {"native_id": "abc", "meeting_id": 46, "status": "failed",
                                          "title": "Ghost"}},
         session="s", prompt="summary?", redis_url=url)
-    assert "no record of this meeting exists" in prompt
-    assert "FAILED" in prompt
+    assert "cannot be read safely from this chat" in prompt
     assert "do not reconstruct or invent" in prompt
 
 
@@ -130,9 +134,29 @@ def test_fold_processed_upserts_by_id_and_skips_view_end(monkeypatch):
     assert folded == "Jane: polished text\nRaj: second note"
 
 
-# ── legacy (status-less) client keeps today's exact live behavior ────────────────────
+def test_fold_processed_uses_a_finite_reverse_read_budget(monkeypatch):
+    import redis
 
-def test_statusless_active_is_legacy_live_path(monkeypatch):
+    class BoundedRedis:
+        count = None
+
+        def xrevrange(self, key, count=None):
+            assert key == "proc:meeting:9"
+            self.count = count
+            return [("999-0", _note("latest", "Raj", "bounded"))]
+
+    fake = BoundedRedis()
+    monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
+
+    folded = _fold_meeting_processed("redis://fake", "9", limit=400)
+
+    assert folded == "Raj: bounded"
+    assert isinstance(fake.count, int) and 400 <= fake.count <= 1600
+
+
+# ── native-only legacy context cannot address a tenant carrier ─────────────────────
+
+def test_statusless_native_only_active_context_is_rejected(monkeypatch):
     url = _fake_redis(monkeypatch, {
         "tc:meeting:abc-defg-hij": [{"payload": json.dumps({"type": "transcription", "segments": [
             {"segment_id": "s1", "speaker": "Jane", "text": "ship it Friday"}]})}],
@@ -140,8 +164,8 @@ def test_statusless_active_is_legacy_live_path(monkeypatch):
     _ctx, _tools, prompt = _meeting_grounding(
         {"kind": "meeting", "meeting": {"platform": "google_meet", "native_id": "abc-defg-hij"}},
         session="main", prompt="who spoke last?", redis_url=url)
-    assert prompt.startswith("You are assisting in a live meeting (google_meet/abc-defg-hij).")
-    assert "Jane: ship it Friday" in prompt and prompt.endswith("who spoke last?")
+    assert prompt == "who spoke last?"
+    assert "Jane: ship it Friday" not in prompt
 
 
 # ── the _global override file ────────────────────────────────────────────────────────

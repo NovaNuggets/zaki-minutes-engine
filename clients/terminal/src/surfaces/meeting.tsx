@@ -13,11 +13,10 @@ import { MEETING_CANVAS_CONTENT_INSET, MeetingCanvasView } from "../canvas/Meeti
 import { type MeetingMock } from "./meetingModel";
 import { useLiveMeetings, liveMeetingsNow, refreshMeetings } from "./liveMeetings";
 import { usePreviewPinTab } from "./previewPinTab";
-import { parseMeetingInput } from "./meetingId";
-import { getJitsiHosts } from "./jitsiHosts";
 import { mintTranscriptShare, mintInvite, listSharedMemberships, type Membership } from "./workspaceApi";
 import { deletePlannedMeeting, getCalendarConfig, setCalendarConfig, getCalendarSyncStatus, syncCalendarNow, type CalendarConfig, type CalendarSyncStamp } from "./plannedApi";
 import { prepTabDescriptor, prepDraftTabDescriptor } from "./meetingPrep";
+import { canonicalMeetingDocPath, canonicalMeetingRow } from "./minutesIdentity";
 
 // ── "Share session" — mint a link to this meeting's LIVE FEED (independent transcript share) and,
 //    optionally, BUNDLE a shared-workspace invite into the SAME link (?tshare=…&invite=…). The two are
@@ -101,7 +100,7 @@ function ShareSessionButton({ platform, native }: { platform: string; native: st
 }
 
 // ── Connected docs — the meeting's knowledge-graph entity + the [[entities]] it links ─────────────
-//  The meeting doc lives at a deterministic path: kg/entities/meeting/<native>.md. When present we show
+//  The meeting doc lives at a deterministic path: kg/entities/meeting/<numeric row>.md. When present we show
 //  its title + the [[wikilinks]] parsed from the body as chips that open that entity's doc. A wikilink
 //  [[Title]] is resolved to a real doc by matching its slug against the workspace tree (so we open the
 //  entity under its true type folder, whatever that is). 404 → a quiet "no notes yet" state.
@@ -128,8 +127,8 @@ function ConnectedDocChip({ doc }: { doc: ConnectedDoc }) {
   );
 }
 
-function MeetingDocChip({ native, title, hasLinks }: { native: string; title: string; hasLinks: boolean }) {
-  const nav = usePreviewPinTab<HTMLButtonElement>(docTabFor(`kg/entities/meeting/${native}.md`, title));
+function MeetingDocChip({ rowId, title, hasLinks }: { rowId: string; title: string; hasLinks: boolean }) {
+  const nav = usePreviewPinTab<HTMLButtonElement>(docTabFor(canonicalMeetingDocPath(rowId)!, title));
   return (
     <button onClick={nav.onClick} onDoubleClick={nav.onDoubleClick} title="Open this meeting's notes"
       style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "5px 10px 5px 6px", borderRadius: 8, background: "var(--panel)", border: "1px solid var(--line)", color: "var(--t1)", fontSize: 12.5, cursor: "pointer", maxWidth: 360, marginBottom: hasLinks ? 8 : 0 }}
@@ -183,7 +182,7 @@ function ConnectedDocsPanel({ docs }: { docs: ConnectedDoc[] }) {
   );
 }
 
-function ConnectedPanel({ native, docs }: { native: string; docs?: ConnectedDoc[] }) {
+function ConnectedPanel({ rowId, docs }: { rowId: string; docs?: ConnectedDoc[] }) {
   // data.docs first — when the meeting carries connected docs, render them and skip the path fallback
   const hasDocs = !!docs?.length;
   const [state, setState] = useState<{ status: "loading" | "absent" | "present"; title: string; links: string[] }>({ status: "loading", title: "", links: [] });
@@ -192,7 +191,8 @@ function ConnectedPanel({ native, docs }: { native: string; docs?: ConnectedDoc[
 
   useEffect(() => {
     let alive = true;
-    const path = `kg/entities/meeting/${native}.md`;
+    const path = canonicalMeetingDocPath(rowId);
+    if (!path) { setState({ status: "absent", title: "", links: [] }); return; }
     void (async () => {
       try {
         const r = await fetch(`/api/workspace/file?path=${encodeURIComponent(path)}`);
@@ -201,13 +201,13 @@ function ConnectedPanel({ native, docs }: { native: string; docs?: ConnectedDoc[
         const content: string = (await r.json()).content ?? "";
         const fmTitle = content.match(/^---\n([\s\S]*?)\n---/)?.[1]?.split("\n").find((l) => l.startsWith("title:"))?.slice(6).trim();
         const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
-        const title = (fmTitle || h1 || native).replace(/^["']|["']$/g, "");
+        const title = (fmTitle || h1 || `Meeting ${rowId}`).replace(/^["']|["']$/g, "");
         const links = [...new Set([...content.matchAll(/\[\[([^\]]+)\]\]/g)].map((m) => m[1].trim()).filter(Boolean))];
         setState({ status: "present", title, links });
       } catch { if (alive) setState({ status: "absent", title: "", links: [] }); }
     })();
     return () => { alive = false; };
-  }, [native]);
+  }, [rowId]);
 
   // load the tree once so wikilink slugs resolve to their real entity doc paths
   useEffect(() => {
@@ -238,12 +238,12 @@ function ConnectedPanel({ native, docs }: { native: string; docs?: ConnectedDoc[
       )}
       {state.status === "present" && (
         <>
-          <MeetingDocChip native={native} title={state.title} hasLinks={state.links.length > 0} />
+          <MeetingDocChip rowId={rowId} title={state.title} hasLinks={state.links.length > 0} />
           {state.links.length > 0 && (
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
               {state.links.map((l) => {
                 const slug = docSlug(l);
-                const path = slugMap[slug] ?? `kg/entities/meeting/${native}.md`;
+                const path = slugMap[slug] ?? canonicalMeetingDocPath(rowId)!;
                 return <WikiLinkChip key={l} title={l} path={path} />;
               })}
             </div>
@@ -265,7 +265,7 @@ const STATUS_BADGE: Record<string, { label: string; color: string; bg: string; k
   requested: { label: "Requested", color: "var(--accent)", bg: "var(--accentbg)", kind: "live" },
   joining: { label: "Joining", color: "var(--accent)", bg: "var(--accentbg)", kind: "live" },
   awaiting_admission: { label: "Awaiting", color: "var(--violet)", bg: "var(--violetbg)", kind: "awaiting" },
-  needs_help: { label: "Needs help", color: "var(--warn)", bg: "var(--warnbg)", kind: "needshelp" },
+  needs_human_help: { label: "Needs help", color: "var(--warn)", bg: "var(--warnbg)", kind: "needshelp" },
   active: { label: "Live", color: "var(--green)", bg: "var(--greenbg)", kind: "live" },
   stopping: { label: "Stopping", color: "var(--t3)", bg: "var(--panel2)", kind: "stopping" },
   completed: { label: "Completed", color: "var(--green)", bg: "var(--greenbg)", kind: "terminal" },
@@ -276,7 +276,7 @@ const badgeFor = (raw?: string) => STATUS_BADGE[raw ?? ""] ?? { label: raw ?? "�
 
 type MeetingActionFailure = { actionId: string; actionLabel: string; native: string; message: string };
 type MeetingActionFailureHandler = (failure: MeetingActionFailure) => void;
-type RowAction = { id: string; label: string; tone: "accent" | "live" | "muted"; run: (onFailure?: MeetingActionFailureHandler) => Promise<void> | void };
+type RowAction = { id: string; label: string; tone: "accent" | "live" | "muted" | "danger"; run: (onFailure?: MeetingActionFailureHandler) => Promise<void> | void };
 
 function failureMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
@@ -291,10 +291,13 @@ async function readFailure(r: Response): Promise<string> {
   return `${status}: ${detail.slice(0, 180)}`;
 }
 
-async function runMeetingAction(action: Omit<MeetingActionFailure, "message">, request: Promise<Response>, onFailure?: MeetingActionFailureHandler): Promise<void> {
+async function runMeetingAction(action: Omit<MeetingActionFailure, "message">, request: Promise<unknown>, onFailure?: MeetingActionFailureHandler): Promise<void> {
   try {
-    const r = await request;
-    if (!r.ok) throw new Error(await readFailure(r));
+    const result = await request;
+    if (result && typeof result === "object" && "ok" in result) {
+      const response = result as Response;
+      if (!response.ok) throw new Error(await readFailure(response));
+    }
   } catch (error) {
     const message = failureMessage(error);
     console.warn("meeting action failed", { ...action, message });
@@ -310,24 +313,12 @@ async function runMeetingAction(action: Omit<MeetingActionFailure, "message">, r
 export function actionsFor(m: MeetingMock): RowAction[] {
   const native = m.native_id ?? m.id;
   // The model stores platform DISPLAY-cased ("Google Meet", else the raw API slug like "teams"/"zoom").
-  // Stop targets DELETE /bots/{platform}/{native}, so normalise back to the slug — hardcoding google_meet
-  // 404s ("No active meeting for this bot") for a live Teams/Zoom bot.
+  // Planned-meeting intent routes use the API platform slug, not the display label.
   const platformSlug = m.platform === "Google Meet" ? "google_meet" : m.platform.toLowerCase().replace(/\s+/g, "_");
   const intent = (state: "idle" | "scheduled", at?: string, onFailure?: MeetingActionFailureHandler) =>
     runMeetingAction({ actionId: state === "idle" ? "cancel" : "schedule", actionLabel: state === "idle" ? "Cancel" : "Schedule", native }, fetch(`/api/meetings/${platformSlug}/${encodeURIComponent(native)}/intent`, {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ intent: state, ...(at ? { at } : {}) }),
-    }), onFailure);
-  const send = (onFailure?: MeetingActionFailureHandler) =>
-    runMeetingAction({ actionId: "send", actionLabel: "Send now", native }, fetch("/api/bots", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        platform: platformSlug, native_meeting_id: native,
-        // the row's real link when it has one (zoom/teams NEED it); gmeet can be constructed
-        ...(m.meeting_url ? { meeting_url: m.meeting_url }
-          : platformSlug === "google_meet" ? { meeting_url: `https://meet.google.com/${native}` } : {}),
-        bot_name: "Vexa",
-      }),
     }), onFailure);
   // Delete a PLANNED row — ROW-id addressed (a link-less plan has no platform/native path).
   const del = (onFailure?: MeetingActionFailureHandler) =>
@@ -337,9 +328,6 @@ export function actionsFor(m: MeetingMock): RowAction[] {
     runMeetingAction({ actionId: "cancel", actionLabel: "Cancel", native }, fetch(`/api/meetings/${encodeURIComponent(m.id)}`, {
       method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scheduled_at: null }),
     }), onFailure);
-  // Stop = the gateway-backed user-stop route DELETE /bots/{platform}/{native} (meeting-api lifecycle/stop_router).
-  const stop = (onFailure?: MeetingActionFailureHandler) =>
-    runMeetingAction({ actionId: "stop", actionLabel: "Stop", native }, fetch(`/api/bots/${platformSlug}/${encodeURIComponent(native)}`, { method: "DELETE" }), onFailure);
   const schedule = (onFailure?: MeetingActionFailureHandler) => {
     // minimal time picker: prompt for a local datetime, send as ISO. (A richer picker can replace this.)
     const def = new Date(Date.now() + 3600_000).toISOString().slice(0, 16);
@@ -354,22 +342,20 @@ export function actionsFor(m: MeetingMock): RowAction[] {
   switch (raw) {
     case "idle":
       return [
-        ...(hasLink ? [
-          { id: "schedule", label: "Schedule", tone: "accent", run: schedule } as RowAction,
-          { id: "send", label: "Send now", tone: "accent", run: send } as RowAction,
-        ] : []),
+        ...(hasLink ? [{ id: "schedule", label: "Schedule", tone: "accent", run: schedule } as RowAction] : []),
         { id: "delete", label: "Delete", tone: "muted", run: del },
       ];
     case "scheduled":
       return [
-        ...(hasLink ? [{ id: "send", label: "Send now", tone: "accent", run: send } as RowAction] : []),
         { id: "cancel", label: "Cancel", tone: "muted", run: (onFailure?: MeetingActionFailureHandler) => hasLink ? intent("idle", undefined, onFailure) : cancelById(onFailure) },
         { id: "delete", label: "Delete", tone: "muted", run: del },
       ];
-    case "requested": case "joining": case "awaiting_admission": case "needs_help": case "active": case "stopping":
-      return [{ id: "stop", label: "Stop", tone: "live", run: stop }];
-    case "completed": case "failed": case "stopped": default:
-      return [{ id: "resend", label: "Re-send", tone: "accent", run: send }];
+    case "requested": case "joining": case "awaiting_admission": case "needs_human_help": case "active": case "stopping":
+      return [];
+    case "completed": case "failed": case "stopped":
+      return [];
+    default:
+      return [];
   }
 }
 
@@ -385,7 +371,7 @@ function StatusBadge({ raw }: { raw?: string }) {
 
 /** Status badge (only when meaningful) + a small ▾ menu of action→transition items for one meeting row.
  *  The ▾ is revealed on row hover (or while its menu is open) to keep the list quiet at rest. */
-function RowActions({ m, showBadge, reveal, onActionStart, onActionFailure }: { m: MeetingMock; showBadge: boolean; reveal: boolean; onActionStart?: () => void; onActionFailure?: MeetingActionFailureHandler }) {
+function RowActions({ m, reveal, onActionStart, onActionFailure }: { m: MeetingMock; reveal: boolean; onActionStart?: () => void; onActionFailure?: MeetingActionFailureHandler }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   const acts = actionsFor(m);
@@ -397,7 +383,6 @@ function RowActions({ m, showBadge, reveal, onActionStart, onActionFailure }: { 
   }, [open]);
   return (
     <div ref={ref} style={{ position: "relative", flex: "none", display: "inline-flex", alignItems: "center", gap: 5 }} onClick={(e) => e.stopPropagation()} onDoubleClick={(e) => e.stopPropagation()}>
-      {showBadge && <StatusBadge raw={m.live_status} />}
       {acts.length > 0 && (reveal || open) && (
         <button title="Actions" onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
           style={{ background: "transparent", border: "1px solid var(--line2)", color: "var(--t2)", borderRadius: 6, padding: "1px 5px", fontSize: 11, lineHeight: 1.4, cursor: "pointer" }}>▾</button>
@@ -406,7 +391,7 @@ function RowActions({ m, showBadge, reveal, onActionStart, onActionFailure }: { 
         <div style={{ position: "absolute", top: "100%", right: 0, marginTop: 4, minWidth: 132, background: "var(--panel)", border: "1px solid var(--line2)", borderRadius: 8, boxShadow: "0 6px 20px rgba(0,0,0,.28)", padding: 4, zIndex: 40 }}>
           {acts.map((a) => (
             <button key={a.id} onClick={(e) => { e.stopPropagation(); setOpen(false); onActionStart?.(); void a.run(onActionFailure); }}
-              style={{ display: "block", width: "100%", textAlign: "left", background: "transparent", border: "none", color: a.tone === "live" ? "var(--danger)" : a.tone === "muted" ? "var(--t2)" : "var(--accent)", borderRadius: 6, padding: "6px 9px", fontSize: 12, fontWeight: 550, cursor: "pointer" }}
+              style={{ display: "block", width: "100%", textAlign: "left", background: "transparent", border: "none", color: a.tone === "live" || a.tone === "danger" ? "var(--danger)" : a.tone === "muted" ? "var(--t2)" : "var(--accent)", borderRadius: 6, padding: "6px 9px", fontSize: 12, fontWeight: 550, cursor: "pointer" }}
               onMouseEnter={(ev) => (ev.currentTarget.style.background = "var(--panel2)")} onMouseLeave={(ev) => (ev.currentTarget.style.background = "transparent")}>
               {a.label}
             </button>
@@ -418,6 +403,15 @@ function RowActions({ m, showBadge, reveal, onActionStart, onActionFailure }: { 
 }
 
 const INTENT_STATUSES = new Set(["idle", "scheduled"]);
+export function canShowRowActions(m: MeetingMock): boolean {
+  return !m.shared && actionsFor(m).length > 0;
+}
+
+/** Shared meeting rows are read-only membership views. Owner lifecycle and transcript-sharing
+ * controls must stay hidden both in the list and after the row is opened. */
+export function canShowMeetingHeaderOwnerControls(m: MeetingMock): boolean {
+  return m.shared !== true;
+}
 
 export function meetingTab(m: MeetingMock): TabDescriptor {
   // A PLANNED (intent-status) row opens its PREP tab — title/time/link editing, workspace bind,
@@ -428,7 +422,12 @@ export function meetingTab(m: MeetingMock): TabDescriptor {
 
 // Statuses worth a badge — `active` (in-room) is shown by the green dot alone, not a badge; the rest
 // (stopped/completed/failed) live under the "Recorded" header already.
-const BADGE_STATUSES = new Set(["idle", "scheduled", "requested", "joining", "awaiting_admission", "needs_help", "stopping"]);
+const BADGE_STATUSES = new Set(["idle", "scheduled", "requested", "joining", "awaiting_admission", "needs_human_help", "stopping"]);
+
+/** Lifecycle visibility is independent of whether this reference Terminal can mutate the row. */
+export function shouldShowMeetingStatusBadge(m: MeetingMock): boolean {
+  return BADGE_STATUSES.has(m.live_status ?? "");
+}
 
 function MeetingRow({ m }: { m: MeetingMock }) {
   const nav = usePreviewPinTab<HTMLDivElement>(meetingTab(m));
@@ -436,11 +435,12 @@ function MeetingRow({ m }: { m: MeetingMock }) {
   const [hover, setHover] = useState(false);
   const [actionFailure, setActionFailure] = useState<MeetingActionFailure | null>(null);
   const native = m.native_id ?? m.id;
+  const rowReference = canonicalMeetingRow(m.id);
   const live = m.status === "live";
   const inRoom = m.live_status === "active";   // actually live = green dot + a quiet "live", no badge
   // A planned meeting's user-given title wins; else just the meeting code — the platform is implicit.
   const label = m.title_custom ?? (m.native_id ?? m.title).replace(/^Google Meet · /, "");
-  const showBadge = BADGE_STATUSES.has(m.live_status ?? "");
+  const showBadge = shouldShowMeetingStatusBadge(m);
   const isIntent = INTENT_STATUSES.has(m.live_status ?? "");
   useEffect(() => {
     if (!actionFailure) return;
@@ -454,22 +454,18 @@ function MeetingRow({ m }: { m: MeetingMock }) {
         {inRoom && <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--green)", flex: "none" }} />}
         <span style={{ fontSize: 13, color: live ? "var(--t1)" : "var(--t2)", fontWeight: live ? 600 : 400, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{label}</span>
         {m.shared && <span title="Shared with you (you don't own this meeting)" style={{ flex: "none", fontSize: 9.5, color: "var(--t3)", border: "1px solid var(--line)", borderRadius: 5, padding: "0 5px" }}>shared</span>}
-        {(m.native_id || isIntent) && !m.shared && <RowActions m={m} showBadge={showBadge} reveal={hover} onActionStart={() => setActionFailure(null)} onActionFailure={setActionFailure} />}
+        {showBadge && <StatusBadge raw={m.live_status} />}
+        {canShowRowActions(m) && <RowActions m={m} reveal={hover} onActionStart={() => setActionFailure(null)} onActionFailure={setActionFailure} />}
       </div>
       <div style={{ fontSize: 11, color: inRoom ? "var(--green)" : "var(--t3)", marginTop: 1, paddingLeft: inRoom ? 13 : 0 }}>{inRoom ? "live" : m.when}</div>
-      {isIntent && m.auto_join_error && (
-        <div role="alert" style={{ fontSize: 11, color: "var(--danger)", marginTop: 3, lineHeight: 1.35 }}>
-          ⚠ Auto-join failed: {m.auto_join_error}
-        </div>
-      )}
       {actionFailure && (
         <div role="status" aria-live="polite" style={{ fontSize: 11, color: "var(--danger)", marginTop: 4, lineHeight: 1.35 }}>
           {actionFailure.actionLabel} failed: {actionFailure.message}
         </div>
       )}
-      {menu && (
+      {menu && rowReference && (
         <ContextMenu x={menu.x} y={menu.y} onClose={() => setMenu(null)} items={[
-          { id: "copy-reference", label: "Copy reference", detail: `@meeting:${native}`, onSelect: () => copyText(`@meeting:${native}`) },
+          { id: "copy-reference", label: "Copy reference", detail: `@meeting:${rowReference}`, onSelect: () => copyText(`@meeting:${rowReference}`) },
         ]} />
       )}
     </div>
@@ -511,7 +507,7 @@ function CalendarSyncStatusLine({ stamp }: { stamp: CalendarSyncStamp | null }) 
   );
 }
 
-// ── Calendar sync — the secret ICS URL + the GLOBAL auto-join default for imported meetings.
+// ── Calendar sync — the secret ICS URL imports meetings; managed capture lives in Hub.
 //    The URL is a secret: reads come back MASKED (host + tail). Synced meetings land under Upcoming.
 //    Two skins over ONE popover: `icon` (the quiet header icon, always there) and `row` (a
 //    discoverable "Connect your calendar" row that hides itself once a feed is connected). ──
@@ -543,7 +539,7 @@ function CalendarSyncButton({ variant = "icon" }: { variant?: "icon" | "row" }) 
     document.addEventListener("mousedown", close);
     return () => document.removeEventListener("mousedown", close);
   }, [open]);
-  const save = async (body: { ics_url?: string | null; auto_join?: boolean }) => {
+  const save = async (body: { ics_url?: string | null }) => {
     setBusy(true); setErr(null);
     try {
       setCfg(await setCalendarConfig(body));
@@ -577,11 +573,6 @@ function CalendarSyncButton({ variant = "icon" }: { variant?: "icon" | "row" }) 
               <div style={{ fontSize: 12, color: "var(--t2)", lineHeight: 1.5 }}>
                 Connected: <span style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{cfg.ics_url_masked}</span>
               </div>
-              <label style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12, color: "var(--t2)", cursor: "pointer", userSelect: "none" }}>
-                <input type="checkbox" checked={cfg.auto_join} disabled={busy}
-                  onChange={(e) => void save({ auto_join: e.target.checked })} />
-                Auto-join imported meetings
-              </label>
               <CalendarSyncStatusLine stamp={stamp} />
               <div style={{ display: "flex", gap: 6 }}>
                 <button disabled={busy || syncing} onClick={() => void syncNow()}
@@ -598,7 +589,7 @@ function CalendarSyncButton({ variant = "icon" }: { variant?: "icon" | "row" }) 
             <>
               <div style={{ fontSize: 11.5, color: "var(--t3)", lineHeight: 1.5 }}>
                 Paste your calendar&apos;s <b>secret ICS address</b> (Google Calendar → Settings → &quot;Secret address in iCal format&quot;).
-                Upcoming meetings with a Meet/Zoom/Teams link appear under Upcoming and auto-join at start.
+                Upcoming meetings with a Meet/Zoom/Teams link appear under Upcoming. Managed capture controls are available in the ZAKI Hub.
               </div>
               <input value={url} placeholder="https://calendar.google.com/…/basic.ics" disabled={busy}
                 onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && url.trim()) void save({ ics_url: url.trim() }); }}
@@ -633,43 +624,6 @@ function MeetingsList() {
       layout.openTab(meetingTab(firstLive));
     }
   }, [all, layout]);
-  // 'add bot from URL': send OUR bot into a meeting; the watcher attaches the copilot once it transcribes
-  const [url, setUrl] = useState("");
-  const [sent, setSent] = useState<null | "sending" | "ok" | "err">(null);
-  const [errMsg, setErrMsg] = useState<string | null>(null);
-  const addBot = async () => {
-    const u = url.trim();
-    if (!u || sent === "sending") return;
-    // Parse + validate the pasted link/id against the platform formats (mirrors join-form).
-    const parsed = parseMeetingInput(u, await getJitsiHosts());
-    if (!parsed) { setSent("err"); setErrMsg("That doesn't look like a Meet / Zoom / Teams / Jitsi link."); setTimeout(() => setSent(null), 5000); return; }
-    setSent("sending"); setErrMsg(null);
-    try {
-      // POST /bots through the authed gateway proxy (X-API-Key injected server-side from the cookie token).
-      const r = await fetch("/api/bots", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: parsed.platform, native_meeting_id: parsed.native_meeting_id, meeting_url: u, bot_name: "Vexa" }),
-      });
-      if (r.ok) {
-        setSent("ok"); setUrl("");
-        // The list has no background poll, so force a re-fetch now and again as the bot
-        // transitions requested → joining → active (else the meeting only shows on reload).
-        refreshMeetings(); setTimeout(refreshMeetings, 2000); setTimeout(refreshMeetings, 6000);
-      } else {
-        // Surface the REAL reason, not a generic "bad link" (the cap/dup/auth cases are common).
-        const detail = (await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 160);
-        setSent("err");
-        setErrMsg(
-          r.status === 429 ? "You're at your meeting limit — stop one first."
-            : r.status === 409 ? "That meeting already has a bot."
-              : r.status === 401 ? "Not signed in — sign in and retry."
-                : `Couldn't send (${r.status})${detail ? `: ${detail}` : ""}`,
-        );
-      }
-    } catch { setSent("err"); setErrMsg("Couldn't reach the server."); }
-    setTimeout(() => setSent(null), 5000);
-  };
   return (
     <div style={{ padding: "8px" }}>
       <div style={{ display: "flex", alignItems: "center", padding: "6px 4px 6px" }}>
@@ -677,16 +631,9 @@ function MeetingsList() {
         <CalendarSyncButton />
       </div>
       <div style={{ padding: "0 4px 10px" }}>
-        <div style={{ display: "flex", gap: 6 }}>
-          <input value={url} onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void addBot(); }}
-            placeholder="Paste a meeting link (Meet / Zoom / Teams / Jitsi)…" style={{ flex: 1, minWidth: 0, background: "var(--panel)", border: "1px solid var(--line2)", borderRadius: 7, padding: "6px 8px", color: "var(--t1)", fontSize: 12, outline: "none" }} />
-          <button onClick={() => void addBot()} disabled={!url.trim() || sent === "sending"} title="Send the Vexa bot to this meeting"
-            style={{ flex: "none", background: url.trim() ? "var(--accent)" : "var(--panel2)", color: url.trim() ? "var(--on-accent)" : "var(--t3)", border: "none", borderRadius: 7, padding: "0 10px", fontSize: 12, fontWeight: 600, cursor: url.trim() ? "pointer" : "default" }}>
-            {sent === "sending" ? "…" : "Add bot"}
-          </button>
+        <div style={{ fontSize: 11, color: "var(--t3)", lineHeight: 1.45, marginBottom: 8 }}>
+          This reference Terminal can plan and review meetings. Managed capture controls are available in the ZAKI Hub.
         </div>
-        {sent === "ok" && <div style={{ fontSize: 11, color: "var(--green)", marginTop: 5, lineHeight: 1.4 }}>Bot sent — admit it in the meeting; it appears here once it starts transcribing.</div>}
-        {sent === "err" && <div style={{ fontSize: 11, color: "var(--danger)", marginTop: 5, lineHeight: 1.4 }}>{errMsg ?? "Couldn't send."}</div>}
         <div style={{ marginTop: 8 }}>
           <PlanMeetingButton />
           <CalendarSyncButton variant="row" />
@@ -741,39 +688,6 @@ function ModelChips() {
   );
 }
 
-/** Bot lifecycle controls on the meeting page header (owner ask 2026-07-09): Stop while the bot
- *  is in the call, Re-send once it stopped/completed/failed. Reuses the row-action map verbatim
- *  (same endpoints, same status vocabulary) — only bot actions surface here; row management
- *  (schedule/cancel/delete) stays in the sidebar menu. */
-function BotControls({ m }: { m: MeetingMock }) {
-  const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const acts = actionsFor(m).filter((a) => a.id === "stop" || a.id === "resend" || a.id === "send");
-  if (acts.length === 0) return null;
-  return (
-    <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flex: "none" }}>
-      {acts.map((a) => {
-        const danger = a.tone === "live";
-        return (
-          <button key={a.id} disabled={busy}
-            onClick={() => {
-              setErr(null); setBusy(true);
-              void Promise.resolve(a.run((f) => setErr(f.message))).finally(() => setBusy(false));
-            }}
-            style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "transparent",
-              border: `1px solid ${danger ? "var(--danger)" : "var(--line2)"}`,
-              color: danger ? "var(--danger)" : "var(--accent)",
-              borderRadius: 7, padding: "4px 11px", fontSize: 12, fontWeight: 600,
-              cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>
-            {a.id === "stop" ? "Stop bot" : "Send bot again"}
-          </button>
-        );
-      })}
-      {err && <span role="alert" style={{ fontSize: 11, color: "var(--danger)", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={err}>⚠ {err}</span>}
-    </span>
-  );
-}
-
 function MeetingTab({ params }: TabProps) {
   const liveList = useLiveMeetings();
   const requestedMeetingId = params.meetingId as string;
@@ -800,8 +714,7 @@ function MeetingTab({ params }: TabProps) {
             {m && <span style={{ color: "var(--t3)", flex: "none" }}>{m.participants.length} in the room</span>}
           </div>
           <div style={{ flex: 1 }} />
-          {m && <BotControls m={m} />}
-          {m?.native_id && <ShareSessionButton platform={platformSlug(m.platform)} native={m.native_id} />}
+          {m?.native_id && canShowMeetingHeaderOwnerControls(m) && <ShareSessionButton platform={platformSlug(m.platform)} native={m.native_id} />}
           <ModelChips />
         </div>
       </header>

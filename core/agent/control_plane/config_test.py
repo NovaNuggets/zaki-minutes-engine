@@ -32,10 +32,49 @@ KEYCHAIN_REFRESH = ('security find-generic-password -s "Claude Code-credentials"
                     "> ~/.claude/.credentials.json")
 
 _TIMEOUT = 8.0
+MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 
 # (status, body_text) — injectable for tests; None body on network failure.
 HttpPost = Callable[[str, dict, dict], tuple[int, str]]
 HttpGet = Callable[[str, dict], tuple[int, str]]
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep authenticated probes bound to the exact operator-configured endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def open_no_redirect(request: urllib.request.Request, *, timeout: float):
+    """Open one authenticated request without forwarding its headers across origins."""
+
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
+def _read_bounded_response(response) -> str:
+    """Read one untrusted probe response with a hard byte ceiling before decoding.
+
+    ``Content-Length`` provides a fast rejection when present; the ``limit + 1`` read also
+    bounds chunked/missing-length responses. The local error never includes upstream bytes.
+    """
+    declared = response.headers.get("Content-Length")
+    if declared is not None:
+        try:
+            declared_length = int(declared)
+        except (TypeError, ValueError):
+            # A malformed length cannot be trusted for a fast decision; the bounded read below
+            # remains authoritative.
+            declared_length = None
+        if declared_length is not None and declared_length > MAX_HTTP_RESPONSE_BYTES:
+            raise ValueError("upstream response exceeds limit")
+    body = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+    if len(body) > MAX_HTTP_RESPONSE_BYTES:
+        raise ValueError("upstream response exceeds limit")
+    return body.decode("utf-8", "replace")
 
 
 def _post(url: str, payload: dict, headers: dict) -> tuple[int, str]:
@@ -43,23 +82,62 @@ def _post(url: str, payload: dict, headers: dict) -> tuple[int, str]:
                                  headers={"Content-Type": "application/json", **headers},
                                  method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+        # Model keys and the completion payload are authorized for this configured origin only.
+        with open_no_redirect(req, timeout=_TIMEOUT) as r:
+            return r.status, _read_bounded_response(r)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return e.code, _read_bounded_response(e)
 
 
 def _get(url: str, headers: dict) -> tuple[int, str]:
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+        # urllib follows redirects by default and copies custom headers, which can leak
+        # an STT token to an arbitrary redirect target. Refuse instead.
+        with open_no_redirect(req, timeout=_TIMEOUT) as r:
+            return r.status, _read_bounded_response(r)
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
+        return e.code, _read_bounded_response(e)
 
 
 def _result(ok: bool, summary: str, **extra) -> dict:
     return {"ok": ok, "summary": summary, **extra}
+
+
+def managed_models_status(config: dict, env: Optional[dict] = None) -> dict:
+    """Non-secret status for an inherited operator model tier. Never opens a credential file or
+    endpoint: a normal user may learn configured/not-configured, but not origin, expiry, or account."""
+    env = env if env is not None else dict(os.environ)
+    configured = bool(
+        (config.get("mode") or config.get("base_url"))
+        or env.get("ANTHROPIC_AUTH_TOKEN")
+        or env.get("ANTHROPIC_API_KEY")
+        or env.get("VEXA_LLM_API_KEY")
+        or env.get("HOST_CLAUDE_CREDENTIALS")
+        or env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    )
+    return _result(
+        configured,
+        "Deployment model credentials are configured and operator-managed; live credential "
+        "details are not exposed here."
+        if configured else "Deployment model credentials are operator-managed but not configured.",
+        source="operator",
+        managed=True,
+        mode=(config.get("mode") or "deployment"),
+    )
+
+
+def managed_transcription_status(url: str, token: str) -> dict:
+    """Non-secret status for an inherited operator STT tier; deliberately performs no request."""
+    configured = bool((url or "").strip() and (token or "").strip())
+    return _result(
+        configured,
+        "Deployment transcription is configured and operator-managed; live account and balance "
+        "details are not exposed here."
+        if configured else "Deployment transcription is operator-managed but not fully configured.",
+        source="operator",
+        managed=True,
+    )
 
 
 # ── models ────────────────────────────────────────────────────────────────────────────────────
@@ -102,8 +180,9 @@ def test_custom_endpoint(base_url: str, api_key: str, model: str = "",
     if not base:
         return _result(False, "Custom mode but no Base URL set.")
     model = model or "claude-haiku-4-5-20251001"
-    auth = {"x-api-key": api_key, "Authorization": f"Bearer {api_key}",
-            "anthropic-version": "2023-06-01"}
+    auth = {"anthropic-version": "2023-06-01"}
+    if api_key:
+        auth.update({"x-api-key": api_key, "Authorization": f"Bearer {api_key}"})
     try:
         status, body = post(f"{base}/v1/messages",
                             {"model": model, "max_tokens": 1,
@@ -112,16 +191,16 @@ def test_custom_endpoint(base_url: str, api_key: str, model: str = "",
             status, body = post(f"{base}/v1/chat/completions",
                                 {"model": model, "max_tokens": 1,
                                  "messages": [{"role": "user", "content": "ping"}]}, auth)
-    except Exception as exc:  # DNS, refused, TLS, timeout — the endpoint itself is the problem
-        return _result(False, f"Endpoint unreachable: {exc}")
+    except Exception:  # DNS, refused, TLS, timeout — keep exception text out of browser/log output
+        return _result(False, "Endpoint unreachable.")
     if status in (401, 403):
         return _result(False, f"Authentication FAILED at {base} (HTTP {status}) — bad or "
                               "expired API key.", status=status)
     if 200 <= status < 300:
         return _result(True, f"Live completion OK against {base} (model {model}).",
                        status=status)
-    detail = body[:200] if body else ""
-    return _result(False, f"Endpoint answered HTTP {status}: {detail}", status=status)
+    # Never reflect an untrusted gateway body: some providers echo request auth on errors.
+    return _result(False, f"Endpoint answered HTTP {status}.", status=status)
 
 
 def run_models_test(config: dict, env: Optional[dict] = None,
@@ -130,10 +209,26 @@ def run_models_test(config: dict, env: Optional[dict] = None,
     (Settings user > global config already collapsed by admin-api; env is the floor)."""
     env = env if env is not None else dict(os.environ)
     mode = (config.get("mode") or "").strip()
-    base_url = (config.get("base_url") or "").strip() or env.get("ANTHROPIC_BASE_URL", "")
-    api_key = (config.get("api_key") or "").strip() or env.get("ANTHROPIC_AUTH_TOKEN", "") \
-        or env.get("ANTHROPIC_API_KEY", "")
-    if mode == "custom" or (not mode and base_url and api_key):
+    if config.get("blocked"):
+        return _result(
+            False,
+            "Personal model configuration is blocked by operator policy; choose an approved "
+            "custom endpoint or Deployment default.",
+            mode=mode or "custom",
+            config={k: v for k, v in config.items() if k in ("mode", "model", "meeting_model") and v},
+        )
+    config_base_url = (config.get("base_url") or "").strip()
+    config_api_key = (config.get("api_key") or "").strip()
+    settings_custom = mode == "custom" or bool(config_base_url)
+    if settings_custom:
+        # Settings selects a complete credential owner tier. Missing fields stay missing; never
+        # fill a user/platform URL with deployment secrets.
+        base_url, api_key = config_base_url, config_api_key
+    else:
+        base_url = (env.get("ANTHROPIC_BASE_URL", "") or env.get("VEXA_LLM_BASE_URL", "")).strip()
+        api_key = (env.get("ANTHROPIC_AUTH_TOKEN", "") or env.get("ANTHROPIC_API_KEY", "")
+                   or env.get("VEXA_LLM_API_KEY", "")).strip()
+    if settings_custom or (not mode and base_url and api_key):
         out = test_custom_endpoint(base_url, api_key, (config.get("model") or "").strip(),
                                    post=post)
         out["mode"] = "custom"
@@ -165,8 +260,8 @@ def run_transcription_test(url: str, token: str, source: str, get: HttpGet = _ge
                        source=source)
     try:
         status, body = get(f"{base}/balance", {"X-API-Key": token})
-    except Exception as exc:
-        return _result(False, f"Backend unreachable: {exc}", source=source)
+    except Exception:
+        return _result(False, "Backend unreachable.", source=source)
     if status in (401, 403):
         return _result(False, f"Token REJECTED by {base} (HTTP {status}).", source=source,
                        status=status)

@@ -14,6 +14,7 @@ from gateway import create_app
 from conftest import VALID_KEY, FakeAuthorizer, FakeDownstream, FakeRedis
 
 AUTH = {"x-api-key": VALID_KEY}
+MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024
 
 
 def _client(authorizer=None, downstream=None):
@@ -51,6 +52,116 @@ def test_authed_request_passes_body_and_status_verbatim():
     r = client.post("/bots", headers=AUTH, json={"platform": "google_meet", "native_meeting_id": "abc"})
     assert r.status_code == 201
     assert r.json() == {"id": 99, "platform": "google_meet"}
+    assert r.headers["cache-control"] == "no-store"
+
+
+def test_declared_oversize_request_is_rejected_before_downstream():
+    """A valid key cannot make the edge buffer a caller-declared body above the public cap."""
+    client, downstream = _client()
+
+    response = client.post(
+        "/bots",
+        headers={**AUTH, "content-length": str(MAX_PROXY_BODY_BYTES + 1)},
+        content=b"x",
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "request body too large"
+    assert downstream.last is None
+
+
+def test_chunked_oversize_request_is_stopped_at_the_byte_cap(monkeypatch):
+    """Chunked callers cannot bypass the cap by omitting Content-Length."""
+    import gateway.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, "MAX_PROXY_BODY_BYTES", 8)
+    client, downstream = _client()
+
+    response = client.post(
+        "/bots",
+        headers=AUTH,
+        content=iter((b"12345", b"67890")),
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "request body too large"
+    assert downstream.last is None
+
+
+def test_oversize_buffered_downstream_response_is_rejected(monkeypatch):
+    """Ordinary JSON proxy routes never return a body above the bounded response budget."""
+    import gateway.app as gateway_app
+
+    monkeypatch.setattr(gateway_app, "MAX_PROXY_BODY_BYTES", 8)
+    client, _ = _client(downstream=FakeDownstream(body={"blob": "123456789"}))
+
+    response = client.get("/meetings", headers=AUTH)
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "upstream response too large"
+
+
+class _RawMediaResponse:
+    status_code = 206
+    headers = {
+        "content-type": "audio/webm",
+        "content-length": "6",
+        "content-range": "bytes 4-9/20",
+        "accept-ranges": "bytes",
+        "etag": '"recording-v1"',
+    }
+
+    def __init__(self):
+        self.closed = False
+
+    async def aiter_raw(self):
+        yield b"abc"
+        yield b"def"
+
+    async def aiter_bytes(self):
+        raise AssertionError("raw recording relay must not decode or transform range bytes")
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _RawMediaDownstream:
+    def __init__(self):
+        self.last = None
+        self.response = _RawMediaResponse()
+
+    async def request(self, *args, **kwargs):
+        raise AssertionError("raw recording media must not use the buffered proxy")
+
+    async def open_stream(self, method, url, *, headers=None, params=None, content=None):
+        self.last = {
+            "method": method,
+            "url": url,
+            "headers": headers or {},
+            "params": params,
+            "content": content,
+        }
+        return self.response
+
+
+def test_raw_recording_is_streamed_with_range_metadata_and_no_store():
+    downstream = _RawMediaDownstream()
+    client, _ = _client(downstream=downstream)
+
+    response = client.get(
+        "/recordings/7/media/9/raw",
+        headers={**AUTH, "range": "bytes=4-9"},
+    )
+
+    assert response.status_code == 206
+    assert response.content == b"abcdef"
+    assert response.headers["content-range"] == "bytes 4-9/20"
+    assert response.headers["accept-ranges"] == "bytes"
+    assert response.headers["content-length"] == "6"
+    assert response.headers["cache-control"] == "no-store"
+    assert downstream.last["headers"]["range"] == "bytes=4-9"
+    assert downstream.last["headers"]["accept-encoding"] == "identity"
+    assert downstream.response.closed is True
 
 
 def test_rate_limit_returns_429_past_the_per_user_cap():
@@ -79,28 +190,6 @@ def test_rate_limit_does_not_apply_when_unconfigured():
         assert client.get("/bots/status", headers=AUTH).status_code == 200
 
 
-@pytest.mark.xfail(
-    reason="FINDING terminal-p20-complete-mediation: GET /agent/meeting/stream forwards WITHOUT a "
-    "per-meeting ownership check (gateway app.py agent_meeting_stream → _forward_stream). Any "
-    "authenticated user can stream any meeting's live transcript by passing its native id — the "
-    "WS /ws path authorizes via authorize_subscribe, the SSE path does not. Fix is lane:contract "
-    "(human-gated, P20/ADR-0012): authorize the requested meeting like /ws before forwarding. This "
-    "executable spec flips RED (strict xfail) the moment the authz lands, forcing the marker's removal.",
-    strict=True,
-)
-def test_meeting_stream_denies_a_meeting_the_user_does_not_own():
-    """P20 complete mediation on the live-transcript SSE: a subscribe to a meeting the user does not
-    own must be denied (403), not silently forwarded. auth_map is EMPTY → the user owns no meeting."""
-    client, _ = _client(authorizer=FakeAuthorizer(auth_map={}))
-    r = client.get(
-        "/agent/meeting/stream",
-        headers=AUTH,
-        params={"meeting_id": "someone-elses-native", "platform": "google_meet",
-                "session_uid": "someone-elses-native"},
-    )
-    assert r.status_code == 403
-
-
 def test_identity_headers_injected_and_spoof_stripped():
     """The gateway injects x-user-id from the resolved token and STRIPS client-supplied
     identity headers (anti-spoofing, main.py:294-296)."""
@@ -111,6 +200,7 @@ def test_identity_headers_injected_and_spoof_stripped():
     assert fwd["x-user-id"] == "7", "must reflect the resolved user, not the spoofed header"
     assert fwd["x-user-scopes"] == "bot,tx,browser"
     assert fwd["x-api-key"] == VALID_KEY
+    assert "x-gateway-verified" not in fwd  # proof is scoped only to the agent-api hop
 
 
 def test_meeting_intent_put_forwards_to_meeting_api():

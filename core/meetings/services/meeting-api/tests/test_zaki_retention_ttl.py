@@ -164,6 +164,49 @@ async def test_failed_scope_remains_retryable_without_blocking_other_due_scopes(
     assert retry.failed == 0
 
 
+async def test_failed_oldest_batch_is_deferred_so_later_due_scopes_are_not_starved():
+    class BackoffStore:
+        def __init__(self):
+            self.items = tuple(
+                DueScope("user-a", f"meeting-{index}", "audio", NOW - timedelta(seconds=3 - index))
+                for index in range(3)
+            )
+            self.deferred_until: dict[tuple[str, str, str], datetime] = {}
+            self.expired: list[str] = []
+
+        @staticmethod
+        def _key(item):
+            return (item.user_id, item.meeting_id, item.scope)
+
+        async def list_due_scopes(self, *, now, limit):
+            return tuple(
+                item
+                for item in self.items
+                if self.deferred_until.get(self._key(item), now) <= now
+                and item.meeting_id not in self.expired
+            )[:limit]
+
+        async def expire_scope(self, item):
+            if item.meeting_id in {"meeting-0", "meeting-1"}:
+                raise RuntimeError("permanent carrier failure")
+            self.expired.append(item.meeting_id)
+            return 1
+
+        async def defer_scope(self, item, *, retry_at):
+            self.deferred_until[self._key(item)] = retry_at
+
+    store = BackoffStore()
+
+    first = await run_ttl_batch(store, now=NOW, limit=2)
+    second = await run_ttl_batch(store, now=NOW, limit=2)
+
+    assert first.attempted == 2
+    assert first.failed == 2
+    assert second.attempted == 1
+    assert second.expired == {"audio": 1, "transcript": 0, "summary": 0}
+    assert store.expired == ["meeting-2"]
+
+
 async def test_ttl_batch_leaves_a_second_tenant_byte_identically_unchanged():
     store = InMemoryTtlStore()
     store.seed(

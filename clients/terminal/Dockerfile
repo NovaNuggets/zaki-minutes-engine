@@ -58,6 +58,7 @@ ARG NEXT_PUBLIC_TERMINAL_MODE=""
 ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0 \
+    NEXT_TELEMETRY_DISABLED=1 \
     NEXT_PUBLIC_TERMINAL_MODE=$NEXT_PUBLIC_TERMINAL_MODE
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -71,6 +72,9 @@ COPY server.mjs next.config.ts tsconfig.json ./
 # rather than the build context, where it is absent on a clean clone.
 COPY --from=build /app/next-env.d.ts ./
 COPY src ./src
+RUN groupadd --gid 10006 vexa && \
+    useradd --uid 10006 --gid 10006 --create-home --shell /usr/sbin/nologin vexa
+USER 10006:10006
 EXPOSE 3000
 # `npm start` === PORT=3000 NODE_ENV=production node server.mjs
 CMD ["node", "server.mjs"]

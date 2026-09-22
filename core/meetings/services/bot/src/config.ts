@@ -1,5 +1,5 @@
 /**
- * invocation.v1 boot config (P14) — the bot's "constructor".
+ * Version-routed invocation boot config (P14) — the bot's "constructor".
  *
  * The container is started with ONE JSON env var, `VEXA_BOT_CONFIG`, holding an
  * `invocation.v1` object. We validate it at boot against the PUBLISHED schema
@@ -7,7 +7,7 @@
  * goldens are the spec, P8) with ajv — the same validator the contract's own
  * `validate.mjs` uses, so the bot can NEVER drift from the contract. A parse/validation
  * failure is fatal: the caller maps it to a lifecycle.v1 `failed` / `validation_error`
- * (fail-fast, P14). Secrets ride in this contract (token / internalSecret / S3 keys) —
+ * (fail-fast, P14). Scoped secrets ride in this contract (MeetingToken / STT / S3 keys) —
  * never logged (P14/P15).
  *
  * `Invocation` is the typed view the rest of the bot depends on. It is a hand-written
@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 
 export type Platform = 'google_meet' | 'zoom' | 'teams' | 'jitsi';
 export type TranscriptionTier = 'realtime' | 'deferred';
+export type InvocationContract = 'invocation.v1' | 'invocation.v2';
 
 /** True for platforms that ride the MIXED capture lane (one combined WebRTC audio
  *  stream + pyannote separation); google_meet rides the per-channel gmeet lane.
@@ -42,9 +43,16 @@ export interface AutomaticLeave {
   everyoneLeftTimeout?: number;
 }
 
+export interface ManagedRetention {
+  policyVersion: string;
+  scopeExpiresAt: { audio: string; transcript: string; summary: string };
+}
+
 /** The compile-time mirror of invocation.v1 `#/$defs/Invocation` (ajv is the runtime truth). */
 export interface Invocation {
-  // ── what to join (required: platform, meetingUrl, botName, redisUrl) ──
+  /** Present and fixed only on the opt-in managed v2 wire. */
+  contractVersion?: 'invocation.v2';
+  // ── what to join (v1 requires redisUrl; managed v2 requires the mediated HTTP URLs) ──
   platform: Platform;
   meetingUrl: string | null;
   botName: string;
@@ -53,10 +61,13 @@ export interface Invocation {
   // ── identity / control plane ──
   token?: string;
   connectionId?: string;
-  meeting_id?: number;
+  meeting_id?: number | string;
   container_name?: string;
-  redisUrl: string;
+  redisUrl?: string;
+  transcriptIngestUrl?: string;
+  retentionFenceUrl?: string;
   meetingApiCallbackUrl?: string;
+  /** Legacy schema-compatible field accepted only when reading an older invocation; unused. */
   internalSecret?: string;
   // ── transcription ──
   language?: string | null;
@@ -70,6 +81,9 @@ export interface Invocation {
   recordingEnabled?: boolean;
   captureModes?: string[];
   recordingUploadUrl?: string;
+  /** Absolute earliest audio/transcript/summary deadline for managed capture. */
+  captureExpiresAt?: string;
+  managedRetention?: ManagedRetention;
   // ── lifecycle timeouts ──
   automaticLeave?: AutomaticLeave;
   reconnectionIntervalMs?: number;
@@ -97,39 +111,64 @@ export class InvocationError extends Error {
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// src/ → ../../../contracts/invocation.v1/  (meetings/services/bot/src → meetings/contracts/…)
-const SCHEMA_PATH = join(HERE, '..', '..', '..', 'contracts', 'invocation.v1', 'invocation.schema.json');
+const schemaPath = (version: InvocationContract) =>
+  join(HERE, '..', '..', '..', 'contracts', version, 'invocation.schema.json');
 
 interface Validator { ajv: Ajv; validate: ValidateFunction }
-let _validator: Validator | undefined;
-function validator(): Validator {
-  if (_validator) return _validator;
-  const schema = JSON.parse(readFileSync(SCHEMA_PATH, 'utf8'));
+const _validators = new Map<InvocationContract, Validator>();
+function validator(version: InvocationContract): Validator {
+  const existing = _validators.get(version);
+  if (existing) return existing;
+  const schema = JSON.parse(readFileSync(schemaPath(version), 'utf8'));
   const ajv = new Ajv2020({ strict: false, allErrors: true });
   addFormats(ajv);
   ajv.addSchema(schema);
   const validate = ajv.compile({ $ref: `${schema.$id}#/$defs/Invocation` });
-  _validator = { ajv, validate };
-  return _validator;
+  const built = { ajv, validate };
+  _validators.set(version, built);
+  return built;
 }
 
-/** Parse + validate a raw JSON string against invocation.v1, or throw InvocationError. */
-export function parseInvocation(raw: string | undefined): Invocation {
-  if (!raw || !raw.trim()) throw new InvocationError('invocation.v1: VEXA_BOT_CONFIG env is missing or empty');
+/** Parse + validate a raw JSON string against the explicitly selected contract. */
+export function parseInvocation(
+  raw: string | undefined,
+  version: InvocationContract = 'invocation.v1',
+): Invocation {
+  if (!raw || !raw.trim()) throw new InvocationError(`${version}: VEXA_BOT_CONFIG env is missing or empty`);
   let data: unknown;
   try {
     data = JSON.parse(raw);
   } catch (e) {
-    throw new InvocationError(`invocation.v1: VEXA_BOT_CONFIG is not valid JSON — ${(e as Error).message}`);
+    throw new InvocationError(`${version}: VEXA_BOT_CONFIG is not valid JSON — ${(e as Error).message}`);
   }
-  const { ajv, validate } = validator();
+  const { ajv, validate } = validator(version);
   if (!validate(data)) {
-    throw new InvocationError(`invocation.v1: VEXA_BOT_CONFIG failed validation — ${ajv.errorsText(validate.errors)}`);
+    throw new InvocationError(`${version}: VEXA_BOT_CONFIG failed validation — ${ajv.errorsText(validate.errors)}`);
+  }
+  if (version === 'invocation.v2') {
+    const invocation = data as Invocation;
+    const expiries = invocation.managedRetention?.scopeExpiresAt;
+    const scopeMs = expiries
+      ? [expiries.audio, expiries.transcript, expiries.summary].map((value) => Date.parse(value))
+      : [];
+    const captureMs = Date.parse(invocation.captureExpiresAt ?? '');
+    if (scopeMs.length !== 3
+        || scopeMs.some((value) => !Number.isFinite(value))
+        || !Number.isFinite(captureMs)
+        || captureMs !== Math.min(...scopeMs)) {
+      throw new InvocationError(
+        'invocation.v2: captureExpiresAt must equal the earliest managed retention expiry',
+      );
+    }
   }
   return data as Invocation;
 }
 
 /** Boot helper — read VEXA_BOT_CONFIG from the environment and validate it (P7: config by env). */
 export function loadInvocation(env: NodeJS.ProcessEnv = process.env): Invocation {
-  return parseInvocation(env.VEXA_BOT_CONFIG);
+  const selected = env.VEXA_INVOCATION_CONTRACT?.trim() || 'invocation.v1';
+  if (selected !== 'invocation.v1' && selected !== 'invocation.v2') {
+    throw new InvocationError(`unsupported invocation contract selector: ${selected}`);
+  }
+  return parseInvocation(env.VEXA_BOT_CONFIG, selected);
 }

@@ -3,10 +3,15 @@
  "service": "meeting-api",
  "keys": [
   {
-   "key": "ADMIN_TOKEN",
+   "key": "MEETING_TOKEN_SECRET",
    "class": "required-explicit",
    "secret": true,
-   "description": "HS256-signs the per-spawn MeetingToken AND verifies the recordings upload — the same admin secret admin-api holds (ADMIN_API_TOKEN); unset, every POST /bots would 500, so the boot refuses instead (A4)"
+   "description": "dedicated HS256 key for per-spawn MeetingTokens used by transcript, lifecycle, and recording writes; projected only to meeting-api and distinct from admin/internal/runtime credentials",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
   },
   {
    "key": "DB_HOST",
@@ -40,6 +45,13 @@
    "description": "PostgreSQL password (dev default; change for any non-local deploy)"
   },
   {
+   "key": "DB_SSL_MODE",
+   "class": "defaulted",
+   "default": "disable",
+   "description": "asyncpg TLS policy for DB_*-constructed URLs: disable, require, verify-ca, or verify-full",
+   "targets": ["compose", "helm"]
+  },
+  {
    "key": "DATABASE_URL",
    "class": "defaulted",
    "default": "(derived from DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD as postgresql+asyncpg://)",
@@ -51,6 +63,7 @@
    "key": "REDIS_URL",
    "class": "defaulted",
    "default": "redis://redis:6379/0",
+   "secret": true,
    "description": "the transcription_segments stream + bm:meeting:{id}:status pub/sub + bot-command channel backing"
   },
   {
@@ -58,6 +71,28 @@
    "class": "defaulted",
    "default": "http://runtime:8090",
    "description": "the runtime kernel's runtime.v1 surface bot_spawn creates workloads on"
+  },
+  {
+   "key": "RUNTIME_CONTROL_SECRET",
+   "class": "required-explicit",
+   "secret": true,
+   "description": "dedicated credential meeting-api attaches to runtime /workloads operations; never copied into bot workload configuration",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
+  },
+  {
+   "key": "RUNTIME_CALLBACK_SECRET",
+   "class": "required-explicit",
+   "secret": true,
+   "description": "dedicated credential accepted only as X-Runtime-Callback-Secret on /runtime/callback; distinct from runtime control, MeetingToken signing, and platform internal credentials",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
   },
   {
    "key": "MEETING_API_URL",
@@ -70,10 +105,23 @@
   },
   {
    "key": "INTERNAL_API_SECRET",
-   "class": "defaulted",
-   "default": "(unset — the internal lifecycle-callback header is then not attached)",
+   "class": "required-explicit",
    "secret": true,
-   "description": "shared secret for internal service-to-service calls (x-internal-secret on the self-driven lifecycle callback)"
+   "description": "platform service-to-service credential for Identity/Agent control edges; never projected into a bot and never accepted on bot lifecycle, runtime callback, or recording upload"
+  },
+  {
+   "key": "DEV_MODE",
+   "class": "defaulted",
+   "default": "false",
+   "description": "development-mode half of the two-key insecure lifecycle harness escape; never enable in a deployed environment",
+   "targets": []
+  },
+  {
+   "key": "VEXA_ALLOW_INSECURE_LIFECYCLE_CALLBACKS",
+   "class": "defaulted",
+   "default": "false",
+   "description": "second default-off key permitting tokenless lifecycle callbacks only in the in-process development harness when DEV_MODE is also true",
+   "targets": []
   },
   {
    "key": "TRANSCRIPTION_SERVICE_URL",
@@ -120,6 +168,41 @@
    "class": "defaulted",
    "default": "8388608",
    "description": "maximum accepted recording-chunk request body in bytes; the route reads at most one byte beyond this bound and rejects oversized input before mutation",
+   "targets": []
+  },
+  {
+   "key": "RECORDING_MAX_CHUNKS",
+   "class": "defaulted",
+   "default": "4096",
+   "description": "maximum number of deterministic chunk sequences accepted for one recording media manifest; enforced before object IO and master assembly",
+   "targets": []
+  },
+  {
+   "key": "RECORDING_MAX_TOTAL_BYTES",
+   "class": "defaulted",
+   "default": "67108864",
+   "description": "maximum aggregate bytes accepted for one recording media manifest; the 64 MiB default is enforced on upload and before any master chunk body is fetched",
+   "targets": []
+  },
+  {
+   "key": "RECORDING_RANGE_MAX_BYTES",
+   "class": "defaulted",
+   "default": "8388608",
+   "description": "maximum bytes returned by one raw recording Range request; larger ranges are rejected before object-store body reads",
+   "targets": []
+  },
+  {
+   "key": "RECORDING_FINALIZE_CONCURRENCY",
+   "class": "defaulted",
+   "default": "2",
+   "description": "maximum in-process recording master finalizations; a semaphore bounds simultaneous assembly working sets",
+   "targets": []
+  },
+  {
+   "key": "RECORDING_MEMORY_BUDGET_BYTES",
+   "class": "defaulted",
+   "default": "536870912",
+   "description": "strict process memory budget used at router construction to reject an unsafe max-recording-size and finalizer-concurrency combination below the 1 GiB pod limit",
    "targets": []
   },
   {
@@ -201,6 +284,20 @@
    "class": "defaulted",
    "default": "0.5",
    "description": "poll interval (s) of the transcription_segments stream consumer loop",
+   "targets": []
+  },
+  {
+   "key": "REDIS_CONNECT_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "5",
+   "description": "finite Redis socket-connect deadline in seconds; non-positive or malformed values fail boot",
+   "targets": []
+  },
+  {
+   "key": "REDIS_IO_TIMEOUT_S",
+   "class": "defaulted",
+   "default": "5",
+   "description": "finite Redis read/write socket deadline in seconds; bounds meeting-write lease duration during dependency faults",
    "targets": []
   },
   {
@@ -307,37 +404,177 @@
   {
    "key": "ADMIN_API_URL",
    "class": "defaulted",
-   "default": "(unset — auto-join spawn-context + calendar-sync discovery are then disabled: auto-join spawns uncapped, calendar sync no-ops)",
-   "description": "admin-api base URL for the internal edges the background sweeps call (/internal/users/{id}/bot-context, /internal/calendar-configs)",
+   "default": "(unset — calendar sync no-ops and managed Minutes activation fails closed)",
+   "description": "admin-api base URL for calendar discovery and Identity-owned Minutes consent/read settings",
    "targets": []
   },
   {
-   "key": "AUTO_JOIN_SWEEP_INTERVAL_S",
+   "key": "AGENT_API_URL",
    "class": "defaulted",
-   "default": "30",
-   "description": "auto-join sweep cadence (s) — how often scheduled meetings are checked for a due start",
-   "targets": []
+   "default": "http://agent-api:8080",
+   "description": "Agent service base URL for the internal, idempotent meeting-derivative erasure handoff",
+   "targets": ["compose", "lite"]
   },
   {
-   "key": "AUTO_JOIN_LEAD_S",
+   "key": "ZAKI_MINUTES_CAPTURE_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "operator activation flag for managed Minutes capture; false physically omits capture routes",
+   "targets": ["compose"]
+  },
+  {
+   "key": "ZAKI_MINUTES_INVOCATION_V2_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "independent producer gate asserting the isolated meeting-bot-v2 runtime profile is installed; capture activation fails boot while false",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_AUTO_JOIN_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "reserved operator gate for managed calendar auto-join; true fails boot until consent, retention, attestation, and withdrawal fencing are implemented",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_MANAGED_ONLY",
+   "class": "defaulted",
+   "default": "false",
+   "description": "downstream complete-mediation policy; Zaki deployments force true so ordinary POST /bots cannot bypass managed consent and retention",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_HUB_TOKEN",
+   "class": "defaulted",
+   "default": "(unset — required when managed Minutes user routes are mounted)",
+   "secret": true,
+   "description": "dedicated external-Hub to meeting-api service token for trusting injected user identity and quota; printable ASCII, unpadded, at least 32 characters",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_READ_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "operator activation flag for the Agent-to-Minutes zaki-read.v1 plane; false physically omits it",
+   "targets": ["compose"]
+  },
+  {
+   "key": "ZAKI_READ_TOKEN_MINUTES",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_READ_ENABLED=true)",
+   "secret": true,
+   "description": "dedicated server-side bearer secret for the Agent-to-Minutes read plane; never exposed to browsers or ordinary API tokens",
+   "targets": ["compose"]
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+   "description": "expected key identifier for Agent-owned erasure receipts",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+   "secret": true,
+   "description": "meeting-api-only verifier projection of the Agent erasure HMAC key",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+   "class": "defaulted",
+   "default": "(unset — optional one-key rotation overlap)",
+   "description": "verification-only identifier for one previous Agent erasure receipt key",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+   "class": "defaulted",
+   "default": "(unset — optional one-key rotation overlap)",
+   "secret": true,
+   "description": "meeting-api-only previous Agent receipt verifier used to finish in-flight erasures after rotation",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+   "description": "non-secret key identifier stamped on Minutes-owned erasure receipts",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_SIGNING_SECRET",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+   "secret": true,
+   "description": "meeting-api-only HMAC signer for Minutes-owned erasure receipts",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+   "class": "defaulted",
+   "default": "(unset — optional one-key verification overlap during Minutes receipt signer rotation)",
+   "description": "previous Minutes receipt key identifier accepted only for verification of durable in-flight erasure receipts",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+   "class": "defaulted",
+   "default": "(unset — configure together with the previous verification key identifier)",
+   "secret": true,
+   "description": "meeting-api-only previous Minutes receipt verification secret; never used to sign new receipts",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "operator activation flag for durable HMAC transcript.finalized delivery to the Hub",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_URL",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_FINALIZED_ENABLED=true)",
+   "description": "fixed operator-owned Hub endpoint for transcript.finalized delivery",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_KEY_ID",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_FINALIZED_ENABLED=true)",
+   "description": "non-secret key identifier stamped on platform transcript.finalized deliveries",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_SECRET",
+   "class": "defaulted",
+   "default": "(unset — required only when ZAKI_MINUTES_FINALIZED_ENABLED=true)",
+   "secret": true,
+   "description": "meeting-api-only HMAC secret for platform transcript.finalized delivery; never persisted in the outbox",
+   "targets": ["compose", "helm"]
+  },
+  {
+   "key": "MINUTES_TTL_ENABLED",
+   "class": "defaulted",
+   "default": "false",
+   "description": "operator activation flag for in-process per-scope Minutes retention sweeps",
+   "targets": ["compose"]
+  },
+  {
+   "key": "MINUTES_TTL_INTERVAL_S",
    "class": "defaulted",
    "default": "60",
-   "description": "auto-join lead (s) — the bot is sent this long before data.scheduled_at",
-   "targets": []
+   "description": "positive interval between bounded Minutes retention sweeps",
+   "targets": ["compose"]
   },
   {
-   "key": "AUTO_JOIN_GRACE_S",
+   "key": "MINUTES_TTL_BATCH_SIZE",
    "class": "defaulted",
-   "default": "600",
-   "description": "auto-join grace (s) — a scheduled meeting older than this is never auto-joined (no hours-late joins)",
-   "targets": []
-  },
-  {
-   "key": "AUTO_JOIN_RETRY_BACKOFF_S",
-   "class": "defaulted",
-   "default": "300",
-   "description": "backoff (s) before an auto-join that failed loudly (cap/quota/spawn) is retried",
-   "targets": []
+   "default": "100",
+   "description": "maximum due retention scopes processed per tick (1..500)",
+   "targets": ["compose"]
   },
   {
    "key": "CALENDAR_SYNC_INTERVAL_S",

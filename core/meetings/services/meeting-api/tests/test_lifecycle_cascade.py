@@ -32,7 +32,7 @@ HOOK_URL = "https://hooks.example.test/vexa"
 
 @pytest.fixture(autouse=True)
 def _admin_token(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)  # POST /bots mints a MeetingToken signed with this
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)  # POST /bots mints a MeetingToken signed with this
 
 
 class _RecordingRedis:
@@ -95,6 +95,8 @@ def test_full_meeting_lifecycle_cascade():
     assert len(runtime.specs) == 1, "the spawn must have created exactly one workload"
 
     conn = asyncio.run(repo.list_sessions(meeting_id=meeting_id))[-1]
+    invocation = json.loads(runtime.specs[0]["env"]["VEXA_BOT_CONFIG"])
+    lifecycle_headers = {"Authorization": f"Bearer {invocation['token']}"}
 
     # ── 2. drive the bot lifecycle joining → active → completed ──
     for st in ("joining", "active", "completed"):
@@ -102,7 +104,11 @@ def test_full_meeting_lifecycle_cascade():
         if st == "completed":
             ev["exit_code"] = 0
             ev["completion_reason"] = "stopped"
-        rr = client.post("/bots/internal/callback/lifecycle", json=ev)
+        rr = client.post(
+            "/bots/internal/callback/lifecycle",
+            headers=lifecycle_headers,
+            json=ev,
+        )
         assert rr.status_code == 200, f"{st}: {rr.text}"
 
     # ── 3. durable persist (sessions/repo) — the FSM advance reached the DB row ──

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 import jsonschema
+import pytest
 from referencing import Registry, Resource
 
 from runtime_kernel import default_registry
@@ -44,6 +45,37 @@ def test_registry_resolves_meeting_bot_and_agent():
         assert isinstance(runnable, Runnable)
         assert runnable.command  # both have a launch command
     assert reg.resolve("does-not-exist") is None
+
+
+def test_agent_profile_can_be_disabled_for_managed_minutes(monkeypatch):
+    monkeypatch.setenv("RUNTIME_AGENT_PROFILE_ENABLED", "false")
+    monkeypatch.setenv("AGENT_IMAGE", "registry.example.com/agent-api:managed")
+    monkeypatch.setenv("AGENT_WORKER_IMAGE", "registry.example.com/agent-worker:managed")
+    monkeypatch.setenv("AGENT_WORKER_COMMAND", "/should/not/run")
+
+    reg = apply_command_overrides(default_registry())
+
+    assert "agent" not in reg.names()
+    assert reg.resolve("agent") is None
+
+
+def test_agent_profile_enable_flag_is_strict(monkeypatch):
+    monkeypatch.setenv("RUNTIME_AGENT_PROFILE_ENABLED", "sometimes")
+
+    with pytest.raises(ValueError, match="RUNTIME_AGENT_PROFILE_ENABLED"):
+        default_registry()
+
+
+def test_managed_v2_profile_is_default_off_and_uses_an_explicit_image(monkeypatch):
+    monkeypatch.delenv("MINUTES_BROWSER_IMAGE", raising=False)
+    assert default_registry().resolve("meeting-bot-v2") is None
+
+    monkeypatch.setenv("MINUTES_BROWSER_IMAGE", "registry.example.com/zaki-minutes-bot:v2")
+    profile = default_registry().get("meeting-bot-v2")
+    assert profile is not None
+    assert profile.runnable.image == "registry.example.com/zaki-minutes-bot:v2"
+    assert profile.base_env == {"VEXA_INVOCATION_CONTRACT": "invocation.v2"}
+    assert profile.idle_timeout_sec == 0
 
 
 def test_meeting_bot_uses_browser_image_from_env(monkeypatch):
@@ -163,6 +195,13 @@ def test_command_overrides_replace_commands(monkeypatch):
     assert reg.resolve("meeting-bot").command == ["/usr/local/bin/vexa-bot-launch"]
     assert reg.resolve("agent").command == ["/usr/local/bin/vexa-agent-worker", "--flag"]
     assert reg.get("agent").idle_timeout_sec == 300  # untouched
+
+
+def test_managed_v2_command_override_is_independent(monkeypatch):
+    monkeypatch.setenv("MINUTES_BROWSER_IMAGE", "minutes-bot:v2")
+    monkeypatch.setenv("MINUTES_BOT_COMMAND", "/usr/local/bin/vexa-bot-launch")
+    reg = apply_command_overrides(default_registry())
+    assert reg.resolve("meeting-bot-v2").command == ["/usr/local/bin/vexa-bot-launch"]
 
 
 def test_command_overrides_ignore_blank_env(monkeypatch):

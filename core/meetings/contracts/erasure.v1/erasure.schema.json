@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/erasure.v1",
+  "title": "erasure.v1",
+  "description": "Content-free, owner- and scope-specific evidence that Minutes or Agent erased one meeting or one account.",
+  "$defs": {
+    "PositiveRowId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "description": "Canonical PostgreSQL signed-bigint identifier encoded as decimal text."
+    },
+    "Count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647
+    },
+    "MinutesDeletedCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "meeting_rows",
+        "transcript_rows",
+        "summary_documents",
+        "recording_objects",
+        "agent_unit_streams",
+        "agent_workspace_documents",
+        "agent_brain_records"
+      ],
+      "properties": {
+        "meeting_rows": { "$ref": "#/$defs/Count" },
+        "transcript_rows": { "$ref": "#/$defs/Count" },
+        "summary_documents": { "$ref": "#/$defs/Count" },
+        "recording_objects": { "$ref": "#/$defs/Count" },
+        "agent_unit_streams": { "$ref": "#/$defs/Count" },
+        "agent_workspace_documents": { "$ref": "#/$defs/Count" },
+        "agent_brain_records": { "$ref": "#/$defs/Count" }
+      }
+    },
+    "AgentDeletedCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_unit_streams",
+        "agent_workspace_documents",
+        "agent_brain_records"
+      ],
+      "properties": {
+        "agent_unit_streams": { "$ref": "#/$defs/Count" },
+        "agent_workspace_documents": { "$ref": "#/$defs/Count" },
+        "agent_brain_records": { "$ref": "#/$defs/Count" }
+      }
+    },
+    "MeetingSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id", "meeting_id"],
+      "properties": {
+        "user_id": { "$ref": "#/$defs/PositiveRowId" },
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" }
+      }
+    },
+    "AccountSubject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_id"],
+      "properties": {
+        "user_id": { "$ref": "#/$defs/PositiveRowId" }
+      }
+    },
+    "IssuedAt": { "type": "string", "format": "date-time" },
+    "KeyId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+    "Nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,128}$" },
+    "Digest": { "type": "string", "pattern": "^sha256=[0-9a-f]{64}$" },
+    "Signature": { "type": "string", "pattern": "^sha256=[0-9a-f]{64}$" },
+    "MinutesMeetingReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "owner", "scope", "subject", "counts", "issued_at", "key_id", "nonce", "digest", "signature"],
+      "properties": {
+        "version": { "const": "erasure.v1" },
+        "owner": { "const": "minutes" },
+        "scope": { "const": "meeting" },
+        "subject": { "$ref": "#/$defs/MeetingSubject" },
+        "counts": { "$ref": "#/$defs/MinutesDeletedCounts" },
+        "issued_at": { "$ref": "#/$defs/IssuedAt" },
+        "key_id": { "$ref": "#/$defs/KeyId" },
+        "nonce": { "$ref": "#/$defs/Nonce" },
+        "digest": { "$ref": "#/$defs/Digest" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "MinutesAccountReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "owner", "scope", "subject", "counts", "issued_at", "key_id", "nonce", "digest", "signature"],
+      "properties": {
+        "version": { "const": "erasure.v1" },
+        "owner": { "const": "minutes" },
+        "scope": { "const": "account" },
+        "subject": { "$ref": "#/$defs/AccountSubject" },
+        "counts": { "$ref": "#/$defs/MinutesDeletedCounts" },
+        "issued_at": { "$ref": "#/$defs/IssuedAt" },
+        "key_id": { "$ref": "#/$defs/KeyId" },
+        "nonce": { "$ref": "#/$defs/Nonce" },
+        "digest": { "$ref": "#/$defs/Digest" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "AgentMeetingReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "owner", "scope", "subject", "counts", "issued_at", "key_id", "nonce", "digest", "signature"],
+      "properties": {
+        "version": { "const": "erasure.v1" },
+        "owner": { "const": "agent" },
+        "scope": { "const": "meeting" },
+        "subject": { "$ref": "#/$defs/MeetingSubject" },
+        "counts": { "$ref": "#/$defs/AgentDeletedCounts" },
+        "issued_at": { "$ref": "#/$defs/IssuedAt" },
+        "key_id": { "$ref": "#/$defs/KeyId" },
+        "nonce": { "$ref": "#/$defs/Nonce" },
+        "digest": { "$ref": "#/$defs/Digest" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "AgentAccountReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "owner", "scope", "subject", "counts", "issued_at", "key_id", "nonce", "digest", "signature"],
+      "properties": {
+        "version": { "const": "erasure.v1" },
+        "owner": { "const": "agent" },
+        "scope": { "const": "account" },
+        "subject": { "$ref": "#/$defs/AccountSubject" },
+        "counts": { "$ref": "#/$defs/AgentDeletedCounts" },
+        "issued_at": { "$ref": "#/$defs/IssuedAt" },
+        "key_id": { "$ref": "#/$defs/KeyId" },
+        "nonce": { "$ref": "#/$defs/Nonce" },
+        "digest": { "$ref": "#/$defs/Digest" },
+        "signature": { "$ref": "#/$defs/Signature" }
+      }
+    },
+    "MinutesReceipt": {
+      "oneOf": [
+        { "$ref": "#/$defs/MinutesMeetingReceipt" },
+        { "$ref": "#/$defs/MinutesAccountReceipt" }
+      ]
+    },
+    "AgentReceipt": {
+      "oneOf": [
+        { "$ref": "#/$defs/AgentMeetingReceipt" },
+        { "$ref": "#/$defs/AgentAccountReceipt" }
+      ]
+    },
+    "SignedReceipt": {
+      "oneOf": [
+        { "$ref": "#/$defs/MinutesMeetingReceipt" },
+        { "$ref": "#/$defs/MinutesAccountReceipt" },
+        { "$ref": "#/$defs/AgentMeetingReceipt" },
+        { "$ref": "#/$defs/AgentAccountReceipt" }
+      ]
+    }
+  }
+}

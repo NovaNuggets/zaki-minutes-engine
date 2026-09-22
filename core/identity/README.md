@@ -5,8 +5,8 @@ The identity lane owns **who you are** and **what you may do** for the whole pla
 authenticates opaque API tokens to a `User`, decides ownership/scope access (default-deny, P20),
 and brokers scoped credentials. It exists TWICE on purpose — the live DB-backed
 `services/admin-api` (users · scoped tokens · `/internal/validate`, the one auth oracle) and the
-pure, DB-free `src/identity_core` reference library — both honoring the frozen `identity.v1` wire
-shape. Python because the gate stack (`gate:python` / `gate:stack`) and the admin-api token model
+pure, DB-free `src/identity_core` reference library — both honoring frozen `identity.v1` and the
+capability-routed Agent addition in `identity.v2`. Python because the gate stack (`gate:python` / `gate:stack`) and the admin-api token model
 already live here.
 
 ## Seams
@@ -17,9 +17,11 @@ already live here.
 | produces | any guarded read path | `identity.v1` `AccessDecision` (`canAccess` port) | allow/deny verdict + stable `reason` for `meeting_transcript \| recording \| ws_subscribe` |
 | produces | workers needing credentials | `src/identity_core/secrets.py` `SecretsPort` (P15) | a scoped credential whose raw value never hits repr/logs/audit |
 | produces | `core/agent`, `core/runtime` consumers | `identity.v1` `ScopedToken` value object | validated subject + scopes + expiry — the identity that travels in a worker's `env` |
+| produces | Terminal / Agent clients | `identity.v2` after `GET /admin/capabilities` negotiation | dedicated `agent` scope; no silent v1 fallback |
 
 ## Contracts
-**Owns:** [`core/identity/contracts/identity.v1`](contracts/identity.v1) — `ScopedToken`,
+**Owns:** [`core/identity/contracts/identity.v1`](contracts/identity.v1) and
+[`core/identity/contracts/identity.v2`](contracts/identity.v2) — `ScopedToken`,
 `AccessDecision`, `ResourceKind` (sealed in the registry `contracts.seal.json`; goldens under
 `contracts/identity.v1/golden/`).
 **Consumes:** none — identity is the root of the trust graph; it reads no other lane's `*.v1`.

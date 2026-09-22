@@ -1,0 +1,9 @@
+{
+  "meeting_id": "42",
+  "doc": {
+    "workspace": "7",
+    "path": "kg/entities/meeting/abc-defg-hij.md",
+    "title": "abc-defg-hij",
+    "kind": "meeting"
+  }
+}

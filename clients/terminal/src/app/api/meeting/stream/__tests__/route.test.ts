@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextRequest } from "next/server";
 import { GET } from "../route";
 
@@ -53,7 +53,20 @@ function withTimeout<T>(p: Promise<T>, ms = 1000): Promise<T> {
   ]);
 }
 
+beforeEach(() => {
+  // These tests exercise the authenticated SSE lifecycle. Cookie-required rejection is pinned in
+  // proxyAuth.test.ts; explicit loopback shared mode supplies a deterministic test identity here.
+  process.env.VEXA_TERMINAL_SHARED_KEY_MODE = "true";
+  process.env.VEXA_API_KEY = "test-user-key";
+  process.env.NEXTAUTH_URL = "http://localhost:3000";
+  process.env.VEXA_TERMINAL_HOST_BIND = "127.0.0.1";
+});
+
 afterEach(() => {
+  delete process.env.VEXA_TERMINAL_SHARED_KEY_MODE;
+  delete process.env.VEXA_API_KEY;
+  delete process.env.NEXTAUTH_URL;
+  delete process.env.VEXA_TERMINAL_HOST_BIND;
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -71,6 +84,7 @@ describe("meeting stream SSE proxy — downstream termination", () => {
 
     const res = await GET(makeReq());
     expect(res.body, "proxy should return a streaming body").toBeTruthy();
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
 
     const result = await withTimeout(drain(res.body as ReadableStream<Uint8Array>));
     expect(result.ok, "downstream must close cleanly when upstream ends").toBe(true);
@@ -171,7 +185,8 @@ describe("meeting stream SSE proxy — downstream termination", () => {
     const res = await GET(makeReq());
     const text = await res.text();
     expect(text).toContain("stream-error");
-    expect(text).toContain("ECONNREFUSED");
+    expect(text).toContain("upstream unavailable");
+    expect(text).not.toContain("ECONNREFUSED");
     expect(res.headers.get("Content-Type")).toBe("text/event-stream");
   });
 });

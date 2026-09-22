@@ -19,10 +19,20 @@ are public.
 |---|---|---|
 | `TRANSCRIPTION_SERVICE_URL` | — | STT service **base URL** (the client appends `/v1/audio/transcriptions`), e.g. `http://<gpu-host>:8083`. Point it at the bundled service you deploy separately (`deploy/transcription`) or a hosted endpoint. Unset → bots join and record but produce no transcript. |
 | `TRANSCRIPTION_SERVICE_TOKEN` | — | STT auth token — must match the `API_TOKEN` of your `deploy/transcription` unit, or a token from `vexa.ai/account`. |
+| `VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS` | — | Comma-separated, exact public HTTPS hostnames users may select for a personal STT backend on port 443. Personal URLs must be query/fragment-free and redirects are refused. Empty denies user endpoint overrides. A user URL and token stay one credential bundle and never inherit the operator token. Operator/platform STT is separate and may use an in-cluster HTTP URL. |
 
 The STT service is the **GPU workload, deployed separately** from this stack — see
 [Deployment → Transcription](/deployment#transcription-the-separate-gpu-unit). The main stack
 stays GPU-free and reaches it over the network via the two variables above.
+
+Terminal composer dictation (`POST /api/stt`) requires a user token validated by admin-api, accepts
+at most 4 MiB per request (about two minutes of 16 kHz mono PCM), refuses redirects, bounds the STT
+response, and returns `Cache-Control: no-store`. Per-user STT billing quota/rate accounting remains a
+separate launch follow-up.
+
+The Settings test action preserves credential ownership: a personal user endpoint is probed live,
+while inherited operator/platform STT returns only a generic configured/unconfigured result. It does
+not spend the shared credential or reveal operator endpoint, account, balance, or expiry data.
 
 ## Secrets & identity
 
@@ -32,7 +42,10 @@ stays GPU-free and reaches it over the network via the two variables above.
 | `INTERNAL_API_SECRET` | `vexa-internal-secret` | Shared secret for service-to-service calls. |
 | `VEXA_DISPATCH_SIGNING_KEY` | `dev-dispatch-signing-key` | Signs dispatch tokens (the identity chain of custody). |
 | `NEXTAUTH_SECRET` | `dev-nextauth-secret` | Session secret for the web UI. |
-| `VEXA_BOT_API_KEY` | — | Pre-shared key a bot uses to call back into the stack. |
+| `VEXA_BOT_API_KEY` | — | Pre-shared service key a bot uses to call back into the stack. It is never a Terminal/browser identity. |
+| `VEXA_TERMINAL_SHARED_KEY_MODE` | `false` | Explicit local self-host escape hatch for a zero-login Terminal. Hosted/default mode requires the signed-in user's httpOnly cookie. Shared mode requires an explicit loopback Terminal origin and a real loopback listener/Docker publication; the shared user key is still validated for Terminal-owned STT/token routes. |
+| `VEXA_API_KEY` | — | User key used by Terminal only when local `VEXA_TERMINAL_SHARED_KEY_MODE=true`; never substitute the bot service key. |
+| `VEXA_DIRECT_LOGIN_ALLOWED_EMAILS` | — | Default-off, comma-separated exact email allowlist for passwordless debug login. It requires both an explicit loopback origin and real loopback listener/publication; substring matches are never accepted, and this path cannot bootstrap the first administrator. Use OAuth for production. |
 
 ## Database & storage
 
@@ -54,10 +67,13 @@ Point the agent at your own model so no inference leaves the network.
 |---|---|---|
 | `VEXA_AGENT_MODEL` | — | Model the agent runner uses. |
 | `VEXA_MEETING_MODEL` | — | Model for meeting-time processing. |
+| `VEXA_USER_MODEL_ALLOWED_HOSTS` | — | Comma-separated, exact public HTTPS hostnames users may select for a personal model endpoint on port 443. Personal URLs must be query/fragment-free and redirects are refused. Empty denies personal endpoints; operator/deployment credentials remain a separate tier and never cross into the personal URL. |
 | `ANTHROPIC_API_KEY` | — | Key for Anthropic-backed runners. |
 | `ANTHROPIC_MODEL` · `ANTHROPIC_DEFAULT_OPUS_MODEL` · `…_SONNET_MODEL` · `…_HAIKU_MODEL` | — | Per-tier model overrides. |
 | `HOST_CLAUDE_CREDENTIALS` | — | Host path to Claude credentials mounted into agent containers (see below). |
-| `VEXA_AGENT_DEFAULT_SUBJECT` | `u_live` | Fallback subject before the gateway fronts agent-api. |
+| `VEXA_AGENT_DEFAULT_SUBJECT` | — | Explicit gateway-less, single-user self-host fallback. Hosted/default deployments leave it empty and fail closed; live meeting attribution never uses it. |
+| `VEXA_MEETING_API_URL` | `http://meeting-api:8080` | Meeting-domain URL used for owner-scoped reads and the exact-row owner authority required before live registration/dispatch. |
+| `VEXA_INTERNAL_API_SECRET` | — | Shared internal credential used by agent-api for settings and exact-row owner lookups. Required for live meeting attribution. |
 
 ### Claude subscription credentials (`HOST_CLAUDE_CREDENTIALS`)
 
@@ -83,8 +99,12 @@ instead of an API key. Whether that file stays valid depends on the host OS:
 
 The credential-file mount is a single-developer convenience. For a portable setup that
 survives token rotation on any OS, configure an API key or a custom endpoint in
-**Settings → Models** (stored per-user/global in the database) — see the setup wizard or
+**Settings → Models** (stored per-user or operator-global in the database) — see the setup wizard or
 the table above.
+
+Model credential tests follow the same ownership boundary as STT: a personal custom endpoint can be
+probed live; an inherited operator/platform credential returns only generic configured/unconfigured
+status and never exposes the operator endpoint, account, balance, or expiry to a regular user.
 
 ## Auto-join & calendar sync
 

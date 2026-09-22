@@ -28,12 +28,35 @@ def test_declaration_loads_and_is_internally_consistent():
     decl = cp.load_declaration()
     assert decl["service"] == "runtime"
     caps = decl["capabilities"]
-    assert set(caps) == {"scheduler", "bot_spawn", "agent_spawn", "model_inference"}
+    assert set(caps) == {
+        "scheduler", "bot_spawn", "minutes_bot_v2", "agent_spawn", "model_inference",
+    }
     # model credentials are ALTERNATIVE paths (subscription mount OR an API-style key)
     assert caps["model_inference"]["mode"] == "any"
     assert caps["model_inference"]["probe"]["kind"] == "file"
-    # the runtime has no required-explicit keys: it boots on defaults, capabilities gate features
-    assert [k for k in decl["keys"] if k["class"] == "required-explicit"] == []
+    # Lifecycle-mutating callbacks are authenticated and origin-bound even when optional spawn
+    # capabilities are dark.
+    assert {
+        k["key"] for k in decl["keys"] if k["class"] == "required-explicit"
+    } == {
+        "RUNTIME_CALLBACK_SECRET",
+        "RUNTIME_CALLBACK_TRUSTED_ORIGINS",
+        "RUNTIME_CONTROL_SECRET",
+    }
+
+
+def test_callback_auth_config_is_required_explicit():
+    with pytest.raises(cp.ConfigError) as exc:
+        cp.preflight({})
+    assert "RUNTIME_CALLBACK_SECRET" in str(exc.value)
+    assert "RUNTIME_CALLBACK_TRUSTED_ORIGINS" in str(exc.value)
+    assert "RUNTIME_CONTROL_SECRET" in str(exc.value)
+
+    cp.preflight({
+        "RUNTIME_CALLBACK_SECRET": "runtime-callback-secret",
+        "RUNTIME_CALLBACK_TRUSTED_ORIGINS": "http://meeting-api:8080",
+        "RUNTIME_CONTROL_SECRET": "runtime-control-secret",
+    })
 
 
 def test_capability_tri_states():
@@ -115,4 +138,6 @@ def test_health_carries_capability_rows_additively(monkeypatch):
     caps = body["capabilities"]
     assert caps["scheduler"]["state"] == cp.NOT_CONFIGURED
     assert caps["model_inference"]["state"] == cp.NOT_CONFIGURED
-    assert set(caps) == {"scheduler", "bot_spawn", "agent_spawn", "model_inference"}
+    assert set(caps) == {
+        "scheduler", "bot_spawn", "minutes_bot_v2", "agent_spawn", "model_inference",
+    }

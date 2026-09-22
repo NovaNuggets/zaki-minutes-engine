@@ -1,4 +1,4 @@
-/** Meeting-link → {platform, native_meeting_id} parsing + validation for the "Add bot" flow.
+/** Meeting-link → {platform, native_meeting_id} parsing + validation for manual ZAKI Notetaker capture.
  *  Id formats mirror the dashboard join-form (clients/dashboard/src/components/join/join-form.tsx):
  *    google_meet → abc-defg-hij   ·   zoom → 9–11 digits   ·   teams → non-empty (passcode handled elsewhere)
  *    jitsi → the meet.jit.si room name, or room@host for a self-hosted deployment (a single

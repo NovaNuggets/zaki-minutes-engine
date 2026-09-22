@@ -80,8 +80,144 @@ async def test_ingest_refuses_transcript_after_capture_withdrawal(bus):
 
     doc = await store.get_transcript(7, "google_meet", "abc-defg-hij")
     assert persisted == 0
-    assert doc["segments"] == []
+    assert doc is None
     assert bus.published == []
+
+
+async def test_ingest_refuses_transcript_while_retention_erasure_is_active(bus):
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+        data={
+            "zaki_retention": {
+                "state": "erasing",
+                "expired_scopes": [],
+            }
+        },
+    )
+
+    persisted = await ingest(store, bus, _message(1, [
+        {
+            "segment_id": "during-erasure",
+            "start": 1.0,
+            "end": 2.0,
+            "text": "must not persist",
+            "completed": True,
+        },
+    ]))
+
+    doc = await store.get_transcript(7, "google_meet", "abc-defg-hij")
+    assert persisted == 0
+    assert doc is None
+    assert bus.published == []
+    assert await bus._client.xlen("tc:meeting:1") == 0
+
+
+async def test_ingest_fails_closed_when_capture_metadata_has_no_retention_authority(bus):
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+        data={"zaki_capture": {"state": "authorized"}},
+    )
+
+    persisted = await ingest(store, bus, _message(1, [
+        {
+            "segment_id": "missing-retention-authority",
+            "start": 1.0,
+            "end": 2.0,
+            "text": "must not persist",
+            "completed": True,
+        },
+    ]))
+
+    assert persisted == 0
+    assert await bus._client.xlen("tc:meeting:1") == 0
+
+
+@pytest.mark.parametrize("capture", [None, {"state": "denied"}, {"state": "corrupt"}])
+async def test_ingest_fails_closed_on_malformed_capture_authority(bus, capture):
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+        data={
+            "zaki_capture": capture,
+            "zaki_retention": {
+                "state": "open",
+                "scope_expiries": {
+                    "transcript": "2099-01-01T00:00:00+00:00"
+                },
+                "expired_scopes": [],
+            },
+        },
+    )
+
+    persisted = await ingest(store, bus, _message(1, [
+        {
+            "segment_id": "malformed-capture-authority",
+            "start": 1.0,
+            "end": 2.0,
+            "text": "must not persist",
+            "completed": True,
+        },
+    ]))
+
+    assert persisted == 0
+    assert await bus._client.xlen("tc:meeting:1") == 0
+
+
+@pytest.mark.parametrize(
+    "retention",
+    [
+        {
+            "state": "corrupt",
+            "scope_expiries": {"transcript": "2099-01-01T00:00:00+00:00"},
+            "expired_scopes": [],
+        },
+        {
+            "state": "open",
+            "scope_expiries": {"transcript": "2099-01-01T00:00:00+00:00"},
+            "expired_scopes": ["unknown"],
+        },
+        {
+            "state": "open",
+            "scope_expiries": {"transcript": "2099-01-01T00:00:00+00:00"},
+            "expired_scopes": [{}],
+        },
+        {
+            "state": "open",
+            "scope_expiries": {"transcript": "2020-01-01T00:00:00+00:00"},
+            "expired_scopes": [],
+        },
+    ],
+)
+async def test_ingest_fails_closed_on_invalid_or_elapsed_retention_authority(bus, retention):
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+        data={"zaki_retention": retention},
+    )
+
+    persisted = await ingest(store, bus, _message(1, [
+        {
+            "segment_id": "unauthorized",
+            "start": 1.0,
+            "end": 2.0,
+            "text": "must not persist",
+            "completed": True,
+        },
+    ]))
+
+    assert persisted == 0
+    assert bus.published == []
+    assert await bus._client.xlen("tc:meeting:1") == 0
 
 
 async def test_ingest_does_not_publish_when_withdrawal_wins_between_segments(bus):
@@ -190,6 +326,81 @@ async def test_ingest_ignores_non_segment_messages(store, bus):
     assert await ingest(store, bus, {"payload": json.dumps({"type": "session_start", "uid": "s"})}) == 0
     assert await ingest(store, bus, {}) == 0
     assert await ingest(store, bus, {"payload": "not-json{"}) == 0
+
+
+async def test_session_end_is_refused_after_capture_withdrawal(bus):
+    store = InMemoryTranscriptStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+        data={"zaki_capture": {"state": "withdrawn"}},
+    )
+
+    assert await ingest(
+        store,
+        bus,
+        {
+            "payload": json.dumps(
+                {
+                    "type": "session_end",
+                    "meeting_id": "1",
+                    "native_meeting_id": "abc-defg-hij",
+                }
+            )
+        },
+    ) == 0
+    assert await bus._client.xlen("tc:meeting:1") == 0
+
+
+async def test_large_segment_messages_use_bounded_leases_and_batched_stream_writes(bus):
+    class BoundedStore(InMemoryTranscriptStore):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes: list[int] = []
+
+        @asynccontextmanager
+        async def transcript_write_lease(self, meeting_id, *, scopes=("transcript",)):
+            async with super().transcript_write_lease(meeting_id, scopes=scopes) as writer:
+                outer = self
+
+                class RecordingWriter:
+                    async def append_segments(self, segments):
+                        outer.batch_sizes.append(len(segments))
+                        await writer.append_segments(segments)
+
+                yield RecordingWriter()
+
+    class BoundedBus(FakeRedisBus):
+        def __init__(self, client):
+            super().__init__(client)
+            self.stream_batch_sizes: list[int] = []
+
+        async def xadd_many(self, stream, payloads):
+            self.stream_batch_sizes.append(len(payloads))
+            return await super().xadd_many(stream, payloads)
+
+    store = BoundedStore()
+    store.seed_meeting(
+        user_id=7,
+        platform="google_meet",
+        native_meeting_id="abc-defg-hij",
+    )
+    bounded_bus = BoundedBus(bus._client)
+    segments = [
+        {
+            "segment_id": f"segment-{index}",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": f"word-{index}",
+            "completed": True,
+        }
+        for index in range(101)
+    ]
+
+    assert await ingest(store, bounded_bus, _message(1, segments)) == 101
+    assert store.batch_sizes == [100, 1]
+    assert bounded_bus.stream_batch_sizes == [100, 1]
 
 
 async def test_consume_segments_drains_a_fakeredis_batch(store, bus):

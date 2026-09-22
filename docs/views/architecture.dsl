@@ -19,11 +19,16 @@ system meetings  # capture → transcribe → record; owns the raw transcript
   module teams-capture
   module whisper
   module zoom-capture
+  contract agent-control.v1
   contract acts.v1
   contract captured-signal.v1
+  contract erasure.v1
   contract flagged-issue.v1
   contract invocation.v1
+  contract invocation.v2
   contract lifecycle.v1
+  contract minutes-api.v1
+  contract minutes-finalized.v1
   contract transcript.v1
   contract webhook.v1
   contract zaki-read.v1
@@ -64,6 +69,7 @@ system gateway-system  # the one public edge (api.v1, ws.v1)
 system identity  # access + audit; owns the durable DB
   service admin-api
   contract identity.v1
+  contract identity.v2
   data-asset identity-db [writers: admin-api]
 
 system runtime-system  # workload spawn (bot/agent containers)
@@ -103,9 +109,15 @@ edges:
   meeting-api -write-> postgres
   meeting-api -write-> minio
   meeting-api -req-> runtime  # POST /workloads spawn bot
+  meeting-api -write-> hub-api  # default-off content-free transcript.finalized platform event after durable finalization
+  hub-api -write-> meeting-api  # authenticated capture, status, consent withdrawal, and meeting erasure; dedicated Hub credential is verified before trusted user identity or request parsing
+  meeting-api -write-> nullalis-agent  # idempotently tombstone and purge Agent-owned workspace and Brain derivatives before deleting Minutes-owned transcript, summary, recording, and meeting carriers
   agent-api -read-> segments-stream  # XREADGROUP agent_copilot (proactive watcher)
+  agent-api -req-> meeting-api  # exact-row owner resolution + canonical generated-doc attachment
   agent-api -req-> runtime  # POST /workloads spawn agent-worker
   agent-api -read-> out-stream  # SSE relay (/api/chat, /api/meeting/stream)
+  agent-api -read-> meeting-api  # default-off in-repo reference consumer; managed launch excludes the bundled Agent service and uses canonical Nullalis
+  nullalis-agent -read-> meeting-api  # minutes_read consumes bounded owner-scoped meeting, transcript, and summary items; Nullalis alone writes governed meeting distillates to Brain
   agent-worker -read-> tc-stream  # copilot tails transcript
   agent-worker -write-> out-stream  # XADD cards/notes/deltas
   agent-worker -write-> proc-stream  # XADD cleaned 1:1 notes

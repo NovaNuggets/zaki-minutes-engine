@@ -269,6 +269,10 @@ class MeetingStore:
         self._records[record.connection_id] = record
         return record
 
+    def discard(self, connection_id: str) -> None:
+        """Forget a speculative record whose durable lifecycle write did not commit."""
+        self._records.pop(connection_id, None)
+
     def rehydrate(self, connection_id: str, persisted_status: Optional[str]) -> MeetingRecord:
         """Seed (or reconcile) the in-memory record from the DB's CURRENT meeting status.
 
@@ -286,6 +290,16 @@ class MeetingStore:
             seeded = bot_status_from_persisted(persisted_status)
             if seeded is not None:
                 rec.status = seeded
+        return rec
+
+    def reconcile_status(self, connection_id: str, persisted_status: Optional[str]) -> MeetingRecord:
+        """Make a live process agree with the durable lifecycle before accepting the next event.
+
+        Unlike one-time ``rehydrate``, this deliberately replaces a stale replica's status. The DB
+        transaction is the cross-replica source of truth; process memory may only be a projection.
+        """
+        rec = self.get_or_create(connection_id)
+        rec.status = bot_status_from_persisted(persisted_status)
         return rec
 
     def __len__(self) -> int:  # pragma: no cover - trivial

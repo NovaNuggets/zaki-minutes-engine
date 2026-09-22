@@ -9,7 +9,7 @@
 //
 // The key injected here is the SAME per-user key the REST proxy forwards
 // (src/app/api/proxyAuth.ts): the logged-in user's APIToken from the `vexa-token`
-// cookie, falling back to VEXA_API_KEY / VEXA_BOT_API_KEY. This MUST match the REST
+// cookie, or the explicit loopback-only VEXA_API_KEY shared mode. This MUST match the REST
 // side — the gateway auto-subscribes the socket to `u:{user_id}:meetings` from this
 // key, so a mismatched key would deliver another user's live meeting.status frames
 // (or none), freezing the client's meeting list at its last REST snapshot.
@@ -17,10 +17,31 @@ import { createServer } from "node:http";
 import nextEnv from "@next/env";
 import next from "next";
 import { WebSocketServer, WebSocket } from "ws";
+import {
+  directLoginModeError,
+  readCookieValue,
+  resolveTerminalProxyKey,
+  sharedKeyModeError,
+} from "./src/proxyAuthPolicy.mjs";
+import {
+  PendingFrameQueue,
+  WS_PROXY_LIMITS,
+  armConnectTimeout,
+  socketCanAcceptFrame,
+} from "./src/wsProxySafety.mjs";
 
 const dev = process.env.NODE_ENV !== "production";
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd(), dev);
+
+const sharedModeError = sharedKeyModeError(process.env);
+if (sharedModeError) {
+  throw new Error(`[terminal-auth] ${sharedModeError}`);
+}
+const directLoginError = directLoginModeError(process.env);
+if (directLoginError) {
+  throw new Error(`[terminal-auth] ${directLoginError}`);
+}
 
 const port = parseInt(process.env.PORT || "3000", 10);
 const hostname = process.env.HOST || "0.0.0.0";
@@ -37,23 +58,12 @@ const AUTH_COOKIE = process.env.VEXA_AUTH_COOKIE_NAME || "vexa-token";
  *  user_id from this key at connect and auto-subscribes the socket to `u:{user_id}:meetings` — so it MUST
  *  be the same per-user key the REST proxy forwards (src/app/api/proxyAuth.ts), else the live meeting.status
  *  frames land on a different user's channel and the client's list never advances past its last snapshot.
- *  Resolution mirrors proxyAuth.ts: cookie token → VEXA_API_KEY → VEXA_BOT_API_KEY → "". */
+ *  Resolution mirrors proxyAuth.ts: a login cookie, or an explicitly enabled local self-host key. */
 function resolveUpstreamKey(req) {
-  const cookieToken = readCookie(req.headers.cookie, AUTH_COOKIE);
-  return cookieToken || process.env.VEXA_API_KEY || process.env.VEXA_BOT_API_KEY || "";
-}
-
-/** Pull a single cookie value out of a raw `Cookie` header. Returns undefined if absent. */
-function readCookie(header, name) {
-  if (!header) return undefined;
-  for (const part of header.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    if (part.slice(0, eq).trim() === name) {
-      return decodeURIComponent(part.slice(eq + 1).trim());
-    }
-  }
-  return undefined;
+  return resolveTerminalProxyKey(
+    readCookieValue(req.headers.cookie, AUTH_COOKIE),
+    process.env,
+  );
 }
 
 process.on("unhandledRejection", (reason) => {
@@ -77,7 +87,10 @@ const server = createServer((req, res) => {
 });
 
 // Browser-facing WS server — we do the upgrade ourselves (noServer) only for `/ws`.
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: WS_PROXY_LIMITS.maxPayloadBytes,
+});
 
 server.on("upgrade", (req, socket, head) => {
   let pathname;
@@ -92,8 +105,13 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
   // Resolve the per-user key from THIS request's cookie before the upgrade completes (req.headers are
-  // gone once we hand off to the WS client). Falls back to the env keys for keyless / single-key deploys.
+  // gone once we hand off to the WS client). A missing/malformed cookie is rejected locally unless the
+  // operator explicitly enabled local self-host shared-key mode.
   const apiKey = resolveUpstreamKey(req);
+  if (!apiKey) {
+    endSocket(socket, 401, "Unauthorized");
+    return;
+  }
   let closeOnSocketError = () => endSocket(socket);
   attachSocketError(socket, "client upgrade", () => closeOnSocketError());
   wss.handleUpgrade(req, socket, head, (client) => {
@@ -118,13 +136,19 @@ function proxyToGateway(client, clientSocket, apiKey) {
   const target = `${GATEWAY_URL}/ws`;
   const upstream = new WebSocket(target, {
     headers: apiKey ? { "x-api-key": apiKey } : {},
+    maxPayload: WS_PROXY_LIMITS.maxPayloadBytes,
   });
 
-  const pending = [];
+  const pending = new PendingFrameQueue({
+    maxFrames: WS_PROXY_LIMITS.maxPendingFrames,
+    maxBytes: WS_PROXY_LIMITS.maxPendingBytes,
+  });
   let upstreamOpen = false;
+  let cancelConnectTimeout = () => {};
 
   const closePair = () => {
-    pending.length = 0;
+    cancelConnectTimeout();
+    pending.clear();
     safeClose(client);
     safeClose(upstream);
   };
@@ -132,6 +156,10 @@ function proxyToGateway(client, clientSocket, apiKey) {
     logError(scope, err);
     closePair();
   };
+  cancelConnectTimeout = armConnectTimeout(
+    () => onProxyError("upstream websocket connect timeout", new Error("gateway websocket did not open in time")),
+    WS_PROXY_LIMITS.connectTimeoutMs,
+  );
 
   attachSocketError(clientSocket || client._socket, "client websocket", (err) => onProxyError("client websocket socket error", err));
   attachSocketError(upstream._socket, "upstream websocket", (err) => onProxyError("upstream websocket socket error", err));
@@ -140,17 +168,19 @@ function proxyToGateway(client, clientSocket, apiKey) {
     if (upstreamOpen && upstream.readyState === WebSocket.OPEN) {
       sendFrame(upstream, data, { binary: isBinary }, "client -> upstream", closePair);
     } else if (upstream.readyState === WebSocket.CONNECTING) {
-      pending.push([data, isBinary]);
+      if (!pending.push(data, isBinary)) {
+        onProxyError("client -> upstream queue overflow", new Error("websocket pending budget exceeded"));
+      }
     }
   });
 
   upstream.on("open", () => {
     upstreamOpen = true;
+    cancelConnectTimeout();
     attachSocketError(upstream._socket, "upstream websocket", (err) => onProxyError("upstream websocket socket error", err));
-    for (const [data, isBinary] of pending) {
+    for (const [data, isBinary] of pending.drain()) {
       sendFrame(upstream, data, { binary: isBinary }, "client -> upstream", closePair);
     }
-    pending.length = 0;
   });
   upstream.on("upgrade", () => {
     attachSocketError(upstream._socket, "upstream websocket", (err) => onProxyError("upstream websocket socket error", err));
@@ -166,8 +196,16 @@ function proxyToGateway(client, clientSocket, apiKey) {
   // Close each side when the other closes. Only forward a code if it's a valid
   // application close code (1000 / 3000-4999); reserved codes like 1005/1006
   // would throw, so fall back to a bare close.
-  client.on("close", (code, reason) => safeClose(upstream, code, reason));
-  upstream.on("close", (code, reason) => safeClose(client, code, reason));
+  client.on("close", (code, reason) => {
+    cancelConnectTimeout();
+    pending.clear();
+    safeClose(upstream, code, reason);
+  });
+  upstream.on("close", (code, reason) => {
+    cancelConnectTimeout();
+    pending.clear();
+    safeClose(client, code, reason);
+  });
   client.on("error", (err) => onProxyError("client websocket error", err));
   upstream.on("error", (err) => onProxyError("upstream websocket error", err));
 
@@ -187,6 +225,12 @@ function attachSocketError(socket, scope, onError) {
 
 function sendFrame(sock, data, options, scope, onError) {
   if (sock.readyState !== WebSocket.OPEN) return;
+  if (!socketCanAcceptFrame(sock, data, WS_PROXY_LIMITS.maxBufferedBytes)) {
+    const err = new Error("websocket backpressure budget exceeded");
+    logError(`${scope} send refused`, err);
+    onError?.(err);
+    return;
+  }
   try {
     sock.send(data, options, (err) => {
       if (!err) return;
@@ -218,7 +262,7 @@ function sendProxyError(res) {
     }
     res.writeHead(502, {
       "Content-Type": "application/json",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-store",
     });
     res.end(JSON.stringify({ error: "upstream_unavailable" }));
   } catch (err) {
@@ -226,10 +270,10 @@ function sendProxyError(res) {
   }
 }
 
-function endSocket(socket) {
+function endSocket(socket, status = 400, reason = "Bad Request") {
   if (!socket || socket.destroyed) return;
   try {
-    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
   } catch (err) {
     logError("socket end failed", err);
   }

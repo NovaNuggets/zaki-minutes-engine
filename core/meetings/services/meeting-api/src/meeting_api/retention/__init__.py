@@ -1,6 +1,6 @@
 """Public front door for Minutes erasure and clock-controlled expiry policy."""
 
-from .service import ErasureFailed, ErasureReceipt, erase_meeting
+from .service import ErasureFailed, ErasureReceipt, SignedErasureReceipt, erase_meeting
 from .ttl import (
     MAX_TTL_BATCH,
     DueScope,
@@ -15,6 +15,7 @@ from .ttl_adapters import run_production_ttl_once
 __all__ = [
     "ErasureFailed",
     "ErasureReceipt",
+    "SignedErasureReceipt",
     "erase_meeting",
     "MAX_TTL_BATCH",
     "DueScope",

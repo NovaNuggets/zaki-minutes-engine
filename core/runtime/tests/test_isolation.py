@@ -51,6 +51,11 @@ def test_plan_unavailable_paths_degrade_loudly_to_none(caplog):
     with caplog.at_level("WARNING"):
         assert plan_process_isolation(_env(MOUNTS, subject="u_jane"), euid=0) is None
     assert "not numeric" in caplog.text
+    # Keep Agent uids disjoint from shared-workspace gids and the per-meeting bot uid range.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert plan_process_isolation(_env(MOUNTS, subject="100000"), euid=0) is None
+    assert "reserved uid range" in caplog.text
 
 
 def test_plan_none_for_workspaceless_workloads():
@@ -119,6 +124,67 @@ def test_apply_default_denies_never_dispatched_tenants(tmp_path, monkeypatch):
     assert (os.stat(root / ".system" / "9").st_mode & 0o777) == 0o700
     assert (os.stat(root / ".attached" / "9").st_mode & 0o777) == 0o700
     assert (os.stat(root / "_global").st_mode & 0o777) != 0o700    # special dir untouched by the sweep
+
+
+def test_apply_stages_the_configured_lite_subscription_file(tmp_path, monkeypatch):
+    """Lite mounts the operator-selected credential outside /root. Stage that exact file into the
+    isolated Agent HOME; never rely on an unrelated root-home default or expose its source path."""
+    root = tmp_path / "workspaces"
+    (root / "17").mkdir(parents=True)
+    source = tmp_path / "operator-claude-credentials.json"
+    source.write_text('{"subscription":"scoped-at-spawn"}')
+    monkeypatch.setenv("HOST_CLAUDE_CREDENTIALS", str(source))
+    monkeypatch.setattr(iso, "_chown_tree", lambda p, u, g: None)
+    monkeypatch.setattr(os, "chown", lambda p, u, g: None)
+    monkeypatch.setattr(os, "fchown", lambda fd, u, g: None)
+    plan = ProcessIsolation(
+        uid=UID_BASE + 17,
+        gid=UID_BASE + 17,
+        store_root=str(root),
+        home=str(root / ".home" / "17"),
+        private=(str(root / "17"),),
+        shared=(),
+    )
+
+    apply_process_isolation(plan)
+
+    staged = root / ".home" / "17" / ".claude" / ".credentials.json"
+    assert staged.read_text() == source.read_text()
+    assert (staged.stat().st_mode & 0o777) == 0o400
+
+
+@pytest.mark.parametrize("attack", ["symlink", "outside-root"])
+def test_apply_rejects_paths_that_can_retarget_root_chown(tmp_path, monkeypatch, attack):
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    operator = tmp_path / "operator-secrets"
+    operator.mkdir()
+    (operator / "secret").write_text("keep-root-owned")
+    if attack == "symlink":
+        tenant_path = root / "17"
+        tenant_path.symlink_to(operator, target_is_directory=True)
+    else:
+        tenant_path = operator
+    chowned: list[str] = []
+    monkeypatch.setattr(
+        iso,
+        "_chown_tree",
+        lambda path, _uid, _gid: chowned.append(str(path)),
+    )
+    plan = ProcessIsolation(
+        uid=UID_BASE + 17,
+        gid=UID_BASE + 17,
+        store_root=str(root),
+        home=str(root / ".home" / "17"),
+        private=(str(tenant_path),),
+        shared=(),
+    )
+
+    with pytest.raises(OSError, match="workspace isolation path"):
+        apply_process_isolation(plan)
+
+    assert chowned == []
+    assert (operator / "secret").read_text() == "keep-root-owned"
 
 
 def test_preexec_drops_groups_then_gid_then_uid(monkeypatch):

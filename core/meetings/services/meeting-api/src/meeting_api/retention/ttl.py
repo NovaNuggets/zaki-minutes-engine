@@ -13,6 +13,7 @@ from typing import Literal, Protocol
 RetentionScope = Literal["audio", "transcript", "summary"]
 RETENTION_SCOPES: tuple[RetentionScope, ...] = ("audio", "transcript", "summary")
 MAX_TTL_BATCH = 500
+TTL_RETRY_BACKOFF = timedelta(minutes=5)
 
 
 class TtlBatchFailed(RuntimeError):
@@ -36,6 +37,7 @@ class DueScope:
     meeting_id: str
     scope: RetentionScope
     expires_at: datetime
+    expiry_invalid: bool = False
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,9 @@ class TtlStore(Protocol):
 
     async def expire_scope(self, item: DueScope) -> int:
         """Idempotently expire one scope and return its content-free deleted-unit count."""
+
+    async def defer_scope(self, item: DueScope, *, retry_at: datetime) -> None:
+        """Durably keep one failed scope out of selection until ``retry_at``."""
 
 
 def _require_utc(value: datetime) -> None:
@@ -118,6 +123,7 @@ def _validate_due_batch(
             or not item.user_id
             or not isinstance(item.meeting_id, str)
             or not item.meeting_id
+            or not isinstance(item.expiry_invalid, bool)
         ):
             raise TtlBatchFailed("TTL store returned an invalid candidate")
         try:
@@ -139,7 +145,8 @@ async def run_ttl_batch(
     """Expire one bounded due-scope batch and return no content or carrier identity.
 
     Candidate validation happens before the first mutation. Individual adapter failures are counted
-    and the batch continues; the adapter must leave a failed scope due so the next run retries it.
+    and the batch continues. Stores that expose ``defer_scope`` durably back the failed candidate off
+    so a full batch of permanently failing oldest rows cannot starve later due work.
     """
 
     _require_utc(now)
@@ -161,6 +168,14 @@ async def run_ttl_batch(
             expired[item.scope] += deleted
         except Exception:
             failed += 1
+            defer_scope = getattr(store, "defer_scope", None)
+            if defer_scope is not None:
+                try:
+                    await defer_scope(item, retry_at=now + TTL_RETRY_BACKOFF)
+                except Exception:
+                    # The expiry failure remains visible in the receipt. A failed deferral must not
+                    # prevent other already-selected tenants from making progress in this batch.
+                    pass
     return TtlBatchReceipt(
         attempted=len(items),
         audio_expired=expired["audio"],

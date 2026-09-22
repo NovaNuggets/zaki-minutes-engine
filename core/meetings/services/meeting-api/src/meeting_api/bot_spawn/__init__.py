@@ -17,30 +17,50 @@ Public surface:
   * ``build_invocation`` / ``build_workload_spec`` / ``mint_meeting_token`` — the
     invocation.v1 / runtime.v1 builders + the MeetingToken minter.
   * ``MeetingRepo`` / ``RuntimeClient`` ports + ``QuotaExceeded`` / ``SpawnFailed`` /
-    ``DuplicateMeeting``.
+    ``DuplicateMeeting``; the shared teardown-confirmation retry policy.
   * ``adapters.build_production_router(...)`` — wire with real SQLAlchemy + the httpx runtime client.
   * ``fakes`` — ``InMemoryMeetingRepo`` / ``FakeRuntimeClient`` (offline drivers).
 """
 from __future__ import annotations
 
-from .invocation import build_invocation, build_workload_spec, mint_meeting_token
-from .ports import CaptureGrantConsumed, MaxBotsExceeded, MeetingRepo, QuotaExceeded, RuntimeClient, SpawnFailed, TranscriptionNotConfigured
+from .invocation import (
+    build_invocation,
+    build_workload_spec,
+    mint_meeting_token,
+    verify_meeting_token,
+)
+from .ports import (
+    CaptureGrantConsumed,
+    MaxBotsExceeded,
+    MeetingRepo,
+    MeetingStatusWrite,
+    QuotaExceeded,
+    RuntimeClient,
+    SpawnFailed,
+    TeardownUnconfirmed,
+    TranscriptionNotConfigured,
+)
 from .router import build_router
 from .service import DuplicateMeeting, construct_meeting_url, request_bot
+from .teardown import confirm_capture_teardown_with_retry
 from .url_validation import UnsafeMeetingUrl, validate_meeting_url
 
 __all__ = [
     "build_router",
     "request_bot",
+    "confirm_capture_teardown_with_retry",
     "construct_meeting_url",
     "build_invocation",
     "build_workload_spec",
     "mint_meeting_token",
+    "verify_meeting_token",
     "MeetingRepo",
+    "MeetingStatusWrite",
     "RuntimeClient",
     "QuotaExceeded",
     "MaxBotsExceeded",
     "SpawnFailed",
+    "TeardownUnconfirmed",
     "TranscriptionNotConfigured",
     "DuplicateMeeting",
     "CaptureGrantConsumed",

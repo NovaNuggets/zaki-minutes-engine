@@ -2,7 +2,7 @@
 
   * **POST /internal/recordings/upload** — the bot's chunk upload. Auth via the MeetingToken it
     carries (``Authorization: Bearer <token>``, re-verified here — the parent's
-    ``require_recording_upload_token``). Multipart form: ``file`` + ``session_uid`` + media metadata.
+    ``require_recording_upload_token``). Multipart form: ``file`` + meeting/session identity + media metadata.
     Folds the chunk into ``meeting.data['recordings']`` JSONB. ``include_in_schema=False`` (internal).
   * **GET /recordings** — the caller's recordings (from ``meeting.data``), scoped by the
     gateway-injected ``x-user-id``.
@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from typing import Optional
@@ -20,8 +21,12 @@ from fastapi.responses import JSONResponse, Response
 
 from .ports import RecordingRepo, RecordingWriteRefused, Storage
 from .service import (
+    DEFAULT_RECORDING_MAX_CHUNKS,
+    DEFAULT_RECORDING_MAX_TOTAL_BYTES,
     InvalidRecordingMetadata,
     RecordingChunkConflict,
+    RecordingLimitExceeded,
+    RecordingNotReady,
     SessionNotFound,
     _verify_meeting_token,
     finalize_master,
@@ -29,19 +34,29 @@ from .service import (
 )
 
 DEFAULT_RECORDING_CHUNK_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_RECORDING_RANGE_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_RECORDING_FINALIZE_CONCURRENCY = 2
+DEFAULT_RECORDING_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024
+_MEETING_API_POD_MEMORY_LIMIT_BYTES = 1024 * 1024 * 1024
 
 
-def _recording_chunk_max_bytes() -> int:
-    raw = os.getenv("RECORDING_CHUNK_MAX_BYTES")
+def _positive_int_setting(name: str, default: int) -> int:
+    raw = os.getenv(name)
     if raw is None:
-        return DEFAULT_RECORDING_CHUNK_MAX_BYTES
+        return default
     try:
         value = int(raw)
     except ValueError:
-        raise RuntimeError("RECORDING_CHUNK_MAX_BYTES must be a positive integer") from None
+        raise RuntimeError(f"{name} must be a positive integer") from None
     if value < 1:
-        raise RuntimeError("RECORDING_CHUNK_MAX_BYTES must be a positive integer")
+        raise RuntimeError(f"{name} must be a positive integer")
     return value
+
+
+def _recording_chunk_max_bytes() -> int:
+    return _positive_int_setting(
+        "RECORDING_CHUNK_MAX_BYTES", DEFAULT_RECORDING_CHUNK_MAX_BYTES
+    )
 
 
 def _bearer_token(authorization: Optional[str]) -> str:
@@ -126,11 +141,18 @@ async def _storage_get_range(storage: Storage, key: str, start: int, end: int) -
     return await getter(key, start, end)
 
 
-async def _finalize_master_or_conflict(repo, storage, **kwargs):
+async def _finalize_master_or_conflict(repo, storage, *, semaphore=None, **kwargs):
     try:
-        return await finalize_master(repo, storage, **kwargs)
+        if semaphore is None:
+            return await finalize_master(repo, storage, **kwargs)
+        async with semaphore:
+            return await finalize_master(repo, storage, **kwargs)
     except RecordingWriteRefused:
         raise HTTPException(status_code=409, detail="Meeting is no longer writable") from None
+    except RecordingNotReady:
+        raise HTTPException(status_code=409, detail="Recording is not available") from None
+    except RecordingLimitExceeded:
+        raise HTTPException(status_code=413, detail="Recording exceeds configured limits") from None
 
 
 def build_router(
@@ -142,10 +164,37 @@ def build_router(
     """The recordings routes over the injected ``RecordingRepo`` + ``Storage`` ports."""
     router = APIRouter()
     recording_chunk_max_bytes = _recording_chunk_max_bytes()
+    recording_max_chunks = _positive_int_setting(
+        "RECORDING_MAX_CHUNKS", DEFAULT_RECORDING_MAX_CHUNKS
+    )
+    recording_max_total_bytes = _positive_int_setting(
+        "RECORDING_MAX_TOTAL_BYTES", DEFAULT_RECORDING_MAX_TOTAL_BYTES
+    )
+    recording_range_max_bytes = _positive_int_setting(
+        "RECORDING_RANGE_MAX_BYTES", DEFAULT_RECORDING_RANGE_MAX_BYTES
+    )
+    recording_finalize_concurrency = _positive_int_setting(
+        "RECORDING_FINALIZE_CONCURRENCY", DEFAULT_RECORDING_FINALIZE_CONCURRENCY
+    )
+    recording_memory_budget_bytes = _positive_int_setting(
+        "RECORDING_MEMORY_BUDGET_BYTES", DEFAULT_RECORDING_MEMORY_BUDGET_BYTES
+    )
+    estimated_finalize_working_set = (
+        recording_max_total_bytes * 3 * recording_finalize_concurrency
+    )
+    if (
+        estimated_finalize_working_set >= recording_memory_budget_bytes
+        or recording_memory_budget_bytes >= _MEETING_API_POD_MEMORY_LIMIT_BYTES
+    ):
+        raise RuntimeError(
+            "recording memory budget must bound all concurrent finalizers below the pod limit"
+        )
+    finalize_semaphore = asyncio.Semaphore(recording_finalize_concurrency)
 
     @router.post("/internal/recordings/upload", include_in_schema=False)
     async def internal_upload_recording(
         file: UploadFile = File(...),
+        meeting_id: Optional[int] = Form(None),
         session_uid: Optional[str] = Form(None),
         media_type: Optional[str] = Form(None),
         media_format: Optional[str] = Form(None),
@@ -178,19 +227,16 @@ def build_router(
         duration_seconds = duration_seconds if duration_seconds is not None else meta.get("duration_seconds")
         sample_rate = sample_rate if sample_rate is not None else meta.get("sample_rate")
 
-        # Auth: accept either the INTERNAL_API_SECRET (the bot's internal upload uses it, like the
-        # lifecycle callback; meeting is scoped by session_uid) OR a MeetingToken (carries its meeting_id).
+        # Auth: the spawn-scoped MeetingToken is the only recording credential. A platform-wide
+        # internal service secret must never enter an ephemeral bot or authorize content writes.
         bearer = _bearer_token(authorization)
-        internal_secret = os.getenv("INTERNAL_API_SECRET")
-        token_meeting_id: Optional[int] = None
-        if internal_secret and bearer == internal_secret:
-            token_meeting_id = None  # internal auth → scope by session; skip the MeetingToken cross-check
-        else:
-            try:
-                claims = _verify_meeting_token(bearer, secret=token_secret)
-            except ValueError as e:
-                raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
-            token_meeting_id = int(claims["meeting_id"])
+        try:
+            claims = _verify_meeting_token(bearer, secret=token_secret)
+        except ValueError as e:
+            raise HTTPException(status_code=401, detail=f"Invalid recording upload token: {e}")
+        if claims["session_uid"] != session_uid:
+            raise HTTPException(status_code=403, detail="Recording token session mismatch")
+        token_meeting_id = int(claims["meeting_id"])
 
         data = await file.read(recording_chunk_max_bytes + 1)
         if len(data) > recording_chunk_max_bytes:
@@ -206,6 +252,8 @@ def build_router(
                 media_type=media_type, media_format=media_format,
                 chunk_seq=chunk_seq, is_final=is_final,
                 duration_seconds=duration_seconds, sample_rate=sample_rate,
+                max_chunks=recording_max_chunks,
+                max_total_bytes=recording_max_total_bytes,
             )
         except SessionNotFound as e:
             raise HTTPException(status_code=404, detail=str(e))
@@ -215,6 +263,11 @@ def build_router(
             raise HTTPException(
                 status_code=409,
                 detail="Recording chunk conflicts with its existing sequence",
+            ) from None
+        except RecordingLimitExceeded:
+            raise HTTPException(
+                status_code=413,
+                detail="Recording exceeds configured limits",
             ) from None
         except RecordingWriteRefused:
             raise HTTPException(status_code=409, detail="Meeting is no longer writable") from None
@@ -259,7 +312,14 @@ def build_router(
             raise HTTPException(status_code=404, detail="Recording not found")
         mf = next((m for m in rec.get("media_files", []) if m.get("type") == type), None)
         master_key = await _finalize_master_or_conflict(
-            repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id, media_type=type
+            repo,
+            storage,
+            meeting_id=rec["meeting_id"],
+            recording_id=recording_id,
+            media_type=type,
+            max_chunks=recording_max_chunks,
+            max_total_bytes=recording_max_total_bytes,
+            semaphore=finalize_semaphore,
         )
         if master_key is None:
             raise HTTPException(status_code=404, detail="No such media file to finalize")
@@ -302,17 +362,30 @@ def build_router(
         )
         if mf is None:
             raise HTTPException(status_code=404, detail="No such media file")
-        if not mf.get("is_final"):
+        storage_path = mf.get("storage_path")
+        has_finalized_master = (
+            isinstance(storage_path, str)
+            and storage_path.rsplit("/", 1)[-1].startswith("master.")
+            and mf.get("finalized_by") == "recording_finalizer.master"
+        )
+        if not has_finalized_master:
             await _finalize_master_or_conflict(
                 repo, storage, meeting_id=rec["meeting_id"], recording_id=recording_id,
                 media_type=mf.get("type", type),
+                max_chunks=recording_max_chunks,
+                max_total_bytes=recording_max_total_bytes,
+                semaphore=finalize_semaphore,
             )
             recs = await repo.list_meeting_recordings(user_id)
-            rec = next((r for r in recs if r.get("id") == recording_id), rec)
+            rec = next((r for r in recs if r.get("id") == recording_id), None)
+            if rec is None:
+                raise HTTPException(status_code=404, detail="Recording not found")
             mf = next(
                 (m for m in (rec or {}).get("media_files", []) if str(m.get("id")) == str(media_file_id)),
-                mf,
+                None,
             )
+            if mf is None:
+                raise HTTPException(status_code=404, detail="Recording not found")
         storage_path = mf.get("storage_path")
         if not storage_path:
             raise HTTPException(status_code=404, detail="Media file has no storage path")
@@ -329,14 +402,19 @@ def build_router(
         # back to fetching the full body if neither size() nor get_range() are available.
         range_header = request.headers.get("range") or request.headers.get("Range")
         total = await _storage_size(storage, storage_path)
-        full_body: Optional[bytes] = None
         if total is None:
-            full_body = await storage.get(storage_path)
-            total = len(full_body)
+            raise HTTPException(status_code=409, detail="Recording is not available")
+        if total > recording_max_total_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Recording exceeds configured limits",
+            )
 
         rng = _parse_range(range_header, total)  # may raise 416
         if rng is None:
-            data = full_body if full_body is not None else await storage.get(storage_path)
+            data = await storage.get(storage_path)
+            if len(data) != total or len(data) > recording_max_total_bytes:
+                raise HTTPException(status_code=409, detail="Recording is not available")
             return Response(
                 content=data,
                 media_type=content_type,
@@ -344,13 +422,16 @@ def build_router(
             )
 
         start, end = rng
-        slice_bytes: Optional[bytes] = None
-        if full_body is None:
-            slice_bytes = await _storage_get_range(storage, storage_path, start, end)
+        if end - start + 1 > recording_range_max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail="Requested recording range exceeds the window limit",
+            )
+        slice_bytes = await _storage_get_range(storage, storage_path, start, end)
         if slice_bytes is None:
-            if full_body is None:
-                full_body = await storage.get(storage_path)
-            slice_bytes = full_body[start : end + 1]
+            raise HTTPException(status_code=409, detail="Recording is not available")
+        if len(slice_bytes) != end - start + 1:
+            raise HTTPException(status_code=409, detail="Recording is not available")
         return Response(
             content=slice_bytes,
             status_code=206,

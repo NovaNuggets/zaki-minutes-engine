@@ -59,33 +59,66 @@ class _Resp:
         self.headers = headers
 
 
+class _StreamResp:
+    def __init__(self, status_code: int, chunks: list[bytes], headers: dict):
+        self.status_code = status_code
+        self._chunks = chunks
+        self.headers = headers
+        self.closed = False
+
+    async def aiter_raw(self):
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self):
+        self.closed = True
+
+
 class FakeDownstream:
     """Satisfies ``ports.DownstreamClient``: records the last forward and returns a canned reply."""
 
     def __init__(self, status_code: int = 200, body: Optional[dict] = None,
                  content_type: str = "application/json",
-                 stream_chunks: Optional[list] = None):
+                 stream_chunks: Optional[list] = None,
+                 stream_headers: Optional[dict] = None,
+                 response_headers: Optional[dict] = None):
         self.status_code = status_code
         self._body = body if body is not None else {"ok": True}
         self._content_type = content_type
+        self._response_headers = response_headers or {}
         # canned SSE frames for the streaming (agent chat) path
         self._stream_chunks = stream_chunks if stream_chunks is not None else [
             b'data: {"type":"token","text":"hi"}\n\n',
             b'data: {"type":"done"}\n\n',
         ]
+        self._stream_headers = {
+            "content-type": "text/event-stream",
+            **(stream_headers or {}),
+        }
         self.last: Optional[dict] = None
+        self.stream_response: Optional[_StreamResp] = None
 
     async def request(self, method, url, *, headers=None, params=None, content=None):
         self.last = {"method": method, "url": url, "headers": headers or {},
                      "params": params, "content": content}
         return _Resp(self.status_code, json.dumps(self._body).encode(),
-                     {"content-type": self._content_type})
+                     {"content-type": self._content_type, **self._response_headers})
 
     async def stream(self, method, url, *, headers=None, params=None, content=None):
         self.last = {"method": method, "url": url, "headers": headers or {},
                      "params": params, "content": content}
         for chunk in self._stream_chunks:
             yield chunk
+
+    async def open_stream(self, method, url, *, headers=None, params=None, content=None):
+        self.last = {"method": method, "url": url, "headers": headers or {},
+                     "params": params, "content": content}
+        self.stream_response = _StreamResp(
+            self.status_code,
+            self._stream_chunks,
+            self._stream_headers,
+        )
+        return self.stream_response
 
 
 class FakePubSub:

@@ -17,6 +17,9 @@ dependencies = [
     # registers multipart (Form/UploadFile) routes — FastAPI requires python-multipart to build the
     # app even though the conformance suite never posts a recording upload.
     "python-multipart>=0.0.9",
+    # The shipped meeting-api source imports its Redis-backed webhook retry module while the
+    # unified app is assembled, so conformance must carry that production import dependency.
+    "redis>=5,<6",
     "pytest>=8",
     # pytest-asyncio drives the /ws unit harness's `async def` tests (asyncio_mode=auto).
     # No SQLAlchemy-async here so no greenlet pin is required (lesson from the identity

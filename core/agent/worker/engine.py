@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
@@ -37,12 +38,35 @@ from llm import (
 )
 from llm.errors import _AUTH_SIGNATURE_RE  # noqa: F401 — re-exported for the worker.worker shim
 from shared.seeding import resolve_seed_dir, seed_workspace, validate_seed
+from shared.meeting_retention import (
+    carrier_is_writable,
+    processing_deadline_from_token,
+    processing_is_current,
+    retention_fence_key,
+)
 
 log = logging.getLogger("agent_api.worker")
 
 # Back-compat aliases: these names predate the llm module split; the worker.worker shim (and
 # meeting.py) re-export/import them under the old underscore names.
 _auth_error_event = auth_error_event
+
+
+def _processing_deadline_env(token: str | None, raw_deadline: str | None) -> int | None:
+    """Resolve and authenticate the processed cutoff carried into a meeting worker.
+
+    The deadline is bound into the opaque generation, so a mutable env hint can only repeat that
+    exact value. Legacy ordinary meetings carry neither value and retain their prior semantics.
+    """
+    bound = processing_deadline_from_token(token) if token else None
+    if raw_deadline is None or not raw_deadline.strip():
+        return bound
+    if token is None or not raw_deadline.isdecimal():
+        raise ValueError("meeting processing deadline env is invalid")
+    explicit = int(raw_deadline)
+    if explicit <= 0 or bound != explicit:
+        raise ValueError("meeting processing deadline env does not match its generation")
+    return explicit
 
 # Bootstrap memory root used ONLY when no valid workspace-seed template is available (tests / misconfig);
 # the normal path seeds the full template (which carries its own conventions file + agents/ + views/).
@@ -421,9 +445,11 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
     # (worker.meeting imports the generic helpers from this module).
     from worker.meeting import (
         meeting_card_turn,
+        meeting_artifact_paths,
         meeting_doc_turn,
         serve_meeting,
         upsert_meeting_transcript_file,
+        write_artifact_if_current,
     )
     from shared.agent_config import load_meeting_config
 
@@ -444,45 +470,96 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
         # The GOVERNED, workspace-driven copilot config (agents/meeting.md) — loaded ONCE at meeting
         # start from the mounted workspace; absent ⇒ all defaults. Env stays the ultimate model default.
         cfg = load_meeting_config(work)
-        # P0 (cross-tenant leak fix): the transcript carrier is keyed by the meetings-domain ROW id
-        # (VEXA_MEETING_NUMERIC_ID) — the transcript_stream tail is now that row id, NOT the native id.
-        # The NATIVE id (human-readable, e.g. abc-defg-hij) is carried SEPARATELY in VEXA_MEETING_ID for
-        # display + the readable kg doc name (nuance #1: kg/entities/meeting/{native}.md must survive).
-        # Never derive `native` from the stream tail anymore (that is the row id); fall back to the tail
-        # only when VEXA_MEETING_ID is somehow unset (older dispatcher), which at worst degrades the
-        # display name, never the row-scoped isolation.
+        # The meetings-domain ROW id is the only storage/carrier authority. Native links and titles are
+        # untrusted display data and never select a workspace path.
         row_id = os.environ.get("VEXA_MEETING_NUMERIC_ID") or transcript_stream.rsplit(":", 1)[-1]
-        native = os.environ.get("VEXA_MEETING_ID") or row_id
-        session_uid = os.environ.get("VEXA_MEETING_SESSION_UID") or native
         platform = os.environ.get("VEXA_MEETING_PLATFORM") or "google_meet"
+        try:
+            meeting_file, meeting_envelope_file = meeting_artifact_paths(work, row_id)
+        except ValueError as exc:
+            log.warning("agent-api worker: invalid meeting artifact authority: %s", exc)
+            return
         import datetime as _dt
         date = _dt.date.today().isoformat()
-        title = f"Meeting {native}"
-        # Auth-B/#3a: mirror each cleaned proc note into the per-meeting workspace file, incrementally,
-        # so a chat agent focused on the meeting can `Read kg/entities/meeting/<native>.md` mid-meeting.
-        meeting_file = work / "kg" / "entities" / "meeting" / f"{native}.md"
+        title = f"Meeting {row_id}"
+        # Mirror each cleaned proc note into the row-scoped workspace file incrementally.
         meeting_meta = {
-            "type": "meeting", "id": native, "title": title, "meeting_id": native,
-            "session_uid": session_uid, "platform": platform, "date": date,
+            "type": "meeting", "id": row_id, "title": title, "meeting_id": row_id,
+            "session_uid": row_id, "platform": platform, "date": date,
         }
-        on_proc_note = lambda note: upsert_meeting_transcript_file(meeting_file, meeting_meta, note)  # noqa: E731
+        processing_flag_key = os.environ.get("VEXA_MEETING_PROCESSING_FLAG_KEY")
+        processing_token = os.environ.get("VEXA_MEETING_PROCESSING_TOKEN")
+        try:
+            processing_expires_at_ms = _processing_deadline_env(
+                processing_token,
+                os.environ.get("VEXA_MEETING_PROCESSING_EXPIRES_AT_MS"),
+            )
+        except ValueError:
+            log.warning("agent-api worker: invalid meeting processing deadline; refusing work")
+            return
+
+        fence_key = retention_fence_key(row_id)
+
+        def processing_authority_current() -> bool:
+            if (
+                processing_expires_at_ms is not None
+                and int(time.time() * 1000) >= processing_expires_at_ms
+            ):
+                return False
+            if bool(processing_flag_key) != bool(processing_token):
+                return False
+            try:
+                if processing_flag_key and processing_token:
+                    return processing_is_current(
+                        client,
+                        fence_key=fence_key,
+                        flag_key=processing_flag_key,
+                        token=processing_token,
+                        expires_at_ms=processing_expires_at_ms,
+                    )
+                return carrier_is_writable(
+                    client,
+                    fence_key,
+                    expires_at_ms=processing_expires_at_ms,
+                )
+            except Exception:  # noqa: BLE001 — unavailable authority cannot bless a local derivative
+                log.warning("agent-api worker: meeting artifact authority check failed", exc_info=True)
+                return False
+
+        def on_proc_note(note: dict) -> bool:
+            return write_artifact_if_current(
+                work,
+                meeting_file,
+                lambda: upsert_meeting_transcript_file(meeting_file, meeting_meta, note),
+                processing_authority_current,
+            )
         # Deterministic dual-source render seam: persist the SAME notes/cards as the durable envelope
         # alongside the markdown, so live (redis) and finished (file) render identically.
         from worker.meeting import persist_envelope, _seed_dir, validate_envelope
-        meeting_envelope_file = work / "kg" / "entities" / "meeting" / f"{native}.envelope.json"
-
-        def on_envelope(envelope: dict) -> None:
+        def on_envelope(envelope: dict) -> bool:
             errors = validate_envelope(envelope, _seed_dir())
             if errors:
                 log.warning("agent-api worker: meeting envelope schema errors: %s", "; ".join(errors[:3]))
-            persist_envelope(meeting_envelope_file, envelope)
+            return write_artifact_if_current(
+                work,
+                meeting_envelope_file,
+                lambda: persist_envelope(meeting_envelope_file, envelope),
+                processing_authority_current,
+            )
         # write_meeting_doc=false ⇒ no doc_turn (independent of `enabled`, which gates the live beats).
         doc_turn = None
         if cfg.write_meeting_doc:
-            doc_turn = lambda cards: meeting_doc_turn(  # noqa: E731
-                work, cards, native=native, meeting_id=native, session_uid=session_uid,
-                platform=platform, date=date, title=title, model=cfg.model,
-            )
+            def doc_turn(cards: list[dict]) -> Iterator[dict]:
+                if not processing_authority_current():
+                    return
+                yield from meeting_doc_turn(
+                    work,
+                    cards,
+                    row_id=row_id,
+                    platform=platform,
+                    date=date,
+                    authority_current=processing_authority_current,
+                )
         serve_meeting(
             client, transcript_stream=transcript_stream, out_topic=out_topic,
             card_turn=lambda segs: meeting_card_turn(
@@ -502,6 +579,9 @@ def main() -> None:  # pragma: no cover — the container entrypoint (wired in t
             # resume one row from another row's position (and leak progress across tenants).
             proc_stream=f"proc:meeting:{row_id}",
             cursor_key=f"proc:meeting:{row_id}:cursor",
+            processing_flag_key=processing_flag_key,
+            processing_token=processing_token,
+            processing_expires_at_ms=processing_expires_at_ms,
             on_proc_note=on_proc_note,
             on_envelope=on_envelope,
             # Provenance stamped on every processed-notes entry: what pipeline/provider/model

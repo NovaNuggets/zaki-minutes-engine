@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 # `PYTHONPATH=/app` resolves them as top-level imports.
 COPY core/agent/shared ./shared
 COPY core/agent/control_plane ./control_plane
+COPY core/agent/llm ./llm
 COPY core/agent/contracts ./contracts
 # The registry of workspace templates (the control plane validates/seeds from one — Phase 6).
 # workspace-seeds/<name>/ — one validated seed per subdir (today: default, finos).
@@ -45,12 +46,18 @@ COPY core/agent/workspace-seeds ./workspace-seeds
 # walk-up (Path(__file__).resolve().parents → /app/contracts/loader.py → /app) resolves
 # `meetings/contracts/...` and `agent/contracts/...` (repo_root == /app).
 COPY core/meetings/contracts/transcript.v1/transcript.schema.json  ./meetings/contracts/transcript.v1/transcript.schema.json
+COPY core/meetings/contracts/zaki-read.v1/zaki-read.schema.json     ./meetings/contracts/zaki-read.v1/zaki-read.schema.json
 COPY core/agent/contracts/workspace.v1/workspace.schema.json       ./agent/contracts/workspace.v1/workspace.schema.json
 COPY core/agent/contracts/invoke.v1/invoke.schema.json             ./agent/contracts/invoke.v1/invoke.schema.json
 COPY core/agent/contracts/unit.v1/unit.schema.json                 ./agent/contracts/unit.v1/unit.schema.json
 COPY core/agent/contracts/routine.v1/routine.schema.json           ./agent/contracts/routine.v1/routine.schema.json
 COPY core/agent/contracts/event.v1/event.schema.json               ./agent/contracts/event.v1/event.schema.json
 COPY core/agent/contracts/tool.v1/tool.schema.json                 ./agent/contracts/tool.v1/tool.schema.json
+
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN groupadd --gid 10005 vexa && \
+    useradd --uid 10005 --gid 10005 --create-home --shell /usr/sbin/nologin vexa
+USER 10005:10005
 
 EXPOSE 8100
 # uvicorn resolves the lazy PEP-562 `app` (control_plane.api:app), which wires the real RuntimeHttpClient

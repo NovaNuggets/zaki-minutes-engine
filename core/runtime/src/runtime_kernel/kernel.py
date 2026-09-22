@@ -66,14 +66,33 @@ class Runtime:
         self.owner_quota = owner_quota
         # Live, non-serializable backend handles. Empty on a fresh process (post-restart).
         self._handles: dict[str, WorkloadHandle] = {}
+        # ProcessBackend has no post-restart substrate lookup. Remember successful scrubs only for
+        # this process lifetime so an immediate retry remains idempotent without claiming that an
+        # arbitrary, never-seen process workload is absent.
+        self._scrubbed_workloads: set[str] = set()
 
     def _emit(self, workload_id: str, state: RuntimeState, **kw) -> RuntimeEvent:
         ev = RuntimeEvent(workloadId=workload_id, state=state, at=_now(), **kw)
         self.on_event(ev)
         return ev
 
-    def _persist(self, spec: WorkloadSpec, status: WorkloadStatus) -> None:
-        self.store.set(WorkloadRecord(spec=spec, status=status, owner=self.owner_resolver(spec)))
+    def _persist(
+        self,
+        spec: WorkloadSpec,
+        status: WorkloadStatus,
+        *,
+        owner: Optional[str] = None,
+    ) -> None:
+        """Persist lifecycle metadata without ever persisting launch env values.
+
+        ``WorkloadRecord`` enforces the redaction.  Once a record exists its resolved owner must
+        also survive that redaction; recomputing it from the now-empty persisted env would silently
+        move an active workload into the unowned quota bucket.
+        """
+        if owner is None:
+            existing = self.store.get(spec.workloadId)
+            owner = existing.owner if existing is not None else self.owner_resolver(spec)
+        self.store.set(WorkloadRecord(spec=spec, status=status, owner=owner))
 
     def _record(self, workload_id: str) -> WorkloadRecord:
         record = self.store.get(workload_id)
@@ -173,10 +192,16 @@ class Runtime:
             workloadId=spec.workloadId, profile=spec.profile,
             state=RuntimeState.starting, backend=self.backend.name,
         )
-        self._persist(spec, status)
+        self._scrubbed_workloads.discard(spec.workloadId)
+        self._persist(spec, status, owner=self.owner_resolver(spec))
         self._emit(spec.workloadId, RuntimeState.starting)
         try:
-            self._handles[spec.workloadId] = self.backend.start(spec.workloadId, runnable, spec.env)
+            self._handles[spec.workloadId] = self.backend.start(
+                spec.workloadId,
+                runnable,
+                spec.env,
+                resources=spec.resources,
+            )
         except Exception:
             status.state = RuntimeState.stopped
             status.stopReason = StopReason.start_failed
@@ -205,6 +230,11 @@ class Runtime:
         if status.state == RuntimeState.running and handle is not None:
             code = self.backend.exit_code(handle)
             if code is not None:
+                # An exited Docker container / Kubernetes Pod still retains its launch env.  Reap
+                # it before reporting a terminal state so meeting credentials do not survive in
+                # the substrate after the bot is gone.
+                self.backend.cleanup(handle)
+                self._handles.pop(workload_id, None)
                 status.state = RuntimeState.stopped
                 status.exitCode = code
                 status.stoppedAt = _now()
@@ -233,6 +263,8 @@ class Runtime:
             if self.backend.exit_code(h) is None:
                 self.backend.kill(h)                                # force after grace
             code = self.backend.exit_code(h)
+            self.backend.cleanup(h)
+            self._handles.pop(workload_id, None)
         else:
             code = None                                             # no live handle (post-restart stop)
         status.state = RuntimeState.stopped
@@ -248,11 +280,59 @@ class Runtime:
         h = self._handle_for(workload_id)                           # re-derives post-restart handles
         if h is not None:
             self.backend.cleanup(h)   # raises on an unconfirmed reclaim — destroyed is never a lie
+            self._handles.pop(workload_id, None)
         status = record.status
         status.state = RuntimeState.destroyed
         self._persist(record.spec, status)
         self._emit(workload_id, RuntimeState.destroyed)
         return status
+
+    def scrub(self, workload_id: str) -> None:
+        """Idempotently remove a workload and every runtime-owned durable trace of its launch.
+
+        Unlike ``destroy``, privacy erasure succeeds for an already-missing record and deletes the
+        lifecycle record itself.  If a runtime restart lost the in-process handle, ``find`` still
+        reaches the deterministic substrate object.  Any cleanup failure is allowed to raise: a
+        successful erasure response over a credential-bearing live/stopped bot would be a lie.
+        """
+        record = self.store.get(workload_id)
+        handle = self._handles.get(workload_id)
+        finder = getattr(self.backend, "find", None)
+        substrate_checked = False
+        if handle is None and finder is not None:
+            # Unlike the ordinary read path, erasure must not collapse a failed substrate lookup
+            # into "not found". A backend outage is not proof that a secret-bearing workload is
+            # gone, so let the failure propagate and make the caller retry.
+            handle = finder(workload_id)
+            substrate_checked = True
+            if handle is not None:
+                self._handles[workload_id] = handle
+        if (
+            handle is None
+            and not substrate_checked
+            and workload_id not in self._scrubbed_workloads
+        ):
+            raise KeyError(workload_id)
+        if handle is not None:
+            if self.backend.exit_code(handle) is None:
+                self.backend.terminate(handle)
+                deadline = time.time() + self.grace_sec
+                while self.backend.exit_code(handle) is None and time.time() < deadline:
+                    time.sleep(0.02)
+                if self.backend.exit_code(handle) is None:
+                    self.backend.kill(handle)
+            self.backend.cleanup(handle)
+            self._handles.pop(workload_id, None)
+
+        if record is not None:
+            record.status.state = RuntimeState.destroyed
+            self._persist(record.spec, record.status, owner=record.owner)
+            self._emit(workload_id, RuntimeState.destroyed)
+
+        self.store.delete(workload_id)
+        if self.store.get(workload_id) is not None:
+            raise RuntimeError(f"runtime record {workload_id!r} survived scrub")
+        self._scrubbed_workloads.add(workload_id)
 
 
 def _coerce_registry(profiles) -> ProfileRegistry:

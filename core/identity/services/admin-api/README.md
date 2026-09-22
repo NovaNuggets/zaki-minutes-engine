@@ -13,14 +13,17 @@ service stays out of the identity business. Python because it carves the parent 
 | **calls** | terminal / dashboard login | `GET /admin/users/email/{email}` | resolve a returning user by email (find-or-create) |
 | **calls** | terminal / dashboard login | `POST /admin/users` · `POST /admin/users/{id}/tokens` | create user · mint a scoped session token |
 | **consumes** | the gateway | `POST /internal/validate` | a raw token → `{user_id, scopes, max_concurrent, email, webhook_*}` (fail-closed) |
-| **calls** | bot/worker clients | `X-API-Key` on `/user/*` | user-tier self-serve (webhook config in `user.data`) |
+| **calls** | interactive browser clients | browser-scoped `X-API-Key` on `GET/PUT /user/minutes` | capture/read choices, per-scope retention, and bounded reconsent/repair state; bot/tx/agent-only tokens are denied |
+| **produces** | Minutes + Agent services | `GET /internal/users/{user_id}/minutes` with `X-Internal-Secret` | fail-closed effective capture/read authority, current policy and retention |
 | **produces** | Postgres (backing stack) | SQLAlchemy `users` · `api_tokens` | the identity tables (one `Base`, FK `api_tokens.user_id → users.id`) |
 
 ## Contracts
 
 **Owns:** [`core/identity/contracts/identity.v1`](../../contracts/identity.v1) — `ScopedToken`
 (`subject`, `scopes[]` ∈ `{bot,tx,browser}`, `expires_at`), `AccessDecision` (default-deny verdict),
-`ResourceKind`. Sealed in [`contracts.seal.json`](../../../../contracts.seal.json).
+`ResourceKind`; and its additive [`identity.v2`](../../contracts/identity.v2) successor, which adds the
+dedicated `agent` scope. `identity.v1` remains sealed in
+[`contracts.seal.json`](../../../../contracts.seal.json).
 Token prefix/scope rules live in `src/admin_api/token_scope.py` (`VALID_SCOPES`, `vxa_<scope>_…`).
 
 **Consumes:** none — this is the root of the identity domain; it produces the token others validate.
@@ -41,6 +44,7 @@ uv run pytest -q     # L3 integration (testcontainers Postgres) · L1 health
 - ✅ delivered — admin tier: `POST /admin/users`, `GET /admin/users/email/{email}`, `POST /admin/users/{id}/tokens`, `DELETE /admin/tokens/{id}`
 - ✅ delivered — `/internal/validate` authz oracle → `{user_id, scopes, max_concurrent, email, webhook_*}`, fail-closed, expiry-rejecting, `last_used_at` bump
 - ✅ delivered — scoped/multi-scope/expiring token mint (`vxa_<scope>_…`, `VALID_SCOPES`)
+- ✅ delivered — browser-only `GET/PUT /user/minutes`: operator/user authority separation, current-policy attestation, bounded retention, and repair status
 - 🟡 partial — user tier: `PUT /user/webhook` self-serve (other `/user/*` surfaces deferred)
 - ⬜ planned — `/internal/validate` also returns the canonical `subject` (`u_<user_id>`)
 - ⬜ planned — the find-or-create-user + mint-token flow backs the terminal login (Google + dev type-any-email)

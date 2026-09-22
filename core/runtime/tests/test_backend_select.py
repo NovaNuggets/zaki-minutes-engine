@@ -6,11 +6,14 @@ that the Docker-only worker-image ensure step is skipped for backends that lack 
 from __future__ import annotations
 
 import pytest
+import fakeredis
 
 from runtime_kernel.__main__ import _build_backend
 from runtime_kernel.docker_backend import DockerBackend
 from runtime_kernel.k8s_backend import K8sBackend
 from runtime_kernel.process_backend import ProcessBackend
+from runtime_kernel.callbacks import RedisPendingStore
+from runtime_kernel.store import RedisStore
 
 
 @pytest.mark.parametrize(
@@ -78,7 +81,81 @@ def test_production_runtime_gets_the_env_grace(monkeypatch):
 
     monkeypatch.setenv("RUNTIME_BACKEND", "process")        # no docker daemon needed
     monkeypatch.setenv("RUNTIME_STOP_GRACE_SEC", "42")
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "runtime-callback-secret")
+    monkeypatch.setenv("RUNTIME_CONTROL_SECRET", "runtime-control-secret")
+    monkeypatch.setenv(
+        "RUNTIME_CALLBACK_TRUSTED_ORIGINS",
+        "http://meeting-api:8080",
+    )
     monkeypatch.delenv("REDIS_URL", raising=False)          # no scheduler ticker
     monkeypatch.delenv("AGENT_IMAGE", raising=False)        # no worker-image ensure
     app = build_production_app()
     assert app.state.runtime.grace_sec == 47.0
+    assert app.state.control_auth_enabled is True
+    assert app.state.callback_queue.default_headers == {
+        "X-Runtime-Callback-Secret": "runtime-callback-secret"
+    }
+
+
+def test_disabled_agent_profile_skips_worker_image_ensure(monkeypatch):
+    """Managed Minutes omits the bundled Agent and must not pull or expose its worker image."""
+    from runtime_kernel.__main__ import build_production_app
+
+    monkeypatch.setenv("RUNTIME_BACKEND", "docker")
+    monkeypatch.setenv("RUNTIME_AGENT_PROFILE_ENABLED", "false")
+    monkeypatch.setenv("AGENT_IMAGE", "registry.example.com/agent-api:must-not-pull")
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "runtime-callback-secret")
+    monkeypatch.setenv("RUNTIME_CONTROL_SECRET", "runtime-control-secret")
+    monkeypatch.setenv("RUNTIME_CALLBACK_TRUSTED_ORIGINS", "http://meeting-api:8080")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    def unexpected_ensure(*_args, **_kwargs):
+        raise AssertionError("disabled Agent profile attempted to ensure its worker image")
+
+    monkeypatch.setattr(DockerBackend, "ensure_worker_image", unexpected_ensure)
+
+    app = build_production_app()
+
+    assert app.state.runtime.profiles.resolve("agent") is None
+
+
+def test_production_runtime_rejects_shared_or_multi_origin_callback_credentials(monkeypatch):
+    from runtime_kernel.__main__ import build_production_app
+
+    monkeypatch.setenv("RUNTIME_BACKEND", "process")
+    monkeypatch.setenv("RUNTIME_CONTROL_SECRET", "same-secret")
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "same-secret")
+    monkeypatch.setenv("RUNTIME_CALLBACK_TRUSTED_ORIGINS", "http://meeting-api:8080")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("AGENT_IMAGE", raising=False)
+
+    with pytest.raises(RuntimeError, match="must be distinct"):
+        build_production_app()
+
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "dedicated-callback-secret")
+    monkeypatch.setenv(
+        "RUNTIME_CALLBACK_TRUSTED_ORIGINS",
+        "http://meeting-api:8080,http://agent-api:8100",
+    )
+    with pytest.raises(RuntimeError, match="exactly one"):
+        build_production_app()
+
+
+def test_redis_url_builds_one_durable_workload_and_callback_state(monkeypatch):
+    from runtime_kernel.__main__ import _build_runtime_stores
+
+    redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+    import redis
+
+    calls = []
+    monkeypatch.setattr(
+        redis,
+        "from_url",
+        lambda url, **kwargs: calls.append((url, kwargs)) or redis_client,
+    )
+
+    workload_store, callback_store = _build_runtime_stores("redis://runtime-state:6379/0")
+
+    assert isinstance(workload_store, RedisStore)
+    assert isinstance(callback_store, RedisPendingStore)
+    assert calls == [("redis://runtime-state:6379/0", {"decode_responses": True})]

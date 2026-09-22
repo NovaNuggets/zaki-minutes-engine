@@ -23,9 +23,12 @@ The flow (parent ``meetings.py`` lines ~1010-1403, reduced to the standard-bot b
 """
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from typing import Any, Optional
+
+from ..public_status import public_meeting_status
 
 from ..obs import log_event
 from .invocation import build_invocation, build_workload_spec, mint_meeting_token
@@ -36,8 +39,10 @@ from .ports import (
     QuotaExceeded,
     RuntimeClient,
     SpawnFailed,
+    TeardownUnconfirmed,
     TranscriptionNotConfigured,
 )
+from .teardown import confirm_capture_teardown_with_retry
 from .url_validation import validate_meeting_url
 
 # Re-exported here (defined in ports.py to avoid an adapters→service circular import) so callers that
@@ -47,6 +52,7 @@ __all__ = ["request_bot", "construct_meeting_url", "DuplicateMeeting"]
 # Non-terminal statuses (parent's active set) — a prior meeting in one of these blocks a new spawn.
 _ACTIVE_STATUSES = ("requested", "joining", "awaiting_admission", "active", "stopping")
 _TERMINAL_STATUSES = ("completed", "failed")
+_MAX_ADMIN_RESPONSE_BYTES = 1024 * 1024
 
 # Construct-URL templates per platform (the parent's ``Platform.construct_meeting_url``, core set).
 # NO jitsi template: a jitsi room name is scoped to a DEPLOYMENT (meet.jit.si is only the public
@@ -59,9 +65,54 @@ _URL_TEMPLATES = {
 }
 
 
+async def _read_admin_json(response) -> Any:
+    """Decode one small admin-api JSON response without trusting its declared or streamed size."""
+    declared = response.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_length = int(declared)
+        except ValueError as error:
+            raise ValueError("invalid admin response length") from error
+        if declared_length < 0 or declared_length > _MAX_ADMIN_RESPONSE_BYTES:
+            raise ValueError("admin response is too large")
+
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in response.aiter_bytes(64 * 1024):
+        total += len(chunk)
+        if total > _MAX_ADMIN_RESPONSE_BYTES:
+            raise ValueError("admin response is too large")
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks))
+
+
+def _validate_transcription_config(value: Any) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    limits = {
+        "url": 4096,
+        "token": 16384,
+        "config_status": 32,
+        "validation_error": 1024,
+    }
+    if set(value) - (set(limits) | {"blocked"}):
+        raise ValueError("invalid transcription config response")
+    for field, limit in limits.items():
+        configured = value.get(field)
+        if configured is not None and (
+            not isinstance(configured, str)
+            or len(configured) > limit
+            or any(control in configured for control in ("\x00", "\r", "\n"))
+        ):
+            raise ValueError("invalid transcription config response")
+    if "blocked" in value and type(value["blocked"]) is not bool:
+        raise ValueError("invalid transcription config response")
+    return value
+
+
 async def _resolve_transcription_backend(user_id: int) -> dict:
     """The Settings-configured transcription backend for this spawn: admin-api's bot-context
-    resolves user pref > platform setting into ``{"transcription": {url, token}}``. Best-effort
+    selects one complete user or platform ``{"transcription": {url, token}}`` tier. Best-effort
     by contract — identity unreachable / unset ADMIN_API_URL degrades to the process env (the
     pre-Settings behaviour), never blocks a spawn. The token crosses ONLY this internal hop."""
     admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
@@ -71,16 +122,46 @@ async def _resolve_transcription_backend(user_id: int) -> dict:
     try:
         import httpx
 
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            async with client.stream(
+                "GET",
                 f"{admin_api_url}/internal/users/{user_id}/bot-context",
                 headers={"X-Internal-Secret": internal_secret},
-            )
-        if r.status_code != 200:
-            return {}
-        body = r.json()
+                follow_redirects=False,
+            ) as response:
+                if response.status_code != 200:
+                    return {}
+                body = await _read_admin_json(response)
         transcription = body.get("transcription") if isinstance(body, dict) else None
-        return transcription if isinstance(transcription, dict) else {}
+        return _validate_transcription_config(transcription)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _resolve_operator_transcription_backend() -> dict:
+    """Resolve only the operator-owned platform STT setting for managed capture."""
+    admin_api_url = (os.getenv("ADMIN_API_URL") or "").rstrip("/")
+    internal_secret = os.getenv("INTERNAL_API_SECRET") or ""
+    if not (admin_api_url and internal_secret):
+        return {}
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            async with client.stream(
+                "GET",
+                f"{admin_api_url}/internal/settings/transcription",
+                headers={"X-Internal-Secret": internal_secret},
+                follow_redirects=False,
+            ) as response:
+                if response.status_code != 200:
+                    return {}
+                body = await _read_admin_json(response)
+        configured = body.get("value") if isinstance(body, dict) else None
+        configured = _validate_transcription_config(configured)
+        if not configured.get("url"):
+            return {}
+        return {key: configured[key] for key in ("url", "token") if configured.get(key)}
     except Exception:  # noqa: BLE001
         return {}
 
@@ -110,7 +191,7 @@ def _meeting_response(row: dict, *, sessions: Optional[list] = None) -> dict:
         "platform": row.get("platform"),
         "native_meeting_id": row.get("native_meeting_id") or row.get("platform_specific_id"),
         "constructed_meeting_url": data.get("constructed_meeting_url"),
-        "status": row.get("status", "requested"),
+        "status": public_meeting_status(row.get("status", "requested")),
         "bot_container_id": row.get("bot_container_id"),
         "start_time": row.get("start_time"),
         "end_time": row.get("end_time"),
@@ -137,12 +218,16 @@ async def request_bot(
     transcription_tier: str = "realtime",
     recording_enabled: bool = False,
     transcribe_enabled: bool = True,
+    operator_transcription_only: bool = False,
     continue_meeting: bool = False,
     max_concurrent: Optional[int] = None,
     redis_url: Optional[str] = None,
     meeting_api_url: Optional[str] = None,
-    internal_secret: Optional[str] = None,
     token_secret: Optional[str] = None,
+    capture_expires_at: Optional[str] = None,
+    max_lifetime_sec: Optional[int] = None,
+    invocation_contract: str = "invocation.v1",
+    managed_retention: Optional[dict] = None,
     # Per-user webhook config (the gateway forwards it from identity's /internal/validate). Persisted
     # into meeting.data so the lifecycle callback delivers status_change events with no users-table read.
     webhook_url: Optional[str] = None,
@@ -172,15 +257,26 @@ async def request_bot(
     #     duplicate): the old router gate refused pre-insert; resolving here keeps that property —
     #     a refused spawn must not leave an orphaned `requested` meeting row (whose retry after
     #     fixing config would then 409 on the dedup guard). STT creds the bot transcribes with —
-    #     the process env is the bottom fallback; a configured backend from Settings (user pref >
-    #     platform setting, resolved by admin-api's bot-context) overrides it per spawn. The
+    #     the process env is the bottom fallback; a configured backend from Settings (one complete
+    #     user or platform tier, resolved by admin-api's bot-context) overrides it per spawn. The
     #     resolved values flow down unchanged to the invocation build. Note: config.v1's `stt`
     #     capability tri-state still drives boot preflight + /health; the spawn path trusts THIS
     #     resolver instead (issue #502 C1) because Settings-configured STT is invisible to the
     #     env-only capability check.
     transcription_service_url = os.getenv("TRANSCRIPTION_SERVICE_URL") or None
     transcription_service_token = os.getenv("TRANSCRIPTION_SERVICE_TOKEN") or None
-    configured = await _resolve_transcription_backend(user_id)
+    configured = (
+        await _resolve_operator_transcription_backend()
+        if operator_transcription_only
+        else await _resolve_transcription_backend(user_id)
+    )
+    if not operator_transcription_only and configured.get("blocked"):
+        # A user explicitly selected this origin. If operator policy later revokes it, do not
+        # switch the meeting to the deployment STT credential behind the user's back.
+        raise TranscriptionNotConfigured(
+            "personal transcription backend is blocked by operator policy — choose an approved "
+            "endpoint or Deployment default in Settings"
+        )
     if configured.get("url"):
         transcription_service_url = configured["url"]
         # A configured backend's token replaces the env token even when empty — the env token
@@ -263,11 +359,13 @@ async def request_bot(
 
     # 4. MeetingToken + invocation. connection_id IS the session_uid (parent's connectionId).
     connection_id = str(uuid.uuid4())
-    redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
     meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")
-    internal_secret = internal_secret if internal_secret is not None else os.getenv(
-        "INTERNAL_API_SECRET"
-    )
+    if invocation_contract == "invocation.v1":
+        redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
+    else:
+        # Managed bots cross only authenticated HTTP seams. Even a caller-provided Redis URL is
+        # discarded rather than serialized into an ephemeral browser-facing workload.
+        redis_url = None
     # STT creds were resolved and gated at step 1b (before the meeting-row write); the resolved
     # transcription_service_url/token flow into the invocation below. Without either the bot
     # joins + captures but cannot transcribe — None-safe: omitted from the invocation when unset
@@ -276,7 +374,13 @@ async def request_bot(
     # transcription dies mid-meeting when the JWT expires. Default 5h; override per deployment.
     token_ttl_seconds = int(os.getenv("MEETING_TOKEN_TTL_SECONDS") or 18000)
     token = mint_meeting_token(
-        meeting_id, user_id, platform, native_meeting_id, secret=token_secret, ttl_seconds=token_ttl_seconds
+        meeting_id,
+        user_id,
+        platform,
+        native_meeting_id,
+        session_uid=connection_id,
+        secret=token_secret,
+        ttl_seconds=token_ttl_seconds,
     )
     invocation = build_invocation(
         meeting_id=meeting_id,
@@ -291,8 +395,15 @@ async def request_bot(
         task=task,
         transcription_tier=transcription_tier,
         redis_url=redis_url,
+        transcript_ingest_url=(
+            f"{meeting_api_url}/bots/internal/transcripts/ingest"
+            if invocation_contract == "invocation.v2" else None
+        ),
+        retention_fence_url=(
+            f"{meeting_api_url}/bots/internal/transcripts/fence"
+            if invocation_contract == "invocation.v2" else None
+        ),
         meeting_api_callback_url=f"{meeting_api_url}/bots/internal/callback/lifecycle",
-        internal_secret=internal_secret,
         transcribe_enabled=transcribe_enabled,
         transcription_service_url=transcription_service_url,
         transcription_service_token=transcription_service_token,
@@ -302,6 +413,9 @@ async def request_bot(
         # A human-in-the-loop dashboard join needs a forgiving lobby window so a late admit does not
         # fail the meeting; everyoneLeftTimeout matches the O6 config.
         automatic_leave={"waitingRoomTimeout": 600000, "everyoneLeftTimeout": 900000},
+        capture_expires_at=capture_expires_at,
+        managed_retention=managed_retention,
+        contract_version=invocation_contract,
     )
 
     # 5. Spawn over runtime.v1.
@@ -309,6 +423,9 @@ async def request_bot(
         workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
+        max_lifetime_sec=max_lifetime_sec,
+        invocation_contract=invocation_contract,
+        profile=("meeting-bot-v2" if invocation_contract == "invocation.v2" else "meeting-bot"),
     )
     try:
         result = await runtime.create_workload(spec)
@@ -383,15 +500,155 @@ async def request_bot(
     # window (DELETE arriving before set_bot_container).
     raced_status = await repo.get_status_by_session(session_uid=connection_id)
     if raced_status in ("stopping", "completed", "failed"):
+        # ``set_bot_container`` returns a detached snapshot in production. A withdrawal can commit
+        # after that snapshot was returned but before this status read, so refresh before inspecting
+        # capture evidence. A confirmed withdrawal may already have hard-deleted the workload; do
+        # not turn that successful stop into a false 404 on a duplicate DELETE.
         try:
-            await runtime.delete_workload(workload_id)
-            log_event("bot_spawn_raced_stop_torn_down", audience="system", level="warning",
-                      span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                      fields={"workload_id": workload_id, "raced_status": raced_status})
-        except Exception as teardown_err:  # noqa: BLE001 — teardown is best-effort, never masks the spawn
-            log_event("bot_spawn_raced_stop_teardown_failed", audience="system", level="error",
-                      span="bots.create", user_id=user_id, meeting_id=str(meeting_id),
-                      fields={"workload_id": workload_id, "error": str(teardown_err)})
+            refreshed = await repo.find_latest(user_id, platform, native_meeting_id)
+            if refreshed is not None and refreshed.get("id") == meeting_id:
+                row = refreshed
+        except Exception as refresh_error:  # noqa: BLE001 — teardown remains the safety boundary
+            log_event(
+                "bot_spawn_raced_stop_refresh_failed",
+                audience="system",
+                level="warning",
+                span="bots.create",
+                user_id=user_id,
+                meeting_id=str(meeting_id),
+                fields={"error_type": type(refresh_error).__name__},
+            )
+        meeting_data = row.get("data") if isinstance(row, dict) else None
+        capture_data = (
+            meeting_data.get("zaki_capture")
+            if isinstance(meeting_data, dict)
+            else None
+        )
+        teardown_already_confirmed = (
+            isinstance(capture_data, dict)
+            and capture_data.get("state") == "withdrawn"
+            and capture_data.get("teardown_state") == "confirmed"
+        )
+        withdrawn_confirmation_required = (
+            isinstance(capture_data, dict)
+            and capture_data.get("state") == "withdrawn"
+        )
+        hard_teardown_confirmed = False
+        if not teardown_already_confirmed:
+            try:
+                await runtime.delete_workload(workload_id)
+                hard_teardown_confirmed = True
+            except Exception as teardown_err:  # noqa: BLE001 — fail closed on an unconfirmed stop
+                log_event(
+                    "bot_spawn_raced_stop_teardown_failed",
+                    audience="system",
+                    level="error" if withdrawn_confirmation_required else "warning",
+                    span="bots.create",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={
+                        "workload_id": workload_id,
+                        "error_type": type(teardown_err).__name__,
+                    },
+                )
+
+        confirmation_persisted = teardown_already_confirmed
+        if hard_teardown_confirmed:
+            try:
+                # The narrow CAS safely no-ops for ordinary non-capture bot stops. It must not be
+                # gated on ``row`` because that snapshot may predate the concurrent withdrawal.
+                confirmation_persisted = await confirm_capture_teardown_with_retry(
+                    repo,
+                    meeting_id=meeting_id,
+                )
+            except Exception as persist_error:  # noqa: BLE001 — workload is already stopped
+                log_event(
+                    "bot_spawn_raced_stop_confirmation_persist_failed",
+                    audience="system",
+                    level="error",
+                    span="bots.create",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={"error_type": type(persist_error).__name__},
+                )
+
+        # Refresh the response after the CAS so neither status nor capture evidence comes from the
+        # pre-withdrawal snapshot. If the read itself fails, the safe local fallback still reports
+        # the raced terminal/stopping status rather than claiming a capture started.
+        response_refreshed = False
+        try:
+            refreshed = await repo.find_latest(user_id, platform, native_meeting_id)
+            if refreshed is not None and refreshed.get("id") == meeting_id:
+                row = refreshed
+                response_refreshed = True
+        except Exception as refresh_error:  # noqa: BLE001 — hard teardown is already confirmed
+            log_event(
+                "bot_spawn_raced_stop_response_refresh_failed",
+                audience="system",
+                level="warning",
+                span="bots.create",
+                user_id=user_id,
+                meeting_id=str(meeting_id),
+                fields={"error_type": type(refresh_error).__name__},
+            )
+        refreshed_data = row.get("data") if isinstance(row, dict) else None
+        refreshed_capture = (
+            refreshed_data.get("zaki_capture")
+            if isinstance(refreshed_data, dict)
+            else None
+        )
+        withdrawn_confirmation_required = withdrawn_confirmation_required or (
+            isinstance(refreshed_capture, dict)
+            and refreshed_capture.get("state") == "withdrawn"
+        )
+        confirmation_persisted = confirmation_persisted or (
+            isinstance(refreshed_capture, dict)
+            and refreshed_capture.get("state") == "withdrawn"
+            and refreshed_capture.get("teardown_state") == "confirmed"
+        )
+        # The shared bot-stop path intentionally gets ``False`` from the capture CAS. That remains
+        # a valid ordinary hard-stop outcome. A withdrawn ZAKI capture is different: its durable
+        # confirmed+terminal marker is the erasure gate, so a False/failed CAS must fail closed.
+        if withdrawn_confirmation_required and not confirmation_persisted:
+            log_event(
+                "bot_spawn_raced_capture_confirmation_unconfirmed",
+                audience="system",
+                level="error",
+                span="bots.create",
+                user_id=user_id,
+                meeting_id=str(meeting_id),
+                fields={"reason": "cas_not_durable"},
+            )
+            raise TeardownUnconfirmed() from None
+        row = dict(row)
+        if not response_refreshed:
+            row["status"] = raced_status
+        if confirmation_persisted:
+            response_data = (
+                dict(row.get("data")) if isinstance(row.get("data"), dict) else {}
+            )
+            response_capture = response_data.get("zaki_capture")
+            if isinstance(response_capture, dict):
+                response_data["zaki_capture"] = {
+                    **response_capture,
+                    "state": "withdrawn",
+                    "teardown_state": "confirmed",
+                }
+                response_data["stop_requested"] = True
+                row["data"] = response_data
+        log_event(
+            "bot_spawn_raced_stop_torn_down",
+            audience="system",
+            level="warning",
+            span="bots.create",
+            user_id=user_id,
+            meeting_id=str(meeting_id),
+            fields={
+                "workload_id": workload_id,
+                "raced_status": raced_status,
+                "already_confirmed": teardown_already_confirmed,
+            },
+        )
 
     # The response lists the meeting's sessions (P3c) — all session_uids that ran against this row.
     sessions = await repo.list_sessions(meeting_id=meeting_id)

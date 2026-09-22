@@ -1,6 +1,7 @@
 /** SSE proxy — forwards the live meeting feed (transcript + copilot cards) from agent-api. */
 import type { NextRequest } from "next/server";
 import { resolveApiKey } from "../../proxyAuth";
+import { credentialedFetch } from "../../credentialedFetch";
 
 export const dynamic = "force-dynamic";
 
@@ -9,7 +10,7 @@ const GATEWAY_URL = (process.env.GATEWAY_URL || "http://127.0.0.1:18056").replac
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
+  "Cache-Control": "no-store",
   "X-Accel-Buffering": "no",
 } as const;
 
@@ -63,6 +64,13 @@ function proxyStream(upstreamBody: ReadableStream<Uint8Array>, abort: AbortContr
 }
 
 export async function GET(req: NextRequest) {
+  const apiKey = await resolveApiKey();
+  if (!apiKey) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
   // Tie the upstream fetch lifetime to this request. Aborting also unblocks an
   // in-flight reader.read(), so the pump's catch path closes the downstream.
   const abort = new AbortController();
@@ -70,8 +78,7 @@ export async function GET(req: NextRequest) {
   req.signal.addEventListener("abort", onClientGone);
 
   try {
-    const apiKey = await resolveApiKey();
-    const headers: Record<string, string> = apiKey ? { "X-API-Key": apiKey } : {};
+    const headers: Record<string, string> = { "X-API-Key": apiKey };
     // Forward Last-Event-ID so the live feed RESUMES from the client's last-seen segment after a
     // reconnect (gapless). Without it, a transient disconnect dropped every segment published in the
     // gap from the live view — the real-time transcript-loss bug. The browser EventSource sets this
@@ -80,15 +87,15 @@ export async function GET(req: NextRequest) {
     // param (the engine's manual forceReconnect, which opens a fresh EventSource that drops the header).
     const lastEventId = req.headers.get("last-event-id") || req.nextUrl.searchParams.get("lid");
     if (lastEventId) headers["Last-Event-ID"] = lastEventId;
-    const upstream = await fetch(`${GATEWAY_URL}/agent/meeting/stream${req.nextUrl.search}`, {
+    const upstream = await credentialedFetch(`${GATEWAY_URL}/agent/meeting/stream${req.nextUrl.search}`, {
       method: "GET",
       headers,
       signal: abort.signal,
     });
     if (!upstream.ok) {
-      const detail = (await upstream.text().catch(() => "")).trim().replace(/\s+/g, " ");
+      await upstream.body?.cancel("untrusted upstream error").catch(() => undefined);
       req.signal.removeEventListener("abort", onClientGone);
-      return sseError(detail || `agent-api stream returned ${upstream.status}`, upstream.status);
+      return sseError(`agent-api stream returned ${upstream.status}`, upstream.status);
     }
     if (!upstream.body) {
       req.signal.removeEventListener("abort", onClientGone);
@@ -98,10 +105,9 @@ export async function GET(req: NextRequest) {
       status: upstream.status,
       headers: SSE_HEADERS,
     });
-  } catch (err) {
+  } catch {
     req.signal.removeEventListener("abort", onClientGone);
-    console.error("[terminal-api] meeting stream proxy failed", err);
-    const message = err instanceof Error && err.message ? err.message : "upstream unavailable";
-    return sseError(message, 502);
+    console.error("[terminal-api] meeting stream proxy failed");
+    return sseError("upstream unavailable", 502);
   }
 }

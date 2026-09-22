@@ -159,7 +159,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     } catch (e) {
       // Already admitted (the browser is seated in the meeting) → LEAVE before exiting, or we
       // strand a ghost participant. Best-effort; never masks the failure.
-      deps.recording?.close(recordingKey);
+      await Promise.resolve(deps.recording?.close(recordingKey)).catch(() => { /* preserve start failure */ });
       await deps.join.leave('pipeline_start_failed').catch(() => { /* best-effort */ });
       await emit('failed', { failure_stage: 'active', completion_reason: 'join_failure', reason: String(e), exit_code: 1 });
       return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
@@ -177,7 +177,15 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     unsubscribe();
     stopRemoval();
     await deps.pipeline.stop().catch(() => { /* best-effort */ });
-    deps.recording?.close(recordingKey);
+    let recordingFailure = false;
+    try {
+      // Managed recording close uploads (or awaits) the contiguous final signal. Do not emit a
+      // terminal lifecycle event while that content write is still fire-and-forget in the worker.
+      await Promise.resolve(deps.recording?.close(recordingKey));
+    } catch {
+      recordingFailure = true;
+      console.error('[bot] orchestrator: recording final upload failed');
+    }
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
     // the disposable worker past its SIGKILL grace — that would cut off the recording-master
     // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.
@@ -185,6 +193,14 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       deps.join.leave(reason).catch(() => { /* best-effort */ }),
       new Promise<void>((resolve) => setTimeout(resolve, 8000)),
     ]);
+
+    if (recordingFailure) {
+      await emit('failed', {
+        failure_stage: 'active', completion_reason: 'join_failure',
+        reason: 'recording final upload failed', exit_code: 1,
+      });
+      return { exitCode: 1, status: 'failed', completionReason: 'join_failure' };
+    }
 
     console.error(`[bot] orchestrator: emitting completed (reason=${reason}, from=${cur})`);
     try {

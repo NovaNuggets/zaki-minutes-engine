@@ -68,8 +68,11 @@ sha256 per contract; CI fails if a sealed schema drifts. Grouped by owning modul
 | `invocation.v1` | meeting-api → bot (`VEXA_BOT_CONFIG`) | The bot's constructor, validated at boot (fail-fast). |
 | `acts.v1` | control-plane → bot (redis pub/sub) | The bot command bus; unknown actions ignored (forward-compatible). |
 | `webhook.v1` | control-plane → subscriber URLs | Outbound delivery envelope + signed-header scheme. |
+| `minutes-finalized.v1` | meeting-api → operator Minutes Hub | Exact content-free transcript-finalized envelope + non-bearer HMAC headers. |
 | `captured-signal.v1` | bot capture bridge → eval replay | Raw capture signal teed before the pipeline — replays offline (O-TEL-2). |
 | `flagged-issue.v1` | user / system → eval | A flagged transcript/attribution bug → reproducible offline test (O-TEL-3). |
+| `agent-control.v1` | meeting-api → agent-api | Secret-protected exact-row owner and canonical generated-doc responses. |
+| `zaki-read.v1` | meeting-api → agent worker (`minutes_read`) | Bounded owner-scoped meeting/transcript/summary reads with retention and sensitivity labels. |
 
 ### core/gateway
 

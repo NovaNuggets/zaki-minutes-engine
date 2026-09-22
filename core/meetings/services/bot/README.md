@@ -16,8 +16,8 @@ composition root (`src/index.ts`).
 |---|---|---|---|
 | consumes | scheduler / meeting-api (spawner) | `invocation.v1` in `VEXA_BOT_CONFIG` env | boot config: meeting URL, platform, ids, callback/upload URLs, secrets |
 | spawns-over | `@vexa/join` + `@vexa/remote-browser` | in-process port (`JoinDriver`) | join/leave/removal over a humanized browser page |
-| publishes | collector [Py] | redis stream `transcription_segments` (XADD) | `transcript.v1` durable segment feed |
-| publishes | gateway → dashboard | redis pub/sub `tc:meeting:{id}:mutable` | live mutable `transcript.v1` segment |
+| publishes | collector [Py] | redis stream `transcription_segments` (XADD `MAXLEN ~ 100000`) | storage-bounded `transcript.v1` feed shared by collector + agent-watcher; approximate trim can sacrifice unread delivery under extreme lag |
+| publishes | gateway → dashboard | redis pub/sub `tc:meeting:{id}:mutable` | live mutable `transcript.v1` segment; source XADD + mutable PUBLISH share one atomic raw-retention fence check |
 | produces | meeting-api | HTTP POST → `inv.meetingApiCallbackUrl` | `lifecycle.v1` status events (retry/backoff) |
 | produces | meeting-api | HTTP POST → `inv.recordingUploadUrl` | assembled recording master (multipart) |
 | consumes | gateway (commands) | redis pub/sub `bot_commands:meeting:{id}` | `acts.v1` commands (e.g. `speak` / `speak_stop`) |
@@ -30,6 +30,20 @@ composition root (`src/index.ts`).
 [`lifecycle.v1`](../../contracts/lifecycle.v1) (status it produces),
 [`transcript.v1`](../../contracts/transcript.v1) (segments it publishes). All four are TS-mirrored
 in `src/contracts.ts` and validated against the sealed registry goldens (`contracts.seal.json`).
+For a production invocation, the numeric meeting row id also selects the permanent Minutes
+retention hash `zaki:retention:meeting:{row_id}:fence`. Transcript egress checks `raw` and performs
+the source XADD plus mutable PUBLISH in the same Redis Lua command; a fence or Redis/script failure
+therefore cannot be bypassed by a delayed bot buffer.
+For a managed capture, `captureExpiresAt` is the frozen earliest absolute audio/transcript/summary
+deadline. The bot arms a guard five seconds before it, first synchronously latches both in-process
+content sinks closed, then gives the monotonic raw+processed Redis fence a bounded four-second
+budget, and requests graceful stop regardless of the fence result. Thus Redis recovery during a
+final flush cannot append or assemble an upload even if the remote fence timed out. The transcript
+Lua also compares Redis `TIME` against the cutoff, covering a write command issued before the local
+latch but executed after expiry. Deadlines longer than one day use bounded re-arming timer chunks,
+never a `setTimeout` value that Node would overflow to an immediate callback. The runtime workload's
+`maxLifetimeSec` is the independent hard-stop backstop. Meeting-api recording writes also check the
+audio scope's absolute deadline, so an upload already in flight fails closed once due.
 
 ## Isolated evaluation
 

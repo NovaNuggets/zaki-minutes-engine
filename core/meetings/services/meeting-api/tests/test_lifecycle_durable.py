@@ -13,8 +13,10 @@ and a same-status redelivery is an idempotent 200 no-op.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
+import httpx
 from fastapi.testclient import TestClient
 
 from meeting_api import create_app
@@ -198,3 +200,107 @@ def test_no_publish_on_idempotent_replay(goldens):
     n_after_first = len(redis.published)
     client.post(ENDPOINT, json=goldens["completed-stopped"])  # redelivery
     assert len(redis.published) == n_after_first, "duplicate publish on idempotent replay"
+
+
+def test_persistence_failure_returns_503_and_retry_reapplies_the_transition():
+    """The callback is an at-least-once durability seam: no commit means no 200 and no local no-op."""
+
+    class _FailOnceRepo(InMemoryMeetingRepo):
+        fail_next = True
+
+        async def update_meeting_status(self, **kwargs):
+            if self.fail_next:
+                self.fail_next = False
+                raise OSError("database temporarily unavailable")
+            return await super().update_meeting_status(**kwargs)
+
+    repo = _FailOnceRepo()
+    import asyncio
+
+    meeting = asyncio.run(
+        repo.create_meeting(
+            user_id=1,
+            platform="google_meet",
+            native_meeting_id="m1",
+            data={},
+        )
+    )
+    asyncio.run(repo.create_session(meeting_id=meeting["id"], session_uid="sess-uid"))
+    app = create_app(meeting_repo=repo)
+    client = TestClient(app)
+    event = {"connection_id": "sess-uid", "status": "joining"}
+
+    first = client.post(ENDPOINT, json=event)
+    second = client.post(ENDPOINT, json=event)
+
+    assert first.status_code == 503, first.text
+    assert first.json()["detail"] == "lifecycle state was not committed; retry"
+    assert second.status_code == 200, second.text
+    assert asyncio.run(repo.get_status_by_session(session_uid="sess-uid")) == "joining"
+    assert len(app.state.status_change_webhooks) == 1
+
+
+def test_cross_replica_stale_writer_cannot_resurrect_active_after_completed():
+    """A DB-transaction CAS, not a process-local lock, protects two independent app replicas."""
+
+    class _InterleavingRepo(InMemoryMeetingRepo):
+        def __init__(self):
+            super().__init__()
+            self.first_active_started = asyncio.Event()
+            self.release_first_active = asyncio.Event()
+            self._hold_first_active = True
+
+        async def update_meeting_status(self, **kwargs):
+            if kwargs.get("status") == "active" and self._hold_first_active:
+                self._hold_first_active = False
+                self.first_active_started.set()
+                await self.release_first_active.wait()
+            return await super().update_meeting_status(**kwargs)
+
+    async def scenario():
+        repo = _InterleavingRepo()
+        meeting = await repo.create_meeting(
+            user_id=1,
+            platform="google_meet",
+            native_meeting_id="race",
+            data={},
+        )
+        await repo.create_session(meeting_id=meeting["id"], session_uid="race-session")
+        repo.set_status(meeting["id"], "joining")
+
+        slow_app = create_app(meeting_repo=repo)
+        fast_app = create_app(meeting_repo=repo)
+        slow_transport = httpx.ASGITransport(app=slow_app)
+        fast_transport = httpx.ASGITransport(app=fast_app)
+        async with (
+            httpx.AsyncClient(transport=slow_transport, base_url="http://slow") as slow,
+            httpx.AsyncClient(transport=fast_transport, base_url="http://fast") as fast,
+        ):
+            stale_active = asyncio.create_task(
+                slow.post(ENDPOINT, json={"connection_id": "race-session", "status": "active"})
+            )
+            await repo.first_active_started.wait()
+
+            active = await fast.post(
+                ENDPOINT,
+                json={"connection_id": "race-session", "status": "active"},
+            )
+            completed = await fast.post(
+                ENDPOINT,
+                json={
+                    "connection_id": "race-session",
+                    "status": "completed",
+                    "completion_reason": "left_alone",
+                },
+            )
+            repo.release_first_active.set()
+            stale = await stale_active
+
+        return repo, meeting, active, completed, stale
+
+    repo, meeting, active, completed, stale = asyncio.run(scenario())
+
+    assert active.status_code == 200, active.text
+    assert completed.status_code == 200, completed.text
+    assert stale.status_code == 503, stale.text
+    assert repo._meetings[meeting["id"]]["status"] == "completed"

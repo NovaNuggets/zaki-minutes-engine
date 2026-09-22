@@ -147,8 +147,8 @@ export function App() {
   return (
     <AuthGate>
       <InviteGate>
-        {/* SetupGate: the bootstrap-claimed admin's first-run wizard (models + transcription,
-            smoke-tested). Non-admins and completed instances fall straight through. */}
+        {/* SetupGate: the bootstrap-claimed admin's first-run configuration wizard (models +
+            transcription). Non-admins and completed instances fall straight through. */}
         <SetupGate>
           <OnboardingGate>
             <ServicesProvider container={container}>

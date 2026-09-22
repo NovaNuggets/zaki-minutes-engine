@@ -26,6 +26,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
+from shared.http import open_no_redirect, read_json_bounded
+
 logger = logging.getLogger("agent_api.schedule_digest")
 
 # Section caps — the digest is a DIGEST: bounded, scannable, ~15 lines.
@@ -36,6 +38,9 @@ MAX_UPCOMING = 5
 MAX_RECENT = 3
 TITLE_MAX = 60
 DIGEST_CHAR_CAP = 1600  # hard stop — a digest must never blow the prompt budget
+MAX_PAGE_ROWS = 100
+MAX_WORKSPACE_HEADERS = 100
+MAX_IDENTITY_HEADER_BYTES = 8192
 
 # statuses (mirrors meeting_steering's phase model — kept literal here so this module stays
 # importable without it)
@@ -56,16 +61,30 @@ def fetch_user_meetings(meeting_api_url: str, user_id: str,
     base = (meeting_api_url or "").rstrip("/")
     if not base:
         return []
-    headers = {"X-User-Id": str(user_id)}
+    subject = str(user_id)
+    if not subject or len(subject.encode("utf-8")) > 128 or any(ord(c) < 0x20 for c in subject):
+        raise ValueError("invalid schedule subject")
+    headers = {"X-User-Id": subject}
     if member_workspaces:
-        headers["X-User-Workspaces"] = ",".join(member_workspaces)
+        if len(member_workspaces) > MAX_WORKSPACE_HEADERS:
+            raise ValueError("too many schedule workspace memberships")
+        workspace_header = ",".join(str(value) for value in member_workspaces)
+        if (len(workspace_header.encode("utf-8")) > MAX_IDENTITY_HEADER_BYTES
+                or any(ord(c) < 0x20 for c in workspace_header)):
+            raise ValueError("invalid schedule workspace memberships")
+        headers["X-User-Workspaces"] = workspace_header
 
     def _page(query: str) -> "list[dict]":
         req = urllib.request.Request(f"{base}/meetings?{query}", headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 — internal service URL
-            body = json.loads(resp.read().decode("utf-8"))
+        with open_no_redirect(req, timeout=timeout_s) as resp:
+            body = read_json_bounded(resp)
         rows = body.get("meetings") if isinstance(body, dict) else None
-        return rows if isinstance(rows, list) else []
+        if rows is None:
+            return []
+        if (not isinstance(rows, list) or len(rows) > MAX_PAGE_ROWS
+                or any(not isinstance(row, dict) for row in rows)):
+            raise ValueError("invalid meetings response")
+        return rows
 
     merged: "dict[int, dict]" = {}
     for q in ("status=scheduled&limit=100", "status=idle&limit=50",

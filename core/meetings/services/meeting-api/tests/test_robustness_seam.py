@@ -40,10 +40,10 @@ LIFECYCLE_ENDPOINT = "/bots/internal/callback/lifecycle"
 
 @pytest.fixture(autouse=True)
 def _admin_token(monkeypatch):
-    """The POST /bots route mints a MeetingToken signed with ADMIN_TOKEN — set it for every test so
+    """The POST /bots route mints a MeetingToken signed with MEETING_TOKEN_SECRET — set it for every test so
     the route-level spawns don't fail on a missing secret (the service-level spawns pass token_secret
     explicitly, but the create_app-routed ones go through the env)."""
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -503,6 +503,10 @@ async def test_http_runtime_client_delete_404_raises_workload_unknown():
     with pytest.raises(SpawnFailed):
         await rt500.delete_workload("mtg-2-d93eee39")
 
+    rt302 = HttpRuntimeClient(_StubHttp(302), "http://runtime:8090")
+    with pytest.raises(SpawnFailed):
+        await rt302.delete_workload("mtg-2-d93eee39")
+
     ok = _StubHttp(200)
     await HttpRuntimeClient(ok, "http://runtime:8090").delete_workload("mtg-2-d93eee39")
     assert ok.deleted == ["http://runtime:8090/workloads/mtg-2-d93eee39"]
@@ -788,37 +792,40 @@ def _assert_concurrent_dedup():
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
-# (A4) missing ADMIN_TOKEN → fail-fast at startup (a misconfig refuses to boot, not 500-per-spawn)
+# (A4) missing MEETING_TOKEN_SECRET → fail-fast at startup (a misconfig refuses to boot, not 500-per-spawn)
 # ──────────────────────────────────────────────────────────────────────────────────────────────
 
 
 def test_startup_requires_admin_token(monkeypatch):
     """FIXED (A4): the production boot (__main__._require_config, called by build_production_app)
-    REFUSES to start when ADMIN_TOKEN is unset — a clear RuntimeError naming the missing var — instead
+    REFUSES to start when MEETING_TOKEN_SECRET is unset — a clear RuntimeError naming the missing var — instead
     of booting fine and 500-ing every POST /bots when mint_meeting_token hits the missing secret deep
     in the request path. So a misconfigured deploy fails loud at boot (P18)."""
     import meeting_api.__main__ as entry
 
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("MEETING_TOKEN_SECRET", raising=False)
     with pytest.raises(RuntimeError) as ei:
         entry._require_config()
     msg = str(ei.value)
-    assert "ADMIN_TOKEN" in msg, f"the error must name the missing var, got: {msg!r}"
+    assert "MEETING_TOKEN_SECRET" in msg, f"the error must name the missing var, got: {msg!r}"
 
     # And with it set, the config check passes (the happy path the deploy actually runs).
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
+    monkeypatch.setenv("INTERNAL_API_SECRET", "platform-internal-secret")
+    monkeypatch.setenv("RUNTIME_CONTROL_SECRET", "runtime-control-secret")
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "runtime-callback-secret")
     entry._require_config()  # must not raise
 
 
 def test_mint_meeting_token_surfaces_clear_config_error(monkeypatch):
-    """The per-request mint also surfaces a CLEAR error (not a cryptic crypto failure) when ADMIN_TOKEN
+    """The per-request mint also surfaces a CLEAR error (not a cryptic crypto failure) when MEETING_TOKEN_SECRET
     is unset — the deep cause the A4 startup gate prevents reaching in production."""
     from meeting_api.bot_spawn.invocation import mint_meeting_token
 
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("MEETING_TOKEN_SECRET", raising=False)
     with pytest.raises(ValueError) as ei:
-        mint_meeting_token(1, USER, "google_meet", "x")
-    assert "ADMIN_TOKEN" in str(ei.value)
+        mint_meeting_token(1, USER, "google_meet", "x", session_uid="sess")
+    assert "MEETING_TOKEN_SECRET" in str(ei.value)
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -861,3 +868,42 @@ def test_spawn_reconciles_a_stop_that_raced_the_boot():
                     json={"platform": "google_meet", "native_meeting_id": "raced-spawn"})
     assert r.status_code == 201, r.text
     assert runtime.deleted, "spawn must tear down the workload when a stop raced its boot (no orphan)"
+
+
+def test_noncapture_terminal_race_does_not_turn_runtime_404_into_capture_teardown_error():
+    """A normal bot can finish and disappear before spawn's raced-stop reconciliation DELETE.
+
+    Runtime 404 is not proof for a withdrawn capture, but an ordinary meeting already carrying a
+    durable terminal lifecycle must keep its successful terminal response instead of being mapped
+    to the capture-only ``teardown_unconfirmed`` failure.
+    """
+    from meeting_api.bot_spawn.ports import WorkloadUnknown
+
+    class _CompletedRacesRepo(InMemoryMeetingRepo):
+        async def set_bot_container(self, *, meeting_id, bot_container_id):
+            row = await super().set_bot_container(
+                meeting_id=meeting_id,
+                bot_container_id=bot_container_id,
+            )
+            self._meetings[meeting_id]["status"] = "completed"
+            self._meetings[meeting_id]["end_time"] = "2026-07-15T10:00:00Z"
+            self._meetings[meeting_id]["data"]["completion_reason"] = "left_alone"
+            return row
+
+    class _AlreadyGoneRuntime(FakeRuntimeClient):
+        async def delete_workload(self, workload_id: str) -> None:
+            raise WorkloadUnknown(workload_id)
+
+    client = TestClient(
+        create_app(meeting_repo=_CompletedRacesRepo(), runtime=_AlreadyGoneRuntime())
+    )
+
+    response = client.post(
+        "/bots",
+        headers={"x-user-id": str(USER)},
+        json={"platform": "google_meet", "native_meeting_id": "natural-finish-race"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "completed"
+    assert response.json()["data"]["completion_reason"] == "left_alone"

@@ -111,3 +111,35 @@ def test_fetch_ics_error_taxonomy(monkeypatch, body, status, expect):
         assert err is None and text is not None
     else:
         assert text is None and expect in (err or "")
+
+
+def test_fetch_ics_stops_streaming_as_soon_as_two_megabyte_cap_is_crossed(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from meeting_api.calendar_sync import adapters as cal_adapters
+
+    class OversizeStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.read_after_limit = False
+
+        async def __aiter__(self):
+            yield b"BEGIN:VCALENDAR\n" + b"x" * cal_adapters.MAX_ICS_BYTES
+            self.read_after_limit = True
+            yield b"must not be consumed"
+
+    stream = OversizeStream()
+
+    def fake_transport():
+        return httpx.MockTransport(
+            lambda request: httpx.Response(200, stream=stream, request=request)
+        )
+
+    import meeting_api.webhooks.ssrf as ssrf
+    monkeypatch.setattr(ssrf, "build_pinned_transport", fake_transport)
+
+    text, err = asyncio.run(cal_adapters.fetch_ics("https://calendar.example.com/huge.ics"))
+
+    assert text is None and err == "the feed is too large (over 2 MB)"
+    assert stream.read_after_limit is False

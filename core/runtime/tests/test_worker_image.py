@@ -154,6 +154,7 @@ def test_worker_create_spec_injects_anthropic_route_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://openrouter.ai/api")
     monkeypatch.setenv("ANTHROPIC_MODEL", "deepseek/deepseek-v4-pro")
     monkeypatch.setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek/deepseek-v4-flash")
+    monkeypatch.setenv("HOST_CLAUDE_CREDENTIALS", "/host/operator/.claude/.credentials.json")
     b, sess = _backend(routes)
     captured = {}
     orig = sess.request
@@ -166,11 +167,60 @@ def test_worker_create_spec_injects_anthropic_route_env(monkeypatch):
     sess.request = spy
     b.start(
         "agent-foo-chat",
-        Runnable(image=TARGET, command=["python", "-m", "worker"]),
-        {"ANTHROPIC_AUTH_TOKEN": "dispatch-wins"},
+        Runnable(
+            image=TARGET,
+            command=["python", "-m", "worker"],
+            broker_model_credentials=True,
+        ),
+        {
+            "VEXA_UNIT_ID": "unit-1",
+            "VEXA_AGENT_IDENTITY_TOKEN": "scoped-token",
+            "ANTHROPIC_AUTH_TOKEN": "dispatch-wins",
+        },
     )
     env = dict(item.split("=", 1) for item in captured["Env"])
     assert env["ANTHROPIC_AUTH_TOKEN"] == "dispatch-wins"
     assert env["ANTHROPIC_BASE_URL"] == "https://openrouter.ai/api"
     assert env["ANTHROPIC_MODEL"] == "deepseek/deepseek-v4-pro"
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "deepseek/deepseek-v4-flash"
+    assert (
+        "/host/operator/.claude/.credentials.json:/root/.claude/.credentials.json:ro"
+        in captured["HostConfig"]["Binds"]
+    )
+
+
+def test_meeting_bot_never_receives_runtime_model_credentials_or_subscription_mount(monkeypatch):
+    routes = {
+        ("POST", "/containers/create"): FakeResp(201, body={"Id": "cid123"}),
+        ("POST", "/containers/cid123/start"): FakeResp(204),
+    }
+    monkeypatch.setenv("HOST_CLAUDE_CREDENTIALS", "/host/operator/.claude/.credentials.json")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-model-key")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "operator-oauth")
+    b, sess = _backend(routes)
+    captured = {}
+    orig = sess.request
+
+    def spy(method, url, **kw):
+        if method == "POST" and "/containers/create" in url:
+            captured.update(kw.get("json", {}))
+        return orig(method, url, **kw)
+
+    sess.request = spy
+    b.start(
+        "mtg-42-session",
+        Runnable(image="vexaai/v012-bot:dev", command=["node", "dist/index.js"]),
+        {
+            "VEXA_BOT_CONFIG": "{}",
+            # Workload env is caller data, not authority to opt into runtime-owned credentials.
+            "VEXA_UNIT_ID": "spoofed-unit",
+            "VEXA_AGENT_IDENTITY_TOKEN": "spoofed-token",
+        },
+    )
+    env = dict(item.split("=", 1) for item in captured["Env"])
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+    assert not any(
+        bind.startswith("/host/operator/.claude/.credentials.json:")
+        for bind in captured["HostConfig"].get("Binds", [])
+    )

@@ -39,6 +39,13 @@ from meeting_api.lifecycle.machine import (
 
 LIFECYCLE = "/bots/internal/callback/lifecycle"
 RUNTIME = "/runtime/callback"
+RUNTIME_CALLBACK_SECRET = "runtime-callback-test-secret"
+RUNTIME_HEADERS = {"X-Runtime-Callback-Secret": RUNTIME_CALLBACK_SECRET}
+RUNTIME_AT = "2026-07-15T12:00:00Z"
+
+
+def _secured_app(**kwargs):
+    return create_app(runtime_callback_secret=RUNTIME_CALLBACK_SECRET, **kwargs)
 
 
 class _StreamRedis:
@@ -104,7 +111,7 @@ def test_runtime_destroy_completes_stopping_after_only_joining_e2e():
         repo = _ReaperRepo()
         m = await _seed(repo)   # requested; the joining callback then sets store = JOINING, DB = joining
         redis = _StreamRedis()
-        app = create_app(meeting_repo=repo, redis=redis)
+        app = _secured_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             # The bot's only lifecycle event lands: joining. In-process FSM record → JOINING.
             r = await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": "joining"})
@@ -115,7 +122,11 @@ def test_runtime_destroy_completes_stopping_after_only_joining_e2e():
             assert repo.list_stale_stopping_sync() == [(m["id"], "sess-uid", "wl-1")]
 
             # The runtime confirms the workload destroyed → the REAL handler drives the synthetic terminal.
-            rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
+            rc = await c.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
             assert rc.status_code == 200, rc.text
         return repo, redis, m
 
@@ -139,12 +150,16 @@ def test_runtime_destroy_completes_stopping_after_active_e2e():
         repo = _ReaperRepo()
         m = await _seed(repo)  # requested → the callbacks walk it up to active
         redis = _StreamRedis()
-        app = create_app(meeting_repo=repo, redis=redis)
+        app = _secured_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             for st in ("joining", "active"):
                 assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
             repo.set_status(m["id"], "stopping")
-            rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
+            rc = await c.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
             assert rc.status_code == 200, rc.text
         return repo, redis, m
 
@@ -163,11 +178,15 @@ def test_runtime_destroy_fails_pre_active_e2e():
         repo = _ReaperRepo()
         m = await _seed(repo)  # requested → callbacks walk it to awaiting_admission
         redis = _StreamRedis()
-        app = create_app(meeting_repo=repo, redis=redis)
+        app = _secured_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             for st in ("joining", "awaiting_admission"):
                 assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
-            rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
+            rc = await c.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
             assert rc.status_code == 200, rc.text
         return repo, redis, m
 
@@ -184,14 +203,18 @@ def test_runtime_destroy_noop_on_already_terminal_e2e():
         repo = _ReaperRepo()
         m = await _seed(repo)
         redis = _StreamRedis()
-        app = create_app(meeting_repo=repo, redis=redis)
+        app = _secured_app(meeting_repo=repo, redis=redis)
         async with _asgi(app) as c:
             for st in ("joining", "active", "completed"):
                 ev = {"connection_id": "sess-uid", "status": st}
                 if st == "completed":
                     ev["completion_reason"] = "left_alone"
                 assert (await c.post(LIFECYCLE, json=ev)).status_code == 200
-            rc = await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "destroyed"})
+            rc = await c.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
             assert rc.status_code == 200, rc.text
         return repo, redis, m
 
@@ -208,16 +231,71 @@ def test_runtime_nonterminal_state_does_not_advance_e2e():
     async def scenario():
         repo = _ReaperRepo()
         m = await _seed(repo)
-        app = create_app(meeting_repo=repo)
+        app = _secured_app(meeting_repo=repo)
         async with _asgi(app) as c:
             for st in ("joining", "active"):
                 assert (await c.post(LIFECYCLE, json={"connection_id": "sess-uid", "status": st})).status_code == 200
             repo.set_status(m["id"], "stopping")
-            assert (await c.post(RUNTIME, json={"workloadId": "wl-1", "state": "running"})).status_code == 200
+            assert (
+                await c.post(
+                    RUNTIME,
+                    headers=RUNTIME_HEADERS,
+                    json={"workloadId": "wl-1", "state": "running", "at": RUNTIME_AT},
+                )
+            ).status_code == 200
         return repo, m
 
     repo, m = asyncio.run(scenario())
     assert repo._meetings[m["id"]]["status"] == "stopping"
+
+
+def test_runtime_terminal_lookup_failure_is_retryable_503_e2e():
+    """A terminal callback is delivery work: a transient DB lookup error must not be ACKed away."""
+
+    class _LookupFailsRepo(_ReaperRepo):
+        async def find_by_container(self, *, bot_container_id):
+            raise OSError("database temporarily unavailable")
+
+    async def scenario():
+        repo = _LookupFailsRepo()
+        await _seed(repo, status="joining")
+        async with _asgi(_secured_app(meeting_repo=repo)) as client:
+            return await client.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
+
+    response = asyncio.run(scenario())
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "runtime callback processing failed; retry"
+
+
+def test_runtime_terminal_lifecycle_write_failure_is_retryable_503_e2e():
+    """A successful lookup followed by a failed durable terminal write is also delivery failure."""
+
+    class _TerminalWriteFailsRepo(_ReaperRepo):
+        async def update_meeting_status(self, **kwargs):
+            if kwargs.get("status") in ("completed", "failed"):
+                raise OSError("commit failed")
+            return await super().update_meeting_status(**kwargs)
+
+    async def scenario():
+        repo = _TerminalWriteFailsRepo()
+        meeting = await _seed(repo, status="joining")
+        async with _asgi(_secured_app(meeting_repo=repo)) as client:
+            response = await client.post(
+                RUNTIME,
+                headers=RUNTIME_HEADERS,
+                json={"workloadId": "wl-1", "state": "destroyed", "at": RUNTIME_AT},
+            )
+        return repo, meeting, response
+
+    repo, meeting, response = asyncio.run(scenario())
+
+    assert response.status_code == 503, response.text
+    assert repo._meetings[meeting["id"]]["status"] == "joining"
 
 
 # ── PURE FSM UNIT: runtime-destroy forces the terminal edge; illegal edges stay illegal ─────────────

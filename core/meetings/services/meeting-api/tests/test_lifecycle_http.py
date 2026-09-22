@@ -13,6 +13,7 @@ from meeting_api.lifecycle import MeetingStore
 from meeting_api.lifecycle.receiver import conforms, create_app
 
 ENDPOINT = "/bots/internal/callback/lifecycle"
+INTERNAL_SECRET = "lifecycle-test-secret"
 
 
 def _client() -> tuple[TestClient, MeetingStore]:
@@ -25,6 +26,26 @@ def test_health():
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_lifecycle_callback_requires_the_configured_internal_secret_before_parsing():
+    client = TestClient(create_app(internal_secret=INTERNAL_SECRET))
+
+    missing = client.post(ENDPOINT, content=b"not-json")
+    wrong = client.post(
+        ENDPOINT,
+        headers={"X-Internal-Secret": "wrong-secret"},
+        content=b"not-json",
+    )
+    accepted = client.post(
+        ENDPOINT,
+        headers={"X-Internal-Secret": INTERNAL_SECRET},
+        json={"connection_id": "authenticated", "status": "joining"},
+    )
+
+    assert missing.status_code == 403
+    assert wrong.status_code == 403
+    assert accepted.status_code == 200
 
 
 def test_full_lifecycle_over_http_conforms(goldens):
@@ -79,6 +100,35 @@ def test_malformed_event_is_422():
     # Unknown status enum value → also a schema violation.
     r = client.post(ENDPOINT, json={"connection_id": "sess-uid", "status": "bogus"})
     assert r.status_code == 422
+
+
+def test_authenticated_malformed_json_is_a_bounded_400():
+    """A trusted caller can still send truncated JSON; that is a client error, never an ASGI 500."""
+    client = TestClient(create_app(internal_secret=INTERNAL_SECRET))
+
+    response = client.post(
+        ENDPOINT,
+        headers={"X-Internal-Secret": INTERNAL_SECRET, "Content-Type": "application/json"},
+        content=b'{"connection_id":"sess-uid",',
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"status": "error", "detail": "malformed JSON body"}
+
+
+def test_sealed_v1_keeps_accepting_legacy_completed_event_without_completion_reason():
+    client, _ = _client()
+    client.post(ENDPOINT, json={"connection_id": "sess", "status": "joining"})
+    client.post(ENDPOINT, json={"connection_id": "sess", "status": "active"})
+
+    response = client.post(
+        ENDPOINT,
+        json={"connection_id": "sess", "status": "completed", "exit_code": 0},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["meeting_status"] == "completed"
+    assert response.json()["completion_reason"] is None
 
 
 def test_accepted_responses_independent_per_connection(goldens):

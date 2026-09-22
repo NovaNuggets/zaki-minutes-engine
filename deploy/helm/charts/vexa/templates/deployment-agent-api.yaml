@@ -1,3 +1,28 @@
+{{- $reservedAgentEnv := list
+  "VEXA_AGENT_API_PORT" "VEXA_RUNTIME_API_URL" "VEXA_RUNTIME_CONTROL_SECRET"
+  "GATEWAY_IDENTITY_SECRET" "GATEWAY_IDENTITY_PREVIOUS_SECRET"
+  "VEXA_AGENT_API_SELF_URL" "VEXA_GATEWAY_URL" "VEXA_ADMIN_API_URL" "VEXA_MEETING_API_URL"
+  "VEXA_INTERNAL_API_SECRET" "VEXA_REQUIRE_GATEWAY_IDENTITY" "VEXA_AGENT_PROFILE"
+  "VEXA_WORKSPACES_DIR" "VEXA_WORKSPACE_MOUNT_SOURCE" "VEXA_GLOBAL_SYSTEM_WORKSPACE_PATH"
+  "VEXA_GLOBAL_SYSTEM_WORKSPACE_REF" "VEXA_REDIS_URL" "TRANSCRIPTION_SERVICE_URL"
+  "TRANSCRIPTION_SERVICE_TOKEN" "VEXA_DISPATCH_SIGNING_KEY" "VEXA_BOT_API_KEY"
+  "VEXA_AGENT_DEFAULT_SUBJECT" "VEXA_AGENT_MODEL" "VEXA_MEETING_MODEL" "VEXA_LOG_LEVEL"
+  "ANTHROPIC_API_KEY" "ANTHROPIC_AUTH_TOKEN" "ANTHROPIC_BASE_URL" "ANTHROPIC_MODEL"
+  "ANTHROPIC_DEFAULT_OPUS_MODEL" "ANTHROPIC_DEFAULT_SONNET_MODEL"
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL" "CLAUDE_CODE_OAUTH_TOKEN"
+  "ADMIN_TOKEN" "ADMIN_API_TOKEN" "INTERNAL_API_SECRET" "RUNTIME_CONTROL_SECRET"
+  "RUNTIME_CALLBACK_SECRET" "MEETING_TOKEN_SECRET" "REDIS_PASSWORD" "NEXTAUTH_SECRET"
+  "DB_PASSWORD" "MINIO_ROOT_USER" "MINIO_ROOT_PASSWORD" "MINIO_ACCESS_KEY"
+  "MINIO_SECRET_KEY" "GOOGLE_CLIENT_SECRET" "MICROSOFT_CLIENT_SECRET" "VEXA_API_KEY"
+-}}
+{{- if .Values.agentApi.enabled -}}
+{{- range .Values.agentApi.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if or (has $name $reservedAgentEnv) (eq $name "ZAKI_READ_TOKEN_MINUTES") (hasPrefix "ZAKI_MINUTES_" $name) (hasPrefix "ZAKI_AGENT_ERASURE_" $name) (hasPrefix "MINUTES_" $name) -}}
+  {{- fail (printf "agentApi.extraEnv may not override reserved deployment setting %s" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.agentApi.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +43,13 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: agent-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml (mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.agentApi.runAsUser) "fsGroupChangePolicy" "OnRootMismatch")) | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -29,8 +57,8 @@ spec:
       containers:
         - name: agent-api
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.agentApi.image.repository }}:{{ .Values.global.imageTag | default .Values.agentApi.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.agentApi.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.agentApi.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.agentApi.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -40,10 +68,39 @@ spec:
               value: "8100"
             - name: VEXA_RUNTIME_API_URL
               value: "http://{{ include "vexa.componentName" (list . "runtime") }}:{{ .Values.runtime.service.port }}"
+            - name: VEXA_RUNTIME_CONTROL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: RUNTIME_CONTROL_SECRET
             - name: VEXA_AGENT_API_SELF_URL
               value: "http://{{ include "vexa.componentName" (list . "agent-api") }}:{{ .Values.agentApi.service.port }}"
             - name: VEXA_GATEWAY_URL
               value: "http://{{ include "vexa.componentName" (list . "gateway") }}:{{ .Values.gateway.service.port }}"
+            - name: VEXA_ADMIN_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "admin-api") }}:{{ .Values.adminApi.service.port }}"
+            - name: VEXA_MEETING_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "meeting-api") }}:{{ .Values.meetingApi.service.port }}"
+            - name: VEXA_INTERNAL_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: INTERNAL_API_SECRET
+            - name: GATEWAY_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_SECRET
+            - name: GATEWAY_IDENTITY_PREVIOUS_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_PREVIOUS_SECRET
+                  optional: true
+            # Every browser/user edge is gateway-fronted. Reject direct X-User-Id spoofing even
+            # from inside the cluster unless the gateway proves the hop with the shared secret.
+            - name: VEXA_REQUIRE_GATEWAY_IDENTITY
+              value: "true"
             - name: VEXA_AGENT_PROFILE
               value: "agent"
             - name: VEXA_WORKSPACES_DIR
@@ -60,7 +117,17 @@ spec:
             - name: VEXA_GLOBAL_SYSTEM_WORKSPACE_REF
               value: {{ .Values.agentApi.globalSystemWorkspaceRef | default "" | quote }}
             - name: VEXA_REDIS_URL
-              value: {{ include "vexa.redisUrl" . | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: REDIS_URL
+            - name: TRANSCRIPTION_SERVICE_URL
+              value: {{ .Values.meetingApi.transcriptionServiceUrl | default "" | quote }}
+            - name: TRANSCRIPTION_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: TRANSCRIPTION_SERVICE_TOKEN
             - name: VEXA_DISPATCH_SIGNING_KEY
               valueFrom:
                 secretKeyRef:
@@ -73,7 +140,7 @@ spec:
                   key: VEXA_BOT_API_KEY
                   optional: true
             - name: VEXA_AGENT_DEFAULT_SUBJECT
-              value: {{ .Values.agentApi.defaultSubject | default "u_live" | quote }}
+              value: {{ .Values.agentApi.defaultSubject | default "" | quote }}
             - name: VEXA_AGENT_MODEL
               value: {{ .Values.models.agentModel | default "" | quote }}
             - name: VEXA_MEETING_MODEL
@@ -122,6 +189,8 @@ spec:
           volumeMounts:
             - name: workspaces
               mountPath: /workspaces
+            - name: tmp
+              mountPath: /tmp
           startupProbe:
             httpGet:
               path: /health
@@ -146,6 +215,8 @@ spec:
         - name: workspaces
           persistentVolumeClaim:
             claimName: {{ include "vexa.componentName" (list . "agent-workspaces") }}
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -82,8 +82,8 @@ Concretely, three moves:
   with an idempotent proc replay).
 - Deferred, recorded here so they don't get lost: the meetings-internal raw-segment carrier collapse
   (`meeting:{id}:segments` hash and the `tc:…:mutable` pubsub are the same disease intra-domain),
-  proc-stream TTL/GC after durable completion, and retirement of the legacy native-keyed
-  `/api/meeting/start` shape.
+  and proc-stream TTL/GC after durable completion. The legacy native-keyed `/api/meeting/start` shape
+  is retired (`410`); owner-scoped processing requires the numeric row and a generation-bound worker.
 - **Generalizes:** "one writer per carrier" is necessary but not sufficient — SSOT also requires *one
   carrier per fact*, with every additional home explicitly declared as a derivation (and its
   completeness guaranteed by a marker or a deadline, never by timing luck). When two components each

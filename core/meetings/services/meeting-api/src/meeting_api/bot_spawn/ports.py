@@ -15,7 +15,30 @@ supplies the production implementations; the module's tests supply in-process fa
 """
 from __future__ import annotations
 
-from typing import Any, Optional, Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Protocol, runtime_checkable
+
+
+LifecycleWriteDisposition = Literal[
+    "applied",
+    "idempotent",
+    "suppressed",
+    "conflict",
+    "rejected",
+]
+
+
+@dataclass(frozen=True)
+class MeetingStatusWrite:
+    """Outcome of one transactionally guarded lifecycle status write.
+
+    ``conflict`` means the durable row changed after the callback read it and the caller must retry;
+    ``rejected`` means the requested edge would regress or reopen the durable lifecycle.
+    """
+
+    row: dict
+    disposition: LifecycleWriteDisposition
+    previous_status: str
 
 
 @runtime_checkable
@@ -37,6 +60,14 @@ class MeetingRepo(Protocol):
     async def find_latest(self, user_id: int, platform: str, native_meeting_id: str) -> Optional[dict]:
         """The user's MOST-RECENT meeting for ``(platform, native_id)`` regardless of status, or
         ``None``. ``continue_meeting`` reuses this row when it is TERMINAL (completed/failed)."""
+        ...
+
+    async def find_owned_minutes(self, *, user_id: int, meeting_id: int) -> Optional[dict]:
+        """Return one owner-bound managed Minutes row by canonical database id.
+
+        Ordinary Vexa meetings and rows owned by another user are deliberately indistinguishable
+        from absence at this product boundary.
+        """
         ...
 
     async def create_meeting(
@@ -104,6 +135,13 @@ class MeetingRepo(Protocol):
         """Make a pre-workload runtime rejection terminal and merge content-free attribution."""
         ...
 
+    async def confirm_capture_teardown(self, *, meeting_id: int) -> bool:
+        """Atomically confirm teardown and terminalize a nonterminal withdrawal as stopped.
+
+        Preserve an existing completed/failed state and its attribution; ensure a terminal end time.
+        """
+        ...
+
     async def withdraw_capture(
         self,
         *,
@@ -137,6 +175,14 @@ class MeetingRepo(Protocol):
         bot's event (else a terminal event on an empty store creates a status=None record and 409s)."""
         ...
 
+    async def get_meeting_id_by_session(self, *, session_uid: str) -> Optional[int]:
+        """Resolve a bot session to its authoritative meeting row id for token binding.
+
+        Lifecycle authentication calls this before any FSM or database mutation; a token's signed
+        meeting/session pair cannot be swapped across sessions or tenants.
+        """
+        ...
+
     async def update_meeting_status(
         self,
         *,
@@ -145,15 +191,32 @@ class MeetingRepo(Protocol):
         completion_reason: Optional[str] = None,
         failure_stage: Optional[str] = None,
         data: Optional[dict] = None,
-    ) -> Optional[dict]:
-        """Persist a bot ``lifecycle.v1`` advance to the DB meeting row + RETURN the updated row dict
-        (incl. ``data`` — so the lifecycle callback can deliver the per-user webhook from
-        ``meeting.data`` without a second read), or ``None`` for an unknown session. Set
+        expected_status: Optional[str] = None,
+        force_terminal: bool = False,
+    ) -> Optional[MeetingStatusWrite]:
+        """Persist a bot ``lifecycle.v1`` advance under a row lock + durable compare-and-set.
+
+        Return the row and write disposition, or ``None`` for an unknown session. ``expected_status``
+        is the status observed before the FSM advance; a mismatch is a retryable cross-replica CAS
+        conflict. The transaction also rejects regressions and terminal reopens even when no
+        expectation is supplied (for non-callback callers such as user stop). Set
         ``status`` and merge ``completion_reason`` / ``failure_stage`` + the receiver's forensics into
         ``meeting.data`` JSONB. Maps ``session_uid`` (== the bot's ``connectionId``) → meeting via
-        ``meeting_sessions``; a no-op for an unknown session (e.g. a self-host bot). So the live FSM is
-        DURABLE + QUERYABLE (``GET /meetings`` reflects it, survives a restart) — not only the
-        in-process ``MeetingStore``."""
+        ``meeting_sessions``. ``force_terminal`` is limited to the runtime-confirmed-destroy path.
+        So the live FSM is DURABLE + QUERYABLE (``GET /meetings`` reflects it, survives a restart) —
+        not only the in-process ``MeetingStore``."""
+        ...
+
+    async def list_terminal_meeting_ids(
+        self, *, before_id: Optional[int] = None, limit: int = 100
+    ) -> list[int]:
+        """Return terminal meeting row ids newest-first for bounded outbox recovery.
+
+        ``transcript.finalized`` normally records its Redis intent immediately after the
+        terminal status commit.  This read seam closes the unavoidable database→Redis crash
+        window: startup/replay can reconstruct missing content-free intents from the durable
+        terminal projection without reading transcript or user-webhook content.
+        """
         ...
 
 
@@ -174,6 +237,14 @@ class RuntimeClient(Protocol):
         ``WorkloadUnknown`` on a 404 — the kernel does not know the workload, so termination is
         UNCONFIRMED: a container may still be live (a recreated runtime that lost its registry).
         Callers must treat that as failure-to-confirm and fail loud, never as "already gone"."""
+        ...
+
+    async def scrub_workload(self, workload_id: str) -> None:
+        """Idempotently reclaim the substrate object and delete durable runtime launch state.
+
+        Used by GDPR erasure after Minutes has fenced the owned meeting. A clean return is proof
+        that the runtime either reclaimed the workload or confirmed it absent on its substrate.
+        """
         ...
 
     async def get_workload(self, workload_id: str) -> Optional[dict]:
@@ -211,6 +282,15 @@ class SpawnFailed(Exception):
     ALSO raised (ROB3) when a post-spawn DB write fails AFTER the workload was created: the orphaned
     workload is torn down (``RuntimeClient.delete_workload``) and the spawn is re-raised as this, so
     the route maps it to 502 and no inconsistent half-spawned state is left behind."""
+
+
+class TeardownUnconfirmed(SpawnFailed):
+    """Stop intent is durable, but teardown plus terminal evidence is not durably confirmed."""
+
+    code = "teardown_unconfirmed"
+
+    def __init__(self):
+        super().__init__(self.code)
 
 
 class WorkloadUnknown(Exception):

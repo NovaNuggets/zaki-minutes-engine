@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from shared.gitenv import scrubbed_git_env
+from shared.git_auth import git_credential_env
 from shared.seeding import resolve_seed_dir, seed_workspace, validate_seed
 
 log = logging.getLogger(__name__)
@@ -122,44 +123,33 @@ def _slug(repo_url: str) -> str:
     return f"{tail}-{digest}"
 
 
-def _authenticated_url(repo_url: str, token: Optional[str]) -> str:
-    """Embed ``token`` as HTTP basic-auth in an https(/http) URL so a PRIVATE repo can be cloned. SSH/scp
-    URLs (``git@host:org/repo``) and tokenless calls are returned unchanged (key-auth / public)."""
-    if not token or "://" not in repo_url:
-        return repo_url
-    proto, rest = repo_url.split("://", 1)
-    return f"{proto}://{token}@{rest}"
-
-
 def _git_clone(repo_url: str, ref: str, dest: Path, token: Optional[str] = None) -> None:
     """Default clone: clone then checkout ``ref`` (kept separate so a non-default branch/tag/sha works
     regardless of the remote's default branch).
 
-    PRIVATE repos: when a ``token`` is given it is embedded in the clone URL for the network op ONLY, then
-    the persisted ``origin`` is reset to the token-free URL so the credential never lands in the cloned
-    ``.git/config`` or the synced workspace (P15 — mirrors ``GitHubVcs.push``). Git is run with prompts
-    disabled so a missing/invalid credential FAILS LOUD instead of hanging on a terminal prompt. Any
-    failure raises ``CloneError`` with the token redacted from the message."""
+    PRIVATE repos: a GitHub ``token`` is supplied only through an ephemeral askpass helper.  The token-free
+    repo URL is used in argv and therefore becomes the token-free persisted ``origin`` automatically.
+    Prompts stay disabled so a missing/invalid credential fails loud instead of hanging. Any failure raises
+    ``CloneError`` with the token redacted from the message."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # scrubbed env: a hook-exported GIT_DIR would re-point every op below at the hook's repo
-    # (see shared/gitenv.py); prompts stay disabled so a bad credential fails loud.
-    env = scrubbed_git_env(GIT_ASKPASS="true", GIT_TERMINAL_PROMPT="0")
-    url = _authenticated_url(repo_url, token)
 
     def redact(text: str) -> str:
         return text.replace(token, "***") if token else text
 
     try:
-        subprocess.run(["git", "clone", "--quiet", url, str(dest)],
-                       check=True, capture_output=True, text=True, env=env)
-        if token:  # never persist the credential in the cloned repo's origin (P15)
-            subprocess.run(["git", "-C", str(dest), "remote", "set-url", "origin", repo_url],
+        with git_credential_env(repo_url, token) as env:
+            # Do not populate the worktree while the credential exists: checkout filters/hooks are
+            # unrelated to network authentication and must never inherit the token-file capability.
+            subprocess.run(["git", "clone", "--quiet", "--no-checkout", repo_url, str(dest)],
                            check=True, capture_output=True, text=True, env=env)
-        if ref:
-            subprocess.run(["git", "-C", str(dest), "checkout", "--quiet", ref],
-                           check=True, capture_output=True, text=True, env=env)
-    except subprocess.CalledProcessError as exc:
-        raise CloneError(redact((exc.stderr or str(exc)).strip())) from None
+        checkout_env = scrubbed_git_env(GIT_ASKPASS="true", GIT_TERMINAL_PROMPT="0")
+        checkout_env.pop("VEXA_GIT_TOKEN_FILE", None)
+        command = ["checkout", "--quiet", ref] if ref else ["reset", "--hard", "--quiet", "HEAD"]
+        subprocess.run(["git", "-C", str(dest), *command],
+                       check=True, capture_output=True, text=True, env=checkout_env)
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise CloneError(redact(detail.strip())) from None
 
 
 def _safe_subject_dir(root: Path, subject: str) -> Path:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -90,18 +91,54 @@ def build_headers(
     return headers
 
 
-def verify_signature(payload_bytes: bytes, headers: Dict[str, str], secret: str) -> bool:
-    """The symmetric verifier a receiver runs: recompute HMAC over `ts.payload`.
+def verify_signature(
+    payload_bytes: bytes,
+    headers: Dict[str, str],
+    secret: str,
+    *,
+    now: Callable[[], float] = time.time,
+    max_age_seconds: float = 300,
+    max_future_seconds: float = 30,
+) -> bool:
+    """Verify the HMAC and the timestamp's bounded replay window.
 
-    Returns True iff `X-Webhook-Signature` matches `sha256=<hmac(ts.payload)>` for the
-    delivered `X-Webhook-Timestamp` and the shared `secret`. Constant-time compare.
+    The clock is injected so consumers can test the exact boundary. Correctly signed but
+    stale/future payloads are rejected; malformed input returns ``False`` without raising.
     """
     sig = headers.get("X-Webhook-Signature")
     ts = headers.get("X-Webhook-Timestamp")
-    if not sig or not ts:
+    if (
+        not isinstance(sig, str)
+        or not isinstance(ts, str)
+        or not ts.isascii()
+        or not ts.isdigit()
+        or not 1 <= len(ts) <= 20
+    ):
         return False
-    expected = sign_payload(payload_bytes, secret, ts)
-    return hmac.compare_digest(sig, expected)
+    try:
+        current = now()
+        timestamp = int(ts)
+        if (
+            isinstance(current, bool)
+            or not isinstance(current, (int, float))
+            or not math.isfinite(current)
+            or isinstance(max_age_seconds, bool)
+            or not isinstance(max_age_seconds, (int, float))
+            or not math.isfinite(max_age_seconds)
+            or max_age_seconds < 0
+            or isinstance(max_future_seconds, bool)
+            or not isinstance(max_future_seconds, (int, float))
+            or not math.isfinite(max_future_seconds)
+            or max_future_seconds < 0
+        ):
+            return False
+        age = float(current) - timestamp
+        if age > max_age_seconds or age < -max_future_seconds:
+            return False
+        expected = sign_payload(payload_bytes, secret, ts)
+        return hmac.compare_digest(sig, expected)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def is_event_enabled(events_config: Optional[Dict[str, Any]], event_type: str) -> bool:
@@ -180,6 +217,13 @@ class WebhookSink:
         headers = build_headers(webhook_secret, payload_bytes, timestamp=ts)
 
         # 3. Deliver. 2xx → delivered. 5xx/429/transport-error → enqueue for retry.
+        claim_meeting_id = None
+        claim_id = None
+        claim = getattr(self.queue, "claim_delivery", None)
+        if callable(claim):
+            claim_meeting_id, claim_id = await claim(envelope)
+            if claim_meeting_id is not None and claim_id is None:
+                return DeliveryResult(status="suppressed")
         try:
             resp = await self.transport(url, payload_bytes, headers)
             code = getattr(resp, "status_code", 0)
@@ -192,12 +236,18 @@ class WebhookSink:
         except Exception as e:  # noqa: BLE001 — any transport error is retryable
             code = e.code if isinstance(e, _RetryableStatus) else None
             if self.queue is not None:
-                await self.queue.enqueue(
+                queued = await self.queue.enqueue(
                     url=url, envelope=envelope, webhook_secret=webhook_secret,
                     label=label, metadata=metadata,
                 )
+                if queued is False:
+                    return DeliveryResult(status="suppressed")
                 return DeliveryResult(status="queued", status_code=code, queued=True, error=str(e))
             return DeliveryResult(status="failed", status_code=code, error=str(e))
+        finally:
+            release = getattr(self.queue, "release_delivery", None)
+            if callable(release):
+                await release(claim_meeting_id, claim_id)
 
 
 class _RetryableStatus(Exception):

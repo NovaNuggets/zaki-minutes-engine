@@ -1,0 +1,6 @@
+{
+  "Content-Type": "application/json",
+  "X-Webhook-Key-Id": "minutes-platform-2026-07",
+  "X-Webhook-Timestamp": "1784118600",
+  "X-Webhook-Signature": "sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

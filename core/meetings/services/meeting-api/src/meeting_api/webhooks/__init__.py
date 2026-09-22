@@ -35,6 +35,12 @@ from .retry import (
     drain_retry_queue,
 )
 from .ssrf import SSRFError, validate_webhook_url
+from .platform_finalized import (
+    FinalizedAttempt,
+    MinutesPlatformWebhookSink,
+    RedisTranscriptFinalizedOutbox,
+    build_minutes_finalized_envelope,
+)
 
 __all__ = [
     "WEBHOOK_API_VERSION",
@@ -53,4 +59,8 @@ __all__ = [
     "drain_retry_queue",
     "SSRFError",
     "validate_webhook_url",
+    "FinalizedAttempt",
+    "MinutesPlatformWebhookSink",
+    "RedisTranscriptFinalizedOutbox",
+    "build_minutes_finalized_envelope",
 ]

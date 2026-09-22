@@ -12,7 +12,10 @@ active             → completed · failed
 completed          ∅   (terminal)
 failed             ∅   (terminal)
 ```
-`completed` carries a `completion_reason`; `failed` carries a `failure_stage`. The machine-checked
+`completed` normally carries a `completion_reason`; legacy v1 producers may omit it because the
+published v1 ingress remains liberal. The managed Minutes API fails closed when terminal attribution
+is absent. `failed` carries a `failure_stage`. Internal `needs_help` is translated to public
+`needs_human_help` only at API/event boundaries. The machine-checked
 `canTransition` lives in the **runtime/bot implementation** (Stage 2) — the contract documents it; the
 impl enforces it (lean: no separate harness, B8).
 

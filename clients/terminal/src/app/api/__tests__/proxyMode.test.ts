@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { refusedInMeetingsMode, MEETINGS_DOMAIN } from "../proxyMode";
+import { isManagedMinutesPath, refusedInMeetingsMode, MEETINGS_DOMAIN } from "../proxyMode";
 
 /** Meetings-only mode gates the catch-all proxy: agent paths are refused, meeting-domain paths pass.
  *  (NEXT_PUBLIC_* is inlined at build time in the browser bundle, but the server routes read
@@ -25,8 +25,18 @@ describe("proxyMode — meetings-only server gate", () => {
 
   it("MEETINGS_DOMAIN matches whole path segments only (no prefix bleed)", () => {
     expect(MEETINGS_DOMAIN.test("meetings")).toBe(true);
+    expect(MEETINGS_DOMAIN.test("minutes/captures")).toBe(false);
     expect(MEETINGS_DOMAIN.test("meetingsomething")).toBe(false);
+    expect(MEETINGS_DOMAIN.test("minutes-private")).toBe(false);
     expect(MEETINGS_DOMAIN.test("botsy")).toBe(false);
+  });
+
+  it("matches exactly the managed Minutes root and nested paths", () => {
+    expect(isManagedMinutesPath("minutes")).toBe(true);
+    expect(isManagedMinutesPath("minutes/captures")).toBe(true);
+    expect(isManagedMinutesPath("minutes/meetings/42/status")).toBe(true);
+    expect(isManagedMinutesPath("minutes-private")).toBe(false);
+    expect(isManagedMinutesPath("user/minutes")).toBe(false);
   });
 
   it("user self-serve configs route to the gateway ROOT (calendar/webhook live in identity)", () => {

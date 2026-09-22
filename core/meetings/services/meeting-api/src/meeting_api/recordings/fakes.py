@@ -15,6 +15,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
+from ..meeting_writes import content_scopes_are_writable
+
 
 class InMemoryStorage:
     """A dict-backed ``Storage`` (key → bytes)."""
@@ -52,17 +54,18 @@ class InMemoryRecordingRepo:
     """A dict-backed ``RecordingRepo``. ``seed`` plants a meeting + its bot session."""
 
     def __init__(self):
-        # meeting_id -> {user_id, recordings: [...]}; session_uid -> meeting_id
+        # meeting_id -> {user_id, recordings: [...]}; exact meeting/session pairs
         self._meetings: dict[int, dict] = {}
-        self._sessions: dict[str, int] = {}
+        self._sessions: set[tuple[int, str]] = set()
         self._chunk_locks: dict[str, asyncio.Lock] = {}
+        self._manifest_locks: dict[tuple[int, str], asyncio.Lock] = {}
 
     def seed(self, *, meeting_id: int, user_id: int, session_uid: str) -> None:
         self._meetings.setdefault(
             meeting_id,
             {"user_id": user_id, "recordings": [], "recording_prefixes": []},
         )
-        self._sessions[session_uid] = meeting_id
+        self._sessions.add((meeting_id, session_uid))
 
     @asynccontextmanager
     async def recording_write(self, meeting_id: int):
@@ -76,6 +79,12 @@ class InMemoryRecordingRepo:
         async with lock:
             yield
 
+    @asynccontextmanager
+    async def manifest_write(self, recording_id: int, media_type: str):
+        lock = self._manifest_locks.setdefault((int(recording_id), media_type), asyncio.Lock())
+        async with lock:
+            yield
+
     async def register_recording_prefix(self, meeting_id: int, prefix: str) -> None:
         meeting = self._meetings.get(meeting_id)
         if meeting is None:
@@ -83,9 +92,10 @@ class InMemoryRecordingRepo:
         if prefix not in meeting["recording_prefixes"]:
             meeting["recording_prefixes"].append(prefix)
 
-    async def find_session(self, session_uid: str) -> Optional[dict]:
-        mid = self._sessions.get(session_uid)
-        return {"meeting_id": mid, "session_uid": session_uid} if mid is not None else None
+    async def find_session(self, *, meeting_id: int, session_uid: str) -> Optional[dict]:
+        if (meeting_id, session_uid) not in self._sessions:
+            return None
+        return {"meeting_id": meeting_id, "session_uid": session_uid}
 
     async def get_recordings(self, meeting_id: int) -> list[dict]:
         return list(self._meetings.get(meeting_id, {}).get("recordings", []))
@@ -115,7 +125,11 @@ class InMemoryRecordingRepo:
     async def list_meeting_recordings(self, user_id: int) -> list[dict]:
         out: list[dict] = []
         for mid, m in self._meetings.items():
-            if m.get("user_id") == user_id:
+            data = m.get("data", {})
+            if (
+                m.get("user_id") == user_id
+                and content_scopes_are_writable(data, "audio")
+            ):
                 for r in m.get("recordings", []):
                     out.append({**r, "meeting_id": mid})
         return out

@@ -46,9 +46,27 @@ def test_non_expiring_token_never_expires():
 
 
 def test_mint_rejects_unknown_scope():
-    """Minting with a scope outside {bot, tx, browser} is rejected (parent → 422)."""
+    """Minting with a scope outside the sealed capability set is rejected (parent → 422)."""
     with pytest.raises(ValueError):
         mint_token("42", ["admin"])
+
+
+def test_agent_scope_is_a_first_class_capability():
+    token = mint_token(
+        "42", ["agent"], expires_at=NOW + timedelta(hours=1),
+        contract_version="identity.v2",
+    )
+    assert validate_token(token, required_scope="agent", now=NOW) is token
+
+
+def test_identity_v1_never_silently_accepts_the_v2_agent_scope():
+    with pytest.raises(ValueError):
+        mint_token("42", ["agent"], expires_at=NOW + timedelta(hours=1))
+
+
+def test_unknown_identity_contract_version_is_rejected():
+    with pytest.raises(ValueError):
+        mint_token("42", ["bot"], contract_version="identity.v99")
 
 
 def test_mint_rejects_empty_scopes():

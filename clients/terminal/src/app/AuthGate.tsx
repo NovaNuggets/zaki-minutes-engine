@@ -2,14 +2,13 @@
 /** Login gate. Polls /api/auth/me on mount; if unauthenticated, renders the sign-in card.
  *  Primary path is OAuth — Google / Microsoft buttons (next-auth/react `signIn`, which works without a
  *  SessionProvider). Enabled providers are discovered from NextAuth's /api/auth/providers so a deploy
- *  with no OAuth creds simply hides the buttons. The direct email form is kept as a DEBUG path (server
- *  restricts it to addresses containing "test"), tucked behind a toggle. Styled to match the terminal
+ *  with no OAuth creds simply hides the buttons. The direct email form is a default-off, local-only
+ *  DEBUG path whose exact email allowlist is operator-owned, tucked behind a toggle. Styled to match the terminal
  *  (CSS vars from globals.css); does not redesign the workbench.
  *
  *  FIRST RUN: /api/auth/instance says whether an admin exists. On a fresh instance the card becomes
  *  the one-time "Set up your instance" claim screen — first sign-in becomes the admin — through
- *  whatever auth the deploy actually has: OAuth buttons when configured, otherwise the test-mode
- *  direct entry with an honest banner naming the OAuth upgrade path. */
+ *  verified OAuth identity. Direct login can never claim the first administrator. */
 import { useEffect, useState, type FormEvent } from "react";
 import { signIn } from "next-auth/react";
 
@@ -20,6 +19,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<Status>("checking");
   const [providers, setProviders] = useState<Providers>({ google: false, microsoft: false });
   const [adminExists, setAdminExists] = useState(true); // fail-safe: plain sign-in until told otherwise
+  const [directLoginEnabled, setDirectLoginEnabled] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [email, setEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -38,8 +38,12 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       .catch(() => undefined);
     // First-run probe — {admin_exists:false} flips the card into the admin-claim variant.
     fetch("/api/auth/instance", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : { admin_exists: true }))
-      .then((d: { admin_exists?: boolean }) => active && setAdminExists(d.admin_exists !== false))
+      .then((r) => (r.ok ? r.json() : { admin_exists: true, direct_login_enabled: false }))
+      .then((d: { admin_exists?: boolean; direct_login_enabled?: boolean }) => {
+        if (!active) return;
+        setAdminExists(d.admin_exists !== false);
+        setDirectLoginEnabled(d.direct_login_enabled === true);
+      })
       .catch(() => undefined);
     return () => { active = false; };
   }, []);
@@ -91,7 +95,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           <>
             <div style={{ fontSize: 12, color: "var(--t3)", lineHeight: 1.5 }}>
               This Vexa instance has no administrator yet. The first sign-in becomes the admin and can
-              configure models, transcription, and other users.
+              configure models, transcription, and other users. Bootstrap requires Google or Microsoft OAuth.
             </div>
             <div
               style={{
@@ -109,9 +113,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
                   border: "1px solid var(--line2)", borderRadius: 8, padding: "9px 11px",
                 }}
               >
-                ⚠ Test mode — no OAuth configured. Sign-in is limited to emails containing &ldquo;test&rdquo;.
-                For real authentication, acquire Google or Microsoft OAuth credentials and add them to this
-                instance&rsquo;s environment (GOOGLE_CLIENT_ID/SECRET or MICROSOFT_CLIENT_ID/SECRET).
+                No OAuth provider is configured. Add Google or Microsoft OAuth credentials to this
+                instance&rsquo;s environment before claiming the first administrator.
               </div>
             )}
           </>
@@ -130,7 +133,7 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           </button>
         )}
 
-        {hasOAuth && (
+        {hasOAuth && directLoginEnabled && adminExists && (
           <button
             onClick={() => setShowDebug((v) => !v)}
             style={{ background: "none", border: "none", color: "var(--t3)", fontSize: 11, cursor: "pointer", padding: 0, alignSelf: "flex-start" }}
@@ -139,19 +142,17 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           </button>
         )}
 
-        {(!hasOAuth || showDebug) && (
+        {directLoginEnabled && adminExists && (!hasOAuth || showDebug) && (
           <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div style={{ fontSize: 11, color: "var(--t3)", lineHeight: 1.4 }}>
-              {claiming && !hasOAuth
-                ? "Email — must contain “test” (test mode)."
-                : "Debug login — email must contain “test”."}
+              Debug login — this exact email must be present in the operator&rsquo;s local allowlist.
             </div>
             <input
               type="email"
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="you-test@company.com"
+              placeholder="allowed@example.com"
               style={{
                 background: "var(--panel2)", border: "1px solid var(--line2)", borderRadius: 7,
                 padding: "9px 10px", color: "var(--t1)", fontSize: 13, outline: "none",
@@ -171,6 +172,12 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
               {submitting ? "Signing in…" : claiming ? "Sign in as admin" : "Sign in"}
             </button>
           </form>
+        )}
+        {!hasOAuth && !claiming && !directLoginEnabled && (
+          <div style={{ fontSize: 11.5, lineHeight: 1.5, color: "var(--t2)" }}>
+            No sign-in provider is configured. Add Google or Microsoft OAuth, or explicitly configure a
+            local-only direct-login email allowlist.
+          </div>
         )}
         {claiming && (
           <div style={{ fontSize: 10.5, color: "var(--t3)", lineHeight: 1.4 }}>

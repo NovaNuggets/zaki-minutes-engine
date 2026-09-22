@@ -1,8 +1,8 @@
 """Token prefix scoping — derived from `libs/admin-models/admin_models/token_scope.py`.
 
-Format: vxa_<scope>_<random>. Valid scopes are {bot, tx, browser}. Tokens without the vxa_
-prefix are legacy (full access). The DB `api_tokens.scopes` column is authoritative; the prefix
-is a hint used at generation time + backfill.
+Format: vxa_<scope>_<random>. identity.v1 scopes are {bot, tx, browser}; identity.v2 adds agent.
+Tokens without the vxa_ prefix are legacy (full access). The DB `api_tokens.scopes` column is
+authoritative; the prefix is a hint used at generation time + backfill.
 """
 import re
 import secrets
@@ -12,7 +12,13 @@ from typing import Optional, Set
 TOKEN_PREFIX = "vxa"
 TOKEN_PATTERN = re.compile(r"^vxa_([a-z]+)_(.+)$")
 
-VALID_SCOPES: Set[str] = {"bot", "tx", "browser"}
+IDENTITY_V1 = "identity.v1"
+IDENTITY_V2 = "identity.v2"
+CONTRACT_SCOPES = {
+    IDENTITY_V1: frozenset({"bot", "tx", "browser"}),
+    IDENTITY_V2: frozenset({"bot", "tx", "browser", "agent"}),
+}
+VALID_SCOPES: Set[str] = set(CONTRACT_SCOPES[IDENTITY_V2])
 
 
 def generate_prefixed_token(scope: str, length: int = 32) -> str:

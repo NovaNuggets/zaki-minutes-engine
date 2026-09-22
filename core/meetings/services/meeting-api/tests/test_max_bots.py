@@ -168,7 +168,7 @@ def _client(repo, runtime):
 
 
 def test_route_429_on_max_bots_precheck(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     client = _client(repo, runtime)
     headers = {"x-user-id": str(USER), "x-user-limits": "1"}
@@ -181,7 +181,7 @@ def test_route_429_on_max_bots_precheck(monkeypatch):
 
 
 def test_route_429_on_runtime_backstop(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient(quota_exceeded=True)
     client = _client(repo, runtime)
     # no x-user-limits header → no pre-check; the kernel backstop still yields 429
@@ -193,7 +193,7 @@ def test_route_429_on_runtime_backstop(monkeypatch):
 def test_route_429_on_cap_zero_and_cap_one_still_admits_one(monkeypatch):
     """x-user-limits: 0 → the FIRST POST /bots is 429 (was 201/unlimited — the #456 bug); and the
     fix must not over-reject: limits=1 still admits exactly one, then 429s the second."""
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     client = _client(repo, runtime)
     depleted = {"x-user-id": str(USER), "x-user-limits": "0"}
@@ -211,7 +211,7 @@ def test_route_429_on_cap_zero_and_cap_one_still_admits_one(monkeypatch):
 
 def test_route_429_on_cap_zero_json_form(monkeypatch):
     """The JSON header form must not lose 0 to falsiness: {"max_concurrent_bots": 0} → 429."""
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     client = _client(repo, runtime)
     headers = {"x-user-id": str(USER), "x-user-limits": '{"max_concurrent_bots": 0}'}
@@ -221,7 +221,7 @@ def test_route_429_on_cap_zero_json_form(monkeypatch):
 
 def test_route_limits_header_parsed_as_json(monkeypatch):
     """The gateway may forward X-User-Limits as a JSON object — the route parses both forms."""
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
     repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
     client = _client(repo, runtime)
     headers = {"x-user-id": str(USER), "x-user-limits": '{"max_concurrent_bots": 1}'}

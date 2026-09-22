@@ -1,0 +1,9 @@
+{
+  "meeting_id": "42",
+  "doc": {
+    "workspace": "7",
+    "path": "kg/entities/meeting/42.md",
+    "title": "Meeting 42",
+    "kind": "meeting"
+  }
+}

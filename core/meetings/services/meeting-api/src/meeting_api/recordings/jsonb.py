@@ -104,19 +104,25 @@ def apply_chunk_to_recording(
     cumulative_bytes = prior_bytes + file_size - (replaced_size or 0)
     cumulative_chunk_count = prior_chunk_count + (0 if replaced_size is not None else 1)
     chunk_sizes[sequence_key] = file_size
+    prior_final_chunk_seq = prior_metadata.get("zaki_final_chunk_seq")
+    final_chunk_seq = chunk_seq if is_final else prior_final_chunk_seq
+    manifest_complete = (
+        isinstance(final_chunk_seq, int)
+        and not isinstance(final_chunk_seq, bool)
+        and final_chunk_seq >= 0
+        and set(chunk_sizes) == {str(sequence) for sequence in range(final_chunk_seq + 1)}
+    )
     first_chunk_at = prior_first_chunk_at or _now_iso()
     media_files = [mf for mf in prior_media_files if mf.get("type") != media_type]
 
     # Pack U.7 — preserve a finalized master path against a late-chunk overwrite.
     prior_sp = (prior_same_type or {}).get("storage_path") or ""
-    prior_is_final = bool((prior_same_type or {}).get("is_final"))
     master_finalized = (
-        prior_sp.endswith("/audio/master.webm")
-        or prior_sp.endswith("/audio/master.wav")
-        or prior_is_final
+        bool((prior_same_type or {}).get("finalized_by"))
+        and prior_sp.rsplit("/", 1)[-1].startswith("master.")
     )
     new_storage_path = prior_sp if master_finalized else storage_path
-    new_is_final = True if master_finalized else is_final
+    new_is_final = True if master_finalized else manifest_complete
 
     media_files.append({
         "id": (prior_same_type or {}).get("id") or new_recording_numeric_id(),
@@ -134,6 +140,11 @@ def apply_chunk_to_recording(
             **prior_metadata,
             **({"sample_rate": sample_rate} if sample_rate else {}),
             "zaki_chunk_sizes": chunk_sizes,
+            **(
+                {"zaki_final_chunk_seq": final_chunk_seq}
+                if isinstance(final_chunk_seq, int) and not isinstance(final_chunk_seq, bool)
+                else {}
+            ),
         },
         "created_at": (prior_same_type or {}).get("created_at") or _now_iso(),
         "is_final": new_is_final,
@@ -151,7 +162,7 @@ def apply_chunk_to_recording(
         "video": f"/recordings/{recording_id}/master?type=video" if "video" in _types_present else None,
     }
 
-    if is_final:
+    if manifest_complete:
         rec_payload["status"] = _STATUS_COMPLETED
         if not was_completed:
             rec_payload["completed_at"] = rec_payload.get("completed_at") or _now_iso()

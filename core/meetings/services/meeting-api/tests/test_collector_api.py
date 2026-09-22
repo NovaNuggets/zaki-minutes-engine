@@ -89,6 +89,34 @@ def test_get_meetings_filters():
     assert len(r2.json()["meetings"]) == 1
 
 
+def test_public_reads_map_needs_help_to_canonical_product_status():
+    store = InMemoryTranscriptStore()
+    meeting_id = store.seed_meeting(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id="help-needed",
+        status="needs_help",
+    )
+    client = TestClient(create_app(store, redis=None))
+
+    listed = client.get(
+        "/meetings",
+        headers=GATEWAY_HEADERS,
+        params={"status": "needs_human_help"},
+    )
+    detail = client.get(f"/meetings/{meeting_id}", headers=GATEWAY_HEADERS)
+    transcript = client.get(
+        "/transcripts/google_meet/help-needed", headers=GATEWAY_HEADERS
+    )
+
+    assert listed.status_code == detail.status_code == transcript.status_code == 200
+    assert [row["status"] for row in listed.json()["meetings"]] == [
+        "needs_human_help"
+    ]
+    assert detail.json()["status"] == "needs_human_help"
+    assert transcript.json()["status"] == "needs_human_help"
+
+
 def test_get_meetings_empty_for_other_user_conforms():
     store, _ = _seeded()
     client = TestClient(create_app(store, redis=None))

@@ -23,8 +23,8 @@ export interface MeetingMock {
   workspace_id?: string;      // the sharing bind (data.workspace_id) — members of it see this meeting
   calendar_uid?: string;      // calendar-import provenance (data.calendar_uid)
   attendees?: Attendee[];     // invited humans from the calendar (data.attendees)
-  auto_join?: boolean;        // "scheduled means the bot joins" toggle (data.auto_join; absent = on)
-  auto_join_error?: string;   // the auto-join sweep's LOUD failure (data.auto_join_error)
+  auto_join?: boolean;        // legacy backend data only; launch UI never enables automatic capture
+  auto_join_error?: string;   // legacy backend diagnostic; not exposed as a launch capability
   meeting_url?: string;       // the joinable link (constructed_meeting_url) — send-bot uses it verbatim
   platform: string;
   participants: Participant[];
@@ -40,7 +40,7 @@ export interface MeetingMock {
 // prep = user intent, nothing captured yet · live = bot in/heading-to the room · post = ran and ended.
 export type MeetingPhase = "prep" | "live" | "post";
 const PREP_STATUSES = new Set(["idle", "scheduled"]);
-const LIVE_PHASE_STATUSES = new Set(["active", "joining", "requested", "awaiting_admission", "needs_help", "stopping"]);
+const LIVE_PHASE_STATUSES = new Set(["active", "joining", "requested", "awaiting_admission", "needs_human_help", "stopping"]);
 
 export function meetingPhase(m: Pick<MeetingMock, "live_status" | "status">): MeetingPhase {
   const s = m.live_status ?? "";

@@ -6,10 +6,17 @@
 # runtime.backend=k8s it launches them as Pods under its ServiceAccount/RBAC; with backend=docker
 # (compose/desktop) via the host docker socket. Images are the compose `vexaai/v012-*` repos.
 #
-# Production overrides: set `global.imageTag` to a pinned YYMMDD-HHMM tag, fill `secrets`, and point
-# `database`/`redisConfig` at managed infra (postgres.enabled=false / redis.enabled=false).
+# Production overrides: set `global.imageTag` to an immutable YYMMDD-<git-sha> tag or fill each
+# image.digest, fill `secrets`, and point
+# `database`/`redisConfig` at managed infra (postgres.enabled=false with a pre-created credentials
+# Secret / redis.enabled=false). meeting-api currently requires the typed in-chart MinIO path;
+# disabling MinIO while meeting-api is enabled fails rendering instead of selecting a dangling URL.
 
 global:
+  # Drives fail-closed deployment checks. `local` permits the documented dev fixtures only while
+  # ingress/publicUrl remain private; staging/production require strong inline values or an
+  # operator-managed existing Secret.
+  deploymentProfile: local
   imageTag: ""              # When set, overrides every service image tag (build-once promotion).
   imagePullPolicy: Always
   imagePullSecrets: []
@@ -19,7 +26,9 @@ global:
   nodeSelector: {}
   tolerations: []
   affinity: {}
-  podSecurityContext: {}
+  podSecurityContext:
+    seccompProfile:
+      type: RuntimeDefault
   # Hardened defaults: block privilege escalation, drop all caps. Images run non-root via their
   # Dockerfile USER. Override per-component only if a workload genuinely needs a cap back.
   securityContext:
@@ -29,17 +38,70 @@ global:
 
 # ---------- Shared secrets ----------
 # Recommended: override via --set-file / external secret tooling, or point existingSecretName at a
-# Secret carrying these keys: ADMIN_API_TOKEN, INTERNAL_API_SECRET, TRANSCRIPTION_SERVICE_TOKEN,
+# Secret carrying these keys: ADMIN_API_TOKEN, INTERNAL_API_SECRET, RUNTIME_CONTROL_SECRET,
+# RUNTIME_CALLBACK_SECRET, MEETING_TOKEN_SECRET, GATEWAY_IDENTITY_SECRET, REDIS_URL, and
+# (when redis.enabled=true)
+# REDIS_PASSWORD. When minio.enabled=true it must also carry MINIO_ACCESS_KEY and MINIO_SECRET_KEY.
+# TRANSCRIPTION_SERVICE_TOKEN,
 # VEXA_DISPATCH_SIGNING_KEY, VEXA_BOT_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
-# ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN.
+# ANTHROPIC_BASE_URL, CLAUDE_CODE_OAUTH_TOKEN, NEXTAUTH_SECRET. When Minutes read is enabled the
+# same operator Secret must also carry ZAKI_READ_TOKEN_MINUTES. Every managed Minutes mode needs
+# ZAKI_MINUTES_HUB_TOKEN; erasure additionally uses ZAKI_AGENT_ERASURE_VERIFICATION_SECRET and
+# ZAKI_MINUTES_ERASURE_SIGNING_SECRET. Optional rotations use the two *_PREVIOUS_VERIFICATION_SECRET
+# keys. zaki-infra separately projects the matching read token, current Agent signer, and optional
+# previous Agent verifier to external Nullalis; previous material is verifier-only on both sides.
+# Platform finalization uses
+# ZAKI_MINUTES_FINALIZED_SECRET. An enabled OAuth provider also
+# requires its fixed GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET or MICROSOFT_CLIENT_ID/
+# MICROSOFT_CLIENT_SECRET keys. When terminal.sharedKeyMode=true, the Secret must additionally carry
+# TERMINAL_SHARED_API_KEY. That key is intentionally distinct from the bot service credential.
 secrets:
   existingSecretName: ""
-  adminApiToken: "CHANGE_ME"        # admin-api auth + MeetingToken signing (== meeting-api ADMIN_TOKEN)
+  # Helm cannot observe data changes in an operator-managed Secret. Hosted/Minutes deployments
+  # therefore require an operator-bumped opaque revision; it is hashed into every Pod template.
+  existingSecretRevision: ""
+  adminApiToken: "CHANGE_ME"        # admin-api authentication only; never a MeetingToken signer
   internalApiSecret: ""             # gateway↔admin-api↔meeting-api internal calls (default vexa-internal-secret)
+  runtimeControlSecret: "vexa-runtime-control-secret" # runtime controller auth; distinct from internal API auth
+  runtimeCallbackSecret: "vexa-runtime-callback-secret" # runtime→meeting callback auth; distinct, runtime+meeting only
+  meetingTokenSecret: "vexa-meeting-token-secret" # meeting-api-only per-spawn capability-token signer
+  # Gateway signs the identity hop to Agent with this dedicated proof. It is projected only to
+  # gateway + agent-api and must be 32..512 unpadded printable-ASCII characters.
+  gatewayIdentitySecret: "vexa-gateway-identity-secret-local-v1"
+  # Optional verifier-only overlap for Gateway request-proof key rotation. Agent receives current
+  # and previous; Gateway signs with current only.
+  gatewayIdentityPreviousSecret: ""
+  # Inline Redis construction accepts URI-userinfo-safe values only. For arbitrary provider URLs
+  # or credential formats, use existingSecretName and supply REDIS_URL directly.
+  redisPassword: "vexa-redis-password"
+  # In-chart MinIO credentials. Workloads receive only secretKeyRef projections; hosted operators
+  # should supply MINIO_ACCESS_KEY/MINIO_SECRET_KEY through existingSecretName instead of inline.
+  minioAccessKey: "vexa-access-key"
+  minioSecretKey: "vexa-secret-key-local"
   transcriptionServiceToken: ""     # funded STT token threaded into spawned bots
   dispatchSigningKey: ""            # agent-api signs per-dispatch tokens (default dev key; k8s prod → set this)
   botApiKey: ""                     # agent-api → gateway "add bot from URL" key (optional)
+  terminalSharedApiKey: ""          # local-only Terminal shared identity (requires terminal.sharedKeyMode)
   nextauthSecret: ""                # terminal next-auth session signing (default dev key; set in prod)
+  # Use independently generated, high-entropy values of 32..512 printable-ASCII characters for
+  # every Minutes credential, with no outer whitespace. Keep them distinct from every platform signing, provider,
+  # database, object-storage, and other Minutes credential. With existingSecretName, the operator
+  # must preserve these requirements because Helm cannot inspect Secret data; meeting-api rechecks
+  # them at activation.
+  minutesHubToken: ""               # external Minutes Hub/BFF -> meeting-api managed-route bearer
+  minutesReadToken: ""              # meeting-api cross-spoke read bearer (required only when read is enabled)
+  agentErasureHmacSecret: ""        # meeting verifier; zaki-infra projects the signer to external Nullalis
+  agentErasurePreviousVerificationSecret: "" # optional previous Agent verifier during rotation
+  minutesErasureSigningSecret: ""   # independent Minutes receipt signer
+  minutesErasurePreviousVerificationSecret: "" # optional previous verifier during one-key rotation
+  minutesFinalizedSecret: ""        # HMAC for operator-owned transcript.finalized delivery
+  # OAuth application credentials are operator/deployment secrets, never user-editable settings.
+  # They are written only when the corresponding terminal.oauth provider is explicitly enabled.
+  # Prefer existingSecretName in hosted environments so these values never enter Helm release data.
+  googleClientId: ""
+  googleClientSecret: ""
+  microsoftClientId: ""
+  microsoftClientSecret: ""
   # Model-provider auth (config.v1 `model_inference` capability, ADR-0026). ANTHROPIC_AUTH_TOKEN +
   # ANTHROPIC_BASE_URL are the OpenRouter/subscription pair (compose sources them from .env as a
   # single source of truth — here they live in the Secret). claudeCodeOauthToken
@@ -68,12 +130,19 @@ database:
   name: "vexa"
   user: "postgres"
   password: "postgres"
+  # Asyncpg-compatible TLS policy. `require` and verify modes are intended for managed Postgres;
+  # the optional in-chart PgBouncer path is explicitly unavailable for TLS until it has typed
+  # client/server certificate configuration.
   sslMode: "disable"
 
 redisConfig:
-  url: ""           # auto-filled when redis.enabled=true, else REQUIRED
+  # Used only for inline managed Redis (redis.enabled=false without existingSecretName). Complex
+  # provider URLs belong in the operator Secret's REDIS_URL key instead.
+  scheme: "redis"
   host: ""
   port: 6379
+  database: 0
+  username: ""
 
 # Model ids brokered into agents/bots (empty ⇒ provider default). Mirrors compose ANTHROPIC_*/VEXA_*.
 models:
@@ -84,15 +153,51 @@ models:
   agentModel: ""        # VEXA_AGENT_MODEL
   meetingModel: ""      # VEXA_MEETING_MODEL
 
+# Minutes is deliberately inert by default. Every active or historical-erasure mode requires the
+# bundled Agent, gateway, and Terminal off; runtime retained for withdrawal/teardown; the complete
+# TTL/erasure fan-out; and external Nullalis over bounded HTTP. zaki-prod's external launch BFF/UI
+# owns the meeting-api user edge. Roll back capture first, drain/erase active meetings, and remove
+# runtime only with the complete managed/historical topology.
+minutes:
+  captureEnabled: false
+  # Independent producer/runtime handshake. Enabling requires an explicit v2-capable bot image;
+  # ordinary runtime.browserImage remains pinned to sealed invocation.v1.
+  invocationV2Enabled: false
+  botImage: ""
+  readEnabled: false
+  # Reserved for the separately deployed canonical Agent. The bundled Agent never consumes this
+  # value; its cross-spoke URL/token belong to the external deployment's own Secret/config surface.
+  readBaseUrl: ""
+  # Required for capture, read, finalized delivery, TTL, invocation-v2, or historical erasure-only
+  # mode. meeting-api appends /internal/minutes/meetings/{id}/erase and refuses redirects/big bodies.
+  nullalisErasureBaseUrl: ""
+  # Key identifiers are non-secret. Supplying either enables the erasure boundary even while
+  # capture is off, so historical deletion remains available after capture is disabled.
+  agentErasureKeyId: ""
+  minutesErasureKeyId: ""
+  # Optional verifier-only overlaps for durable erasure receipts issued immediately before rotation.
+  previousAgentErasureKeyId: ""
+  previousMinutesErasureKeyId: ""
+  finalized:
+    enabled: false
+    url: ""
+    keyId: ""
+  ttl:
+    enabled: false
+    intervalSeconds: 60
+    batchSize: 100
+
 # ============ Components ============
 
 # The HTTP front door (compose: gateway → :8000).
 gateway:
   enabled: true
   replicaCount: 2
+  runAsUser: 10001
   image:
     repository: vexaai/v012-gateway
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 8000
@@ -121,13 +226,22 @@ gateway:
 adminApi:
   enabled: true
   replicaCount: 2
+  runAsUser: 10002
   image:
     repository: vexaai/v012-admin-api
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 8001
   logLevel: "info"
+  # Exact public HTTPS hosts users may select for personal model endpoints on port 443. Empty keeps
+  # personal model egress disabled; operator/deployment model credentials remain independent.
+  userModelAllowedHosts: ""
+  # Exact public HTTPS hosts users may select for personal STT on port 443. Personal URLs must be
+  # query/fragment-free and cannot redirect. Empty keeps user egress disabled; operator/platform
+  # STT remains independent and may use an in-cluster HTTP service.
+  userTranscriptionAllowedHosts: ""
   # fastapi-guard edge layer: per-IP throttle + auto-ban at the gateway edge.
   # ON by default with generous limits (600 req/min per IP); set enabled: false to opt out.
   guard:
@@ -151,13 +265,17 @@ adminApi:
 meetingApi:
   enabled: true
   replicaCount: 2
+  runAsUser: 10003
   image:
     repository: vexaai/v012-meeting-api
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 8080
-  transcriptionServiceUrl: ""   # STT endpoint the spawned bot transcribes against (empty ⇒ capture only)
+  # Operator STT endpoint shared by spawned bots, agent credential probes, and terminal dictation.
+  # Empty means meeting capture can run without transcript and the probe/dictation surfaces fail loud.
+  transcriptionServiceUrl: ""
   minioSecure: "false"
   logLevel: "info"
   resources:
@@ -173,10 +291,20 @@ runtime:
   #   docker → host /var/run/docker.sock (single-node k3s fallback; mounts the socket — see below).
   #   process→ child processes (no containers).
   backend: "k8s"
+  # Required only for backend=docker: the numeric GID owning /var/run/docker.sock on the node.
+  # There is deliberately no default because the wrong group makes the non-root runtime unusable
+  # (or grants an unintended host privilege). Prefer backend=k8s; Compose already wires DOCKER_GID.
+  dockerSocketGroup: ""
+  # Empty keeps local compatibility by spawning into the release namespace. Hosted and managed
+  # Minutes profiles require a distinct, pre-created, secret-free namespace. This chart creates
+  # only the Role/RoleBinding and workload NetworkPolicies there; Infra owns Namespace lifecycle.
+  workloadNamespace: ""
   replicaCount: 1               # keep at 1 unless backend=k8s (Redis is the state-of-record)
+  runAsUser: 10004
   image:
     repository: vexaai/v012-runtime
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 8090
@@ -185,6 +313,22 @@ runtime:
   browserImage: ""            # empty → follows global.imageTag (fallback vexaai/vexa-bot:v012)
   agentImage: "vexaai/v012-agent-api:v012"
   agentWorkerImage: "vexaai/v012-agent-worker:v012"
+  # Policy inherited by every Pod the k8s backend spawns. Placement and registry credentials are
+  # serialized from global.*; these resource bounds are enforced before kubectl creates a Pod.
+  spawnedPods:
+    botIdentity:
+      runAsUser: 10003
+      runAsGroup: 10003
+      fsGroup: 10003
+    agentIdentity:
+      runAsUser: 10007
+      runAsGroup: 10007
+      fsGroup: 10007
+    defaultCpu: 1
+    defaultMemoryMb: 1024
+    maxCpu: 4
+    maxMemoryMb: 4096
+    maxGpu: 0
   logLevel: "info"
   resources:
     requests: { cpu: 50m, memory: 256Mi }
@@ -195,13 +339,15 @@ runtime:
 agentApi:
   enabled: true
   replicaCount: 1               # shares a workspace store with spawned workers; keep single for RWO PVC
+  runAsUser: 10005
   image:
     repository: vexaai/v012-agent-api
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 8100
-  defaultSubject: "u_live"      # VEXA_AGENT_DEFAULT_SUBJECT single-user fallback until gateway fronts agent-api
+  defaultSubject: ""            # optional explicit single-user self-host fallback; hosted defaults fail closed
   logLevel: "info"
   # Workspace store the worker mounts and agent-api reads. On k3s (local-path = RWO) keep agentApi at
   # replicaCount 1; full agent-worker dispatch on k8s needs RWX storage (see README — follow-up).
@@ -217,10 +363,20 @@ agentApi:
 # The user-facing web UI (Next.js custom server). Proxies /ws → gateway, REST/login → agent-api/admin-api.
 terminal:
   enabled: true
+  # Local self-host escape hatch for a zero-login Terminal. Default off: hosted/public Terminal
+  # requests require a user session cookie. The chart refuses this mode behind ingress, and the
+  # Terminal process also refuses it when NEXTAUTH_URL/TERMINAL_URL is non-loopback.
+  sharedKeyMode: false          # Compose/Lite loopback profile only; the Helm chart rejects it.
+  # Default-off passwordless debug login for loopback/local self-host only. Entries are exact,
+  # case-insensitive email matches. Requires a real host loopback bind, so the Kubernetes chart
+  # rejects it; use Compose/Lite locally. Never eligible to claim the first administrator.
+  directLoginAllowedEmails: []
   replicaCount: 2
+  runAsUser: 10006
   image:
     repository: vexaai/v012-terminal
     tag: v012
+    digest: ""
   service:
     type: ClusterIP
     port: 3000
@@ -228,22 +384,31 @@ terminal:
   # External origin once an ingress/LB fronts the terminal (sets NEXTAUTH_URL/TERMINAL_URL for cookie
   # security + OAuth callbacks). Empty for cluster-internal / port-forward access.
   publicUrl: ""
+  # Hosted/staging terminals must explicitly enable at least one OAuth provider. Both providers are
+  # default-off for local/port-forward installs. IDs and secrets are sourced from the operator Secret
+  # using fixed keys; users cannot override them through Terminal settings.
+  oauth:
+    google:
+      enabled: false
+    microsoft:
+      enabled: false
+      tenantId: "common"
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 1Gi }
-  # OAuth (Google/Microsoft) + other knobs: add here, e.g.
-  #   - name: GOOGLE_CLIENT_ID
-  #     value: "..."
+  # Non-auth extension knobs only. OAuth credentials use terminal.oauth + the operator Secret above;
+  # do not place provider secrets in this plaintext values list.
   extraEnv: []
 
-# Optional idempotent schema-sync Job (meeting-api owns init_db). Off by default; the services
-# create their schema on boot. Enable for an explicit pre-upgrade migration gate.
+# Optional idempotent schema-sync Job (admin-api owns the shared schema convergence). Off by
+# default; admin-api also converges on boot. Enable for post-install and pre-upgrade gates.
 migrations:
   enabled: false
   backoffLimit: 3
   image:
     repository: ""
     tag: ""
+    digest: ""
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -254,7 +419,7 @@ pgbouncer:
   # Transaction-mode pooler in front of Postgres. Default off; enable against managed Postgres with a
   # fixed slot budget or when scaling replicas. When on, every service's DB_HOST routes through it.
   enabled: false
-  image: edoburu/pgbouncer:latest
+  image: edoburu/pgbouncer:v1.24.1-p1
   replicaCount: 1
   poolMode: transaction
   defaultPoolSize: 20
@@ -271,7 +436,17 @@ pgbouncer:
 postgres:
   enabled: true
   image: postgres:17-alpine
+  runAsUser: 70
+  runAsGroup: 70
+  fsGroup: 70
+  # Local dev may let the chart create this Secret from database.*. Hosted profiles should set
+  # createCredentialsSecret=false, pre-create the named Secret with POSTGRES_DB/USER/PASSWORD, and
+  # keep the password out of Helm release values. postgres.enabled=false also requires this mode.
+  createCredentialsSecret: true
   credentialsSecretName: postgres-credentials
+  # Required for hosted/managed profiles when credentialsSecretName is operator-managed. Bump on
+  # every data change so all DB consumers roll.
+  credentialsSecretRevision: ""
   idleInTransactionTimeoutMs: 60000
   service:
     port: 5432
@@ -286,19 +461,26 @@ postgres:
 redis:
   enabled: true
   image: redis:7-alpine
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
   service:
     port: 6379
   persistence:
     enabled: true
     size: 2Gi
     storageClassName: ""
-  maxmemory: "1gb"
-  maxmemoryPolicy: "allkeys-lru"
+  # Keep the dataset well below the 1Gi pod limit so allocator overhead and AOF rewrite
+  # copy-on-write have headroom; noeviction can then reject writes before cgroup OOM termination.
+  maxmemory: "512mb"
+  # Privacy fences/tombstones share this store. Never evict acknowledged keys: at the configured
+  # memory limit Redis returns OOM and callers fail closed until an operator restores capacity.
+  maxmemoryPolicy: "noeviction"
   # Durability paired invariant (enforced by vexa.validateRedisDurability): AOF on ⇒ BGSAVE failures
   # are non-blocking. Don't set stopWritesOnBgsaveError=yes without appendonly=yes.
   durability:
     appendonly: "yes"
-    appendfsync: "everysec"
+    appendfsync: "always"
     stopWritesOnBgsaveError: "no"
   resources:
     requests: { cpu: 100m, memory: 256Mi }
@@ -306,11 +488,20 @@ redis:
 
 minio:
   enabled: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  initRunAsUser: 1000
+  initRunAsGroup: 1000
+  initFsGroup: 1000
   image:
     repository: minio/minio
-    tag: latest
-  accessKey: vexa-access-key
-  secretKey: vexa-secret-key
+    tag: RELEASE.2025-09-07T16-13-09Z
+    digest: ""
+  clientImage:
+    repository: minio/mc
+    tag: RELEASE.2025-08-13T08-35-41Z
+    digest: ""
   bucket: vexa
   persistence:
     size: 10Gi
@@ -339,6 +530,29 @@ ingress:
       pathType: Prefix
       service: terminal
       servicePort: 3000
+
+# NetworkPolicy is on by default. Platform Pods start default-deny and receive only DNS, explicit
+# release-local service flows, and HTTPS egress. Runtime-managed Pods receive a separate policy in
+# runtime.workloadNamespace; meeting/browser egress ports are operator-auditable here.
+networkPolicy:
+  enabled: true
+  platformAdditionalIngress: []
+  platformAdditionalEgress: []
+  workloadAdditionalEgress: []
+  externalEgress:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+    - protocol: UDP
+      port: 3478
+      endPort: 3481
+    - protocol: TCP
+      port: 3478
+      endPort: 3481
+    - protocol: UDP
+      port: 19302
+      endPort: 19309
 
 # ---------- PodDisruptionBudgets (optional) ----------
 # Stateless services default on (paired with replicaCount 2). Keys are the component value keys;

@@ -7,6 +7,7 @@ from enum import Enum
 import hashlib
 import hmac
 import json
+import math
 from typing import Any, Optional, Protocol
 
 from ..bot_spawn import (
@@ -15,10 +16,13 @@ from ..bot_spawn import (
     MeetingRepo,
     QuotaExceeded,
     RuntimeClient,
+    TeardownUnconfirmed,
     UnsafeMeetingUrl,
     request_bot,
     validate_meeting_url,
+    confirm_capture_teardown_with_retry,
 )
+from ..collector.carriers import fence_meeting_redis_carriers
 from ..retention import ScopeExpiries, materialize_scope_expiries
 from ..lifecycle.stop import leave_command_channel, leave_command_payload
 from ..obs import log_event
@@ -55,11 +59,46 @@ class CaptureDenied(Exception):
         super().__init__(code.value)
 
 
+class CaptureTeardownUnconfirmed(TeardownUnconfirmed):
+    """Withdrawal is durable, but its Redis fence and/or terminal stop is unconfirmed."""
+
+
 class CaptureStopPublisher(Protocol):
     """The internal leave-command publisher used after withdrawal is durable."""
 
     async def publish(self, channel: str, message: str) -> Any:
         ...
+
+
+class CaptureCarrierFencer(Protocol):
+    """Install the permanent raw/processed Redis tombstone for one numeric meeting row."""
+
+    async def __call__(
+        self, meeting_id: int, *, raw: bool, processed: bool
+    ) -> None:
+        ...
+
+
+class RedisCaptureCarrierFencer:
+    """Production adapter over the shared monotonic Redis carrier-fence contract."""
+
+    def __init__(self, redis_client: Any) -> None:
+        self._redis_client = redis_client
+
+    async def __call__(
+        self, meeting_id: int, *, raw: bool, processed: bool
+    ) -> None:
+        from ..webhooks.platform_finalized import RedisTranscriptFinalizedOutbox
+        from ..webhooks.retry import purge_meeting_webhook_state
+
+        await purge_meeting_webhook_state(self._redis_client, meeting_id)
+        await RedisTranscriptFinalizedOutbox(self._redis_client).cancel(meeting_id)
+        await fence_meeting_redis_carriers(
+            self._redis_client,
+            meeting_id,
+            raw=raw,
+            processed=processed,
+        )
 
 
 @dataclass(frozen=True)
@@ -299,7 +338,6 @@ async def request_capture(
     max_concurrent: Optional[int] = None,
     redis_url: Optional[str] = None,
     meeting_api_url: Optional[str] = None,
-    internal_secret: Optional[str] = None,
     token_secret: Optional[str] = None,
     evaluated_at: Optional[datetime] = None,
 ) -> dict:
@@ -332,6 +370,14 @@ async def request_capture(
         native_meeting_id=native_meeting_id,
         evaluated_at=evaluated_at,
     )
+    scope_expiries = metadata["zaki_retention"]["scope_expiries"]
+    capture_expires_at = min(
+        datetime.fromisoformat(scope_expiries[scope])
+        for scope in ("audio", "transcript", "summary")
+    )
+    capture_lifetime_seconds = max(
+        1, math.ceil((capture_expires_at - evaluated_at).total_seconds())
+    )
     capture_repo = _CaptureEvidenceRepo(repo, metadata)
     try:
         return await request_bot(
@@ -347,23 +393,36 @@ async def request_capture(
             task=task,
             recording_enabled=True,
             transcribe_enabled=True,
+            operator_transcription_only=True,
             continue_meeting=False,
             max_concurrent=max_concurrent,
             redis_url=redis_url,
             meeting_api_url=meeting_api_url,
-            internal_secret=internal_secret,
             token_secret=token_secret,
+            capture_expires_at=capture_expires_at.isoformat(),
+            invocation_contract="invocation.v2",
+            managed_retention={
+                "policyVersion": authority.tenant_policy_version,
+                "scopeExpiresAt": {
+                    scope: scope_expiries[scope]
+                    for scope in ("audio", "transcript", "summary")
+                },
+            },
+            max_lifetime_sec=capture_lifetime_seconds,
         )
     except CaptureGrantConsumed as error:
         raise CaptureDenied(CaptureDenial.AUTHORITY_REPLAYED) from error
     except (MaxBotsExceeded, QuotaExceeded) as error:
         raise CaptureDenied(CaptureDenial.QUOTA_EXHAUSTED) from error
+    except TeardownUnconfirmed:
+        raise CaptureTeardownUnconfirmed() from None
 
 
 async def withdraw_capture(
     repo: MeetingRepo,
     publisher: CaptureStopPublisher,
     *,
+    carrier_fencer: CaptureCarrierFencer,
     tenant_id: str,
     user_id: int,
     platform: str,
@@ -374,8 +433,10 @@ async def withdraw_capture(
     """Durably withdraw capture, then ask the bot to leave.
 
     The repository takes the exclusive side of the meeting write barrier before storing the
-    withdrawal. In-flight transcript/recording writes drain first; writers starting later observe
-    ``zaki_capture.state=withdrawn`` and refuse. The returned receipt is content-free.
+    withdrawal. Immediately afterward, the permanent Redis raw+processed fence closes the bot and
+    Agent egress paths before runtime teardown starts. A fence failure never skips authoritative
+    teardown, but it does return the content-free retryable pending outcome. The receipt is
+    content-free.
     """
     withdrawn_at = withdrawn_at if withdrawn_at is not None else datetime.now(timezone.utc)
     if (
@@ -408,34 +469,145 @@ async def withdraw_capture(
     if result is None:
         raise CaptureDenied(CaptureDenial.AUTHORITY_SCOPE_MISMATCH)
     meeting = result["meeting"]
+    carrier_fence_confirmed = False
+    try:
+        await carrier_fencer(meeting["id"], raw=True, processed=True)
+        carrier_fence_confirmed = True
+    except Exception as error:  # noqa: BLE001 — stop still runs; caller receives retryable pending
+        log_event(
+            "capture_withdraw_carrier_fence_failed",
+            audience="system",
+            level="error",
+            span="capture.withdraw",
+            user_id=user_id,
+            meeting_id=str(meeting["id"]),
+            fields={"error_type": type(error).__name__},
+        )
     if result["should_stop"]:
         meeting_id = meeting["id"]
-        try:
-            await publisher.publish(
-                leave_command_channel(meeting_id),
-                json.dumps(leave_command_payload(meeting_id)),
-            )
-        finally:
-            # A booting workload may not yet be subscribed to the leave channel. Attempt the
-            # direct teardown even when Redis publication fails; the durable withdrawal already
-            # makes all later transcript and recording writes fail closed.
-            if (
-                runtime is not None
-                and result["prior_status"] in {"requested", "joining", "awaiting_admission"}
-                and meeting.get("bot_container_id")
-            ):
+        capture = meeting["data"]["zaki_capture"]
+        teardown_already_confirmed = capture.get("teardown_state") == "confirmed"
+        if teardown_already_confirmed:
+            # Upgrade legacy rows that recorded physical teardown before the terminal projection
+            # was introduced. The same narrow CAS is safe and must not re-delete the workload.
+            try:
+                legacy_terminalized = await confirm_capture_teardown_with_retry(
+                    repo,
+                    meeting_id=meeting_id,
+                )
+            except Exception as error:  # noqa: BLE001 — durable terminal evidence is still missing
+                log_event(
+                    "capture_withdraw_confirmation_persist_failed",
+                    audience="system",
+                    level="error",
+                    span="capture.withdraw",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={"error_type": type(error).__name__},
+                )
+                raise CaptureTeardownUnconfirmed() from None
+            if not legacy_terminalized:
+                log_event(
+                    "capture_withdraw_confirmation_persist_failed",
+                    audience="system",
+                    level="error",
+                    span="capture.withdraw",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={"reason": "legacy_terminal_cas_not_applied"},
+                )
+                raise CaptureTeardownUnconfirmed() from None
+            meeting["status"] = "completed"
+            meeting["data"]["completion_reason"] = "stopped"
+        else:
+            # The runtime kernel is the primary stop path. It may terminate gracefully itself, and
+            # its successful 2xx is authoritative. Running it before best-effort pub/sub prevents a
+            # fast bot exit from turning the subsequent DELETE into an ambiguous 404.
+            workload_id = meeting.get("bot_container_id")
+            hard_teardown_confirmed = False
+            if runtime is None or not workload_id:
+                log_event(
+                    "capture_withdraw_teardown_unconfirmed",
+                    audience="system",
+                    level="error",
+                    span="capture.withdraw",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={"reason": "runtime_or_workload_missing"},
+                )
+            else:
                 try:
-                    await runtime.delete_workload(meeting["bot_container_id"])
-                except Exception as error:  # noqa: BLE001 — durable refusal already protects privacy
+                    await runtime.delete_workload(workload_id)
+                    hard_teardown_confirmed = True
+                except Exception as error:  # noqa: BLE001 — report a stable pending outcome
                     log_event(
-                        "capture_withdraw_teardown_failed",
+                        "capture_withdraw_teardown_unconfirmed",
                         audience="system",
-                        level="warning",
+                        level="error",
                         span="capture.withdraw",
                         user_id=user_id,
                         meeting_id=str(meeting_id),
-                        fields={"error": str(error)},
+                        fields={"error_type": type(error).__name__},
                     )
+
+            confirmation_persisted = False
+            if hard_teardown_confirmed:
+                try:
+                    confirmation_persisted = await confirm_capture_teardown_with_retry(
+                        repo,
+                        meeting_id=meeting_id,
+                    )
+                    if not confirmation_persisted:
+                        log_event(
+                            "capture_withdraw_confirmation_persist_failed",
+                            audience="system",
+                            level="error",
+                            span="capture.withdraw",
+                            user_id=user_id,
+                            meeting_id=str(meeting_id),
+                            fields={"reason": "cas_not_applied"},
+                        )
+                except Exception as error:  # noqa: BLE001 — physical stop lacks durable evidence
+                    log_event(
+                        "capture_withdraw_confirmation_persist_failed",
+                        audience="system",
+                        level="error",
+                        span="capture.withdraw",
+                        user_id=user_id,
+                        meeting_id=str(meeting_id),
+                        fields={"error_type": type(error).__name__},
+                    )
+
+            # Pub/sub remains a courtesy signal only. Its subscriber count is intentionally ignored:
+            # delivery says nothing about command execution or workload termination.
+            try:
+                await publisher.publish(
+                    leave_command_channel(meeting_id),
+                    json.dumps(leave_command_payload(meeting_id)),
+                )
+            except Exception as error:  # noqa: BLE001 — kernel result remains authoritative
+                log_event(
+                    "capture_withdraw_leave_publish_failed",
+                    audience="system",
+                    level="warning",
+                    span="capture.withdraw",
+                    user_id=user_id,
+                    meeting_id=str(meeting_id),
+                    fields={"error_type": type(error).__name__},
+                )
+
+            # A physical stop without its durable confirmed+terminal CAS is not enough to unblock
+            # GDPR erasure. Surface the same content-free pending outcome for either missing proof.
+            if not hard_teardown_confirmed or not confirmation_persisted:
+                raise CaptureTeardownUnconfirmed() from None
+            meeting["data"]["zaki_capture"] = {
+                **capture,
+                "teardown_state": "confirmed",
+            }
+            meeting["status"] = "completed"
+            meeting["data"]["completion_reason"] = "stopped"
+    if not carrier_fence_confirmed:
+        raise CaptureTeardownUnconfirmed() from None
     capture = meeting["data"]["zaki_capture"]
     return {
         "meeting_id": meeting["id"],

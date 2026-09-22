@@ -33,7 +33,13 @@ def _phase(name: str) -> str:
     ).stdout.strip()
 
 
-def test_k8s_backend_real_pod_lifecycle():
+def test_k8s_backend_real_pod_lifecycle(monkeypatch):
+    # This is a substrate lifecycle proof, not a capacity test. Keep its throwaway Alpine Pod tiny
+    # so a busy developer cluster does not leave it Pending behind unrelated production defaults.
+    monkeypatch.setenv("RUNTIME_K8S_DEFAULT_CPU", "0.01")
+    monkeypatch.setenv("RUNTIME_K8S_DEFAULT_MEMORY_MB", "16")
+    monkeypatch.setenv("RUNTIME_K8S_MAX_CPU", "0.1")
+    monkeypatch.setenv("RUNTIME_K8S_MAX_MEMORY_MB", "32")
     name = "vexa-rt-k8stest"
     subprocess.run(["kubectl", "delete", "pod", name, "--ignore-not-found",
                     "--grace-period=0", "--force"], capture_output=True)  # clean slate

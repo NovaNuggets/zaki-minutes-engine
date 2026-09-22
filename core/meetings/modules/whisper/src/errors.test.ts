@@ -35,7 +35,10 @@ async function run() {
     check('402 → attributed source=stt, kind=payment_required', f?.source === 'stt' && f?.kind === 'payment_required', JSON.stringify({ s: f?.source, k: f?.kind }));
     check('402 → non-retryable', f?.retryable === false);
     check('402 → STT called exactly once (no retry storm)', calls() === 1, `calls=${calls()}`);
-    check('402 → balance detail preserved', !!f?.detail && /balance/i.test(f.detail), f?.detail);
+    check('402 → untrusted upstream detail is not reflected', f?.detail === undefined,
+      JSON.stringify({ detail: f?.detail, message: f?.message }));
+    check('402 → echoed upstream content is absent from logs/errors',
+      !f?.message.includes('Available: 0.00 minutes'), f?.message);
   }
   // 503 — transient: unavailable, retryable, retried maxRetries+1 times.
   {

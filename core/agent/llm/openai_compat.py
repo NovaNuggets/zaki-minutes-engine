@@ -18,11 +18,17 @@ from typing import Optional
 import httpx
 
 from llm.errors import LLMAuthError, LLMConfigError, LLMError
+from llm.http_safety import (
+    MAX_LLM_OUTPUT_CHARS,
+    encode_request,
+    read_response_json,
+)
 from llm.ports import CompletionResult
 
 
 class OpenAICompatCompletion:
     name = "openai-compat"
+    supports_max_tokens = True
 
     def __init__(self, *, base_url: Optional[str] = None, api_key: Optional[str] = None,
                  model: Optional[str] = None, timeout: float = 120.0,
@@ -33,10 +39,15 @@ class OpenAICompatCompletion:
                      or os.environ.get("ANTHROPIC_AUTH_TOKEN")
                      or os.environ.get("ANTHROPIC_API_KEY") or "")
         self._model = model or os.environ.get("VEXA_LLM_MODEL") or ""
-        self._client = httpx.Client(timeout=timeout, transport=transport)
+        self._client = httpx.Client(
+            timeout=timeout,
+            transport=transport,
+            follow_redirects=False,
+        )
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 model: Optional[str] = None) -> CompletionResult:
+                 model: Optional[str] = None,
+                 max_tokens: Optional[int] = None) -> CompletionResult:
         target = (model or "").strip() or self._model
         if not self._base:
             raise LLMConfigError(
@@ -51,18 +62,43 @@ class OpenAICompatCompletion:
         messages = ([{"role": "system", "content": system}] if system else [])
         messages.append({"role": "user", "content": prompt})
         headers = {"Authorization": f"Bearer {self._key}"} if self._key else {}
+        headers["Content-Type"] = "application/json"
+        payload: dict = {"model": target, "messages": messages}
+        if max_tokens is not None:
+            if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
+                raise LLMConfigError("max_tokens must be a positive integer")
+            payload["max_tokens"] = max_tokens
+        body = encode_request(payload)
         try:
-            r = self._client.post(f"{self._base}/chat/completions",
-                                  json={"model": target, "messages": messages}, headers=headers)
-        except httpx.HTTPError as exc:
-            raise LLMError(f"completion transport failure against {self._base}: {exc}") from exc
-        if r.status_code in (401, 403):
-            raise LLMAuthError(f"{r.status_code} from {self._base}: {r.text[:300]}")
-        if r.status_code >= 400:
-            raise LLMError(f"{r.status_code} from {self._base}: {r.text[:300]}")
-        try:
-            choice = (r.json().get("choices") or [{}])[0]
-            text = (choice.get("message") or {}).get("content") or ""
-        except (ValueError, AttributeError, IndexError, TypeError) as exc:
-            raise LLMError(f"malformed completion payload from {self._base}: {exc}") from exc
-        return CompletionResult(text=str(text), model=target)
+            with self._client.stream(
+                "POST",
+                f"{self._base}/chat/completions",
+                content=body,
+                headers=headers,
+                follow_redirects=False,
+            ) as r:
+                if r.status_code in (401, 403):
+                    raise LLMAuthError(f"completion endpoint rejected credentials (HTTP {r.status_code})")
+                if not 200 <= r.status_code < 300:
+                    raise LLMError(f"completion endpoint answered HTTP {r.status_code}")
+                data = read_response_json(r)
+        except (LLMAuthError, LLMError):
+            raise
+        except httpx.HTTPError:
+            # HTTPX retains the prompt- and credential-bearing Request on transport failures.
+            raise LLMError("completion transport failure") from None
+
+        if not isinstance(data, dict):
+            raise LLMError("malformed completion payload")
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices or len(choices) > 100:
+            raise LLMError("malformed completion payload")
+        choice = choices[0]
+        if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+            raise LLMError("malformed completion payload")
+        text = choice["message"].get("content")
+        if not isinstance(text, str):
+            raise LLMError("malformed completion payload")
+        if len(text) > MAX_LLM_OUTPUT_CHARS:
+            raise LLMError("completion output exceeds limit")
+        return CompletionResult(text=text, model=target)

@@ -18,10 +18,12 @@ Python because the agent domain is the LLM/tooling + runtime ecosystem (P13).
 | consumes | gateway / terminal | `POST /api/chat` (SSE), `/api/chat/reset`, `GET /api/sessions` | a chat now-dispatch; SSE view of `unit:<id>:out` |
 | consumes | any integration | `POST /events` | an `event.v1` → `unit.v1` (carried plan) → dispatch |
 | consumes | terminal | `POST /api/routines`, `GET /api/routines`, `DELETE /api/routines/{id}` | a `routine.v1` → a `schedule.v1` cron job |
-| consumes | bridge / terminal | `POST /api/meeting/{start,bot,stop}`, `GET /api/meetings/live`, `GET /api/meeting/stream` | launch/stop a live-meeting copilot; SSE merge of transcript + copilot out |
+| consumes | terminal | `POST /api/meeting/process`, `GET /api/meeting/stream` | owner-scoped processing consent; SSE merge keyed only by the canonical numeric meeting row (`POST /api/meeting/start` is retired) |
 | consumes | terminal | `GET /api/workspace/{tree,file,git}` | workspace tree, file content, git state |
 | calls | runtime kernel | `runtime.v1` (Dispatcher → RuntimePort) | the worker container `env` (repo URL + scoped token) |
 | calls | gateway / meeting-api | `POST /bots`, `DELETE /bots/{platform}/{native_id}` | forward our self-hosted bot in/out of a meeting |
+| calls | meeting-api | `GET /internal/meetings/{row}/owner` + `X-Internal-Secret` | exact row → canonical decimal-string row/owner only; required before live registration/dispatch |
+| calls | meeting-api | `POST /internal/meetings/{row}/docs` + `X-Internal-Secret` | decimal-string exact-row generated-doc link; meeting-api derives the row owner workspace + canonical row path |
 | consumes | self-hosted bots | redis stream `transcription_segments` | live segments, tailed by `transcription_watcher` |
 | publishes | terminal / `serve_meeting` | redis stream `tc:meeting:{uid}` | per-meeting transcript wire (drafts + finals) |
 | spawns-over | runtime kernel | `runtime.v1` agent profile | `agent-meet-{uid}` copilot, re-armed on transcript activity |
@@ -51,8 +53,8 @@ uv run pytest -q        # uv manages this package's own venv/deps
 - ✅ delivered — `/api/chat` SSE relay of `unit:<id>:out`, `/api/chat/reset`, `/api/sessions`
 - ✅ delivered — `/api/routines` CRUD → `schedule.v1` cron jobs
 - ✅ delivered — `/events` generic ingress (`event.v1` → `unit.v1`)
-- ✅ delivered — `/api/meeting/{start,bot,stop,stream}`, `/api/meetings/live` live-copilot surface
-- ✅ delivered — `transcription_watcher`: fan `transcription_segments` → `tc:meeting:{uid}` + spawn copilot
+- ✅ delivered — owner-attributed transcript watcher, `/api/meeting/process`, and owner-scoped `/api/meeting/stream`; native-only `/api/meeting/start` retired
+- ✅ delivered — `transcription_watcher`: consume row-keyed transcript triggers, resolve the authoritative owner, then register/re-arm the owner-bound copilot (meeting-api remains the transcript-carrier writer)
 - ✅ delivered — `/api/workspace/{tree,file,git}` reads
 - ✅ delivered — in-container worker (`serve` / `serve_meeting`)
 - ✅ delivered — multi-session chat: real conversation threads keyed `agent-{subject}-chat-{session}`
@@ -73,5 +75,5 @@ uv run pytest -q        # uv manages this package's own venv/deps
 - ⬜ planned — multi-workspace (company/service tiers — a FUTURE axis beyond the single user workspace)
 - 🟡 partial — in-memory live-meeting registry (redis-backed adapter pending)
 - ⬜ planned — GET /api/meetings (proxy meeting-api + merge live registry)
-- ⬜ planned — a session_end doc-binding write turn
+- ✅ delivered — session-end generated-doc binding through an exact-row internal edge (no global user key/native-link addressing)
 - ⬜ planned — WS publishers (u:{user_id}:meetings on registry add/stop/drop, u:{user_id}:workspace on commit)

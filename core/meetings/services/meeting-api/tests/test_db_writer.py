@@ -18,6 +18,7 @@ the redis-wired in-memory store mirroring the prod topology — no docker):
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import fakeredis.aioredis
@@ -25,6 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from meeting_api.collector import consume_segments
+from meeting_api.collector.carriers import fence_meeting_redis_carriers
 from meeting_api.collector.ports import TranscriptWriteRefused
 from meeting_api.collector.db_writer import (
     ACTIVE_MEETINGS_KEY,
@@ -80,6 +82,27 @@ def _seg(sid: str, start: float, text: str, *, completed: bool = True) -> dict:
 def _durable_texts(store, meeting_id: int = 1) -> list[str]:
     rows = store._meetings[meeting_id]["segments"]
     return [rows[k]["text"] for k in sorted(rows)]
+
+
+def _minutes_authority() -> dict:
+    return {
+        "zaki_capture": {
+            "state": "authorized",
+            "bot_name": "ZAKI Notetaker",
+            "tenant_attested": True,
+            "tenant_attested_at": "2026-07-01T00:00:00+00:00",
+            "tenant_policy_version": "minutes-retention-v1",
+        },
+        "zaki_retention": {
+            "state": "open",
+            "expired_scopes": [],
+            "scope_expiries": {
+                "audio": "2099-01-01T00:00:00+00:00",
+                "transcript": "2099-01-01T00:00:00+00:00",
+                "summary": "2099-01-01T00:00:00+00:00",
+            },
+        },
+    }
 
 
 # ── (a) consumer tick + db-writer tick ⇒ durable ────────────────────────────────────────────────
@@ -257,6 +280,34 @@ async def test_completed_meeting_transcript_is_flushed_immediately(redis_c, gold
     assert await redis_c.hlen(segments_hash_key(1)) == 0    # hash drained
 
 
+async def test_minutes_finalization_writes_immutable_revision_and_fences_late_segments(redis_c):
+    store = InMemoryTranscriptStore(redis_client=redis_c)
+    store.seed_meeting(
+        user_id=USER,
+        platform="google_meet",
+        native_meeting_id=NATIVE,
+        meeting_id=1,
+        status="completed",
+        data=_minutes_authority(),
+    )
+    await store.append_segment(1, {
+        **_seg("s1", 1.0, "final words"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    outcome = await finalize_meeting(redis_c, store, 1)
+
+    assert outcome.state == "finalized"
+    marker = store._meetings[1]["data"]["zaki_transcript_finalization"]
+    assert marker["state"] == "finalized"
+    assert marker["segment_count"] == 1
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", marker["revision"])
+    assert marker["finalized_at"]
+    assert await redis_c.hlen(segments_hash_key(1)) == 0
+    with pytest.raises(TranscriptWriteRefused, match="not writable"):
+        await store.append_segment(1, _seg("s2", 3.0, "too late"))
+
+
 async def test_nonterminal_advance_does_not_finalize(redis_c, goldens):
     client, store = await _terminal_app_and_stores(redis_c)
     await store.append_segment(1, {**_seg("s1", 1.0, "mid-meeting"),
@@ -406,6 +457,15 @@ async def test_finalize_already_marker_complete_does_not_park(store, redis_c):
 
     await finalize_meeting(redis_c, store, 1)
     assert [n["text"] for n in _view(store, 1)["doc"]["notes"]] == ["Done early."]
+    assert await _pending_ids(redis_c) == []
+
+
+async def test_finalize_cannot_rearm_processed_pending_after_retention_fence(store, redis_c):
+    """A delayed terminal finalizer must not recreate work after processed erasure completed."""
+    await fence_meeting_redis_carriers(redis_c, 1, raw=False, processed=True)
+
+    await finalize_meeting(redis_c, store, 1)
+
     assert await _pending_ids(redis_c) == []
 
 

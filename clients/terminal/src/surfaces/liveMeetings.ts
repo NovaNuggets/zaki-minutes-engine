@@ -10,7 +10,7 @@ import { onGatewayWSConnected, onMeetingStatus } from "./gatewayWS";
 
 /** A row from meeting-api GET /meetings (live AND past). */
 interface MeetingRowDTO {
-  id: number | string;
+  id: number;
   platform: string;
   native_meeting_id: string | null;   // null on a link-less PLANNED meeting (platform 'unknown')
   status: string;
@@ -125,8 +125,8 @@ function formatTranscriptTime(start?: number | null): string {
 }
 
 // Statuses where the bot is in/heading-to the room — these map to the list's "live" bucket and carry a
-// session_uid so the tab subscribes to the copilot stream. awaiting_admission/needs_help are live too.
-const LIVE_STATUSES = new Set(["active", "joining", "requested", "awaiting_admission", "needs_help", "stopping"]);
+// session_uid so the tab subscribes to the copilot stream. awaiting_admission/needs_human_help are live too.
+const LIVE_STATUSES = new Set(["active", "joining", "requested", "awaiting_admission", "needs_human_help", "stopping"]);
 
 let meetings: MeetingMock[] = [];
 const subs = new Set<() => void>();
@@ -149,18 +149,21 @@ function whenLabel(d: MeetingRowDTO, live: boolean): string {
   catch { return "Recorded"; }
 }
 
-function toMock(d: MeetingRowDTO): MeetingMock {
+function toMock(d: MeetingRowDTO): MeetingMock | null {
+  // api.v1 emits JSON integers. JavaScript has already lost identity if an integer exceeds
+  // Number.MAX_SAFE_INTEGER, so never stringify or act on it; api.v2 must move row ids to strings.
+  if (!Number.isSafeInteger(d.id) || d.id <= 0) return null;
+  const id = String(d.id);
   const raw = displayStatus(d);
   const live = LIVE_STATUSES.has(d.status);
   const native = d.native_meeting_id;
   // P0 (cross-tenant leak + wrong-row hydration fix): the tab identity + the live SUBSCRIBE key is the
   // meetings-domain ROW id (`d.id`), NOT the native code. The native id is NOT unique — it collides
   // across a user's re-sends of the same link (distinct rows) and across DIFFERENT tenants. Keying the
-  // tab/subscribe by the row id makes every row a DISTINCT meeting: it subscribes to its OWN row-keyed
-  // transcript stream (`tc:meeting:{id}`) and its OWN copilot out-stream (`agent-meet-{id}`), and fetches
-  // its OWN durable transcript by id. The native id rides on `native_id` for DISPLAY + bot actions
-  // (send/stop target the native), and the readable meeting-doc name.
-  const id = String(d.id);
+    // tab/subscribe by the row id makes every row a DISTINCT meeting: it subscribes to its OWN row-keyed
+    // transcript stream (`tc:meeting:{id}`) and its OWN copilot out-stream (`agent-meet-{id}`), and fetches
+    // its OWN durable transcript by id. The native id rides on `native_id` for display, generic planned-row
+    // intent routes, and the readable meeting-doc name; managed capture controls live in Hub.
   return {
     id,
     native_id: native ?? undefined,
@@ -208,7 +211,10 @@ async function snapshot() {
     // collapse hydrated the wrong row's notes). Dedup is keyed by the ROW id purely to defend against a
     // duplicated row in the list (idempotent), never to merge distinct rows sharing a native.
     const seen = new Set<string>();
-    const next = (list || []).map(toMock).filter((m) => !seen.has(m.id) && (seen.add(m.id), true));
+    const next = (list || [])
+      .map(toMock)
+      .filter((m): m is MeetingMock => m !== null)
+      .filter((m) => !seen.has(m.id) && (seen.add(m.id), true));
     const key = (m: MeetingMock[]) => m.map((x) =>
       `${x.id}|${x.live_status}|${x.has_recording}|${x.title_custom ?? ""}|${x.scheduled_at ?? ""}|${x.workspace_id ?? ""}|${x.auto_join ?? ""}|${x.auto_join_error ?? ""}|${x.native_id ?? ""}|${(x.attendees ?? []).map((a) => a.email).join("+")}`,
     ).join(",");

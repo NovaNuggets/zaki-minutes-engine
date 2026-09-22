@@ -30,6 +30,7 @@ the shipped collector; this package imports nothing from conformance.
 from __future__ import annotations
 
 from .app import create_app
+from .carriers import purge_meeting_redis_carriers
 from .ingest import consume_segments, ingest
 from .ports import PubSub, RedisBus, TranscriptStore, TranscriptWriteRefused
 
@@ -41,4 +42,5 @@ __all__ = [
     "RedisBus",
     "PubSub",
     "TranscriptWriteRefused",
+    "purge_meeting_redis_carriers",
 ]

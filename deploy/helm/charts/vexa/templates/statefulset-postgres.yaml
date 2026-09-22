@@ -17,7 +17,18 @@ spec:
       labels:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: postgres
+      annotations:
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        checksum/database-secret: {{ include "vexa.databaseSecretRolloutChecksum" . | quote }}
     spec:
+      securityContext:
+        fsGroup: {{ .Values.postgres.fsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: {{ .Values.postgres.runAsGroup }}
+        runAsNonRoot: true
+        runAsUser: {{ .Values.postgres.runAsUser }}
+        seccompProfile:
+          type: RuntimeDefault
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -26,6 +37,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
       # v0.10.5 Pack I.s — stateful-pod anti-affinity (#272 iter-5).
       # See deployment-minio.yaml header for the full rationale. Symmetric
       # spread across postgres/redis/minio/tts-service so that on a 2+
@@ -43,12 +58,21 @@ spec:
                       operator: In
                       values: [redis, minio, tts-service]
                 topologyKey: kubernetes.io/hostname
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: postgres
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: {{ .Values.postgres.runAsGroup }}
+            runAsNonRoot: true
+            runAsUser: {{ .Values.postgres.runAsUser }}
           image: "{{ .Values.postgres.image }}"
           imagePullPolicy: IfNotPresent
           # idle_in_transaction_session_timeout=60s auto-kills orphaned
@@ -64,10 +88,14 @@ spec:
               value: "/var/lib/postgresql/data/pgdata"
           envFrom:
             - secretRef:
-                name: {{ .Values.postgres.credentialsSecretName | quote }}
+                name: {{ include "vexa.postgresCredentialsSecretName" . | quote }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
             exec:
               command: ["sh", "-c", "pg_isready -h localhost -p 5432 -U $POSTGRES_USER -d $POSTGRES_DB"]
@@ -80,6 +108,11 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.postgres.resources | nindent 12 }}
+      volumes:
+        - name: postgres-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

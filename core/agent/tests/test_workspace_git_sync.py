@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import control_plane.workspace_git_sync as workspace_git_sync
 from control_plane.workspace_git_sync import (
     RemoteSyncError,
     home_remote,
@@ -113,6 +114,57 @@ def test_pull_with_no_new_commits_is_a_noop(tmp_path):
     a = _clone(bare, tmp_path / "a", seed=True)
     r = pull_origin(a, token=TOKEN)
     assert r.updated is False and r.behind_before == 0
+
+
+def test_authenticated_pull_uses_askpass_without_pat_in_fetch_argv_or_env(monkeypatch, tmp_path):
+    real_run = subprocess.run
+    ws = tmp_path / "ws"
+    (ws / ".git").mkdir(parents=True)
+    askpass_path: Path | None = None
+
+    def fake_run(argv, *, capture_output, text, env):
+        nonlocal askpass_path
+        args = [str(arg) for arg in argv]
+        copied_env = {str(key): str(value) for key, value in env.items()}
+        assert TOKEN not in "\0".join(args)
+        assert TOKEN not in "\0".join(copied_env.values())
+
+        if "fetch" in args:
+            askpass_path = Path(copied_env["GIT_ASKPASS"])
+            username = real_run(
+                [str(askpass_path), "Username for 'https://github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            password = real_run(
+                [str(askpass_path), "Password for 'https://x-access-token@github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert username == "x-access-token"
+            assert password == TOKEN
+
+        if args[-3:] == ["remote", "get-url", "origin"]:
+            stdout = "https://github.com/acme/minutes.git\n"
+        elif args[-3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            stdout = "main\n"
+        elif args[-2:] == ["rev-parse", "FETCH_HEAD"] or args[-2:] == ["rev-parse", "HEAD"]:
+            stdout = "deadbeef\n"
+        elif "rev-list" in args:
+            stdout = "0 0\n"
+        else:
+            stdout = ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(workspace_git_sync.subprocess, "run", fake_run)
+    result = pull_origin(ws, token=TOKEN)
+
+    assert result.head_sha == "deadbeef"
+    assert askpass_path is not None and not askpass_path.exists()
 
 
 def test_pull_refuses_a_divergence(tmp_path):

@@ -6,13 +6,11 @@ Once a workspace has an origin — either an ATTACHED clone (``origin``, kept to
 module keeps it in sync with that home:
 
 - **push**  — fast-forward push of the current branch to the home remote (NEVER forces; a diverged
-  remote fails loud). The token rides on the URL for the push's duration ONLY via the shared
-  ``push_with_token`` mechanic, then is scrubbed (P15).
+  remote fails loud). The token is supplied only by the shared ephemeral askpass mechanic (P15).
 - **pull**  — fetch the home branch and FAST-FORWARD only. A divergence (local has commits the remote
   doesn't, or vice-versa with local changes) is reported as a conflict — no auto-merge, no rebase, no
   force — so the user resolves it deliberately, matching the push philosophy. The token is used for the
-  fetch only and NEVER persisted (we fetch from the authenticated URL as an argument, so no remote or
-  ``.git/config`` credential is ever written).
+  fetch only and NEVER persisted; the token-free URL stays in argv/config.
 - **status** — ahead/behind counts against the last-known remote-tracking ref, computed LOCALLY (no
   network, no token) so the panel can render ``↑2 ↓1`` cheaply on every poll.
 
@@ -30,6 +28,7 @@ from typing import Optional
 
 from shared.adapters import GitPushError, push_with_token
 from shared.gitenv import scrubbed_git_env
+from shared.git_auth import git_credential_env
 
 from control_plane.workspace_publish import PUBLISH_REMOTE, _URL_CREDENTIAL_RE, _display_url
 
@@ -50,12 +49,18 @@ def _redacted(text: str, token: Optional[str]) -> str:
     return text.replace(token, "***") if token else text
 
 
-def _git(ws: Path, *args: str, token: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
+def _git(
+    ws: Path,
+    *args: str,
+    token: Optional[str] = None,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
     """Run a git command in ``ws`` with a scrubbed env + prompts disabled; failures raise a token-redacted
     ``RemoteSyncError`` (unless ``check=False``, which returns the completed process for the caller to read)."""
     proc = subprocess.run(
         ["git", "-C", str(ws), *args], capture_output=True, text=True,
-        env=scrubbed_git_env(GIT_ASKPASS="true", GIT_TERMINAL_PROMPT="0"),
+        env=env or scrubbed_git_env(GIT_ASKPASS="true", GIT_TERMINAL_PROMPT="0"),
     )
     if check and proc.returncode != 0:
         raise RemoteSyncError(_redacted(f"git {' '.join(args)} failed: {proc.stderr.strip()}", token))
@@ -189,8 +194,8 @@ class PullResult:
 def pull_origin(ws: str | Path, *, token: Optional[str] = None) -> PullResult:
     """Fetch the home branch and FAST-FORWARD only. No merge commit, no rebase, no force: a divergence
     (local commits the remote lacks) is reported as a conflict for the user to resolve. The ``token``
-    (optional — public repos need none) is used for the fetch ONLY and NEVER persisted: we fetch from the
-    authenticated URL as an argument, so nothing is written to a remote or ``.git/config`` (P15)."""
+    (optional — public repos need none) is used for the fetch ONLY through ephemeral askpass; the URL in
+    argv and every remote in ``.git/config`` remain token-free (P15)."""
     wsp = Path(ws)
     home = home_remote(wsp)
     if home is None:
@@ -200,12 +205,22 @@ def pull_origin(ws: str | Path, *, token: Optional[str] = None) -> PullResult:
     if not branch:
         raise RemoteSyncError("workspace is on a detached HEAD — check out a branch to pull")
     token = (token or "").strip() or None
-    auth_url = url
-    if token and "://" in url:
-        proto, rest = url.split("://", 1)
-        auth_url = f"{proto}://{token}@{rest}"
-    # Fetch from the URL directly (not a persisted remote) so the credential never lands anywhere.
-    fetch = _git(wsp, "fetch", "--quiet", auth_url, branch, token=token, check=False)
+    # Fetch from the token-free URL directly (not a persisted remote).  A PAT, when present, is
+    # origin-bound and exposed only through the ephemeral askpass helper.
+    try:
+        with git_credential_env(url, token) as auth_env:
+            fetch = _git(
+                wsp,
+                "fetch",
+                "--quiet",
+                url,
+                branch,
+                token=token,
+                check=False,
+                env=dict(auth_env),
+            )
+    except ValueError as exc:
+        raise RemoteSyncError(_redacted(str(exc), token)) from None
     if fetch.returncode != 0:
         raise RemoteSyncError(_redacted(f"fetch from {remote} failed: {fetch.stderr.strip()}", token))
     fetched = _git(wsp, "rev-parse", "FETCH_HEAD", token=token).stdout.strip()

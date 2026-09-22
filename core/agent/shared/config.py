@@ -13,7 +13,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """The agent-api boot config. Every field arrives by ``VEXA_*`` env (12-factor)."""
 
-    model_config = SettingsConfigDict(env_prefix="VEXA_", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="VEXA_", extra="ignore", populate_by_name=True)
 
     # ── Where this service lives ─────────────────────────────────────────────
     agent_api_port: int = Field(default=8100, ge=1, le=65535)
@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # The agent worker is spawned via runtime.v1 under this opaque profile (P11); routine jobs are
     # registered on the same runtime's schedule.v1 surface.
     runtime_api_url: str = "http://runtime-api:8090"
+    # Operator-only credential for the runtime control plane. It authenticates
+    # agent-api itself and is never forwarded in a WorkloadSpec or worker env.
+    runtime_control_secret: SecretStr = SecretStr("")
     agent_profile: str = "agent"
     # How the runtime's scheduler reaches THIS service's /invocations sink when a routine fires.
     agent_api_self_url: str = "http://agent-api:8100"
@@ -93,13 +96,21 @@ class Settings(BaseSettings):
     # workspace git repo) and mirrors the derived index over this internal edge. Empty base URL = the
     # in-memory index (git files stay authoritative; only the "shared with me" listing is degraded).
     admin_api_url: str = ""                       # e.g. http://admin-api:8001; empty = no index mirror
-    # meeting-api base URL — agent-api hits GET /meetings/{id} on it to OWNER-SCOPE the live SSE stream
-    # (P0 cross-tenant leak fix, SSE sibling): the caller-supplied meeting_id (row id) is verified to
-    # belong to the authenticated X-User-Id BEFORE the redis transcript stream is opened, mirroring the
-    # WS /ws authorize_subscribe ownership gate. meeting-api trusts the gateway-injected X-User-Id the
-    # same way its own /transcripts/by-id path does.
+    # meeting-api base URL — used for both the caller-scoped meeting reads and the internal exact-row
+    # owner authority that binds transcription-watcher registration/dispatch to the real user.
     meeting_api_url: str = "http://meeting-api:8080"
-    # The X-Internal-Secret the admin-api's internal tier checks (same value the gateway uses). SecretStr.
+    # Cross-spoke Minutes read runs in agent-api, never in the spawned workspace worker. These
+    # aliases intentionally use the normative unprefixed names shared with the Minutes spoke.
+    minutes_read_enabled: bool = Field(
+        default=False,
+        validation_alias="ZAKI_MINUTES_READ_ENABLED",
+    )
+    minutes_read_base_url: str = Field(
+        default="",
+        validation_alias="ZAKI_MINUTES_READ_BASE_URL",
+    )
+    # The X-Internal-Secret used for Admin/Meeting internal calls. It is intentionally distinct from
+    # the Gateway→Agent identity proof below.
 
     # ── secrets (never logged, committed, or in goldens) — P14 / P15 ─────────
     # Brokered, scoped identity the worker presents (ADR-0003): a port, not a raw key here.
@@ -107,8 +118,45 @@ class Settings(BaseSettings):
     # The shared key the Identity service signs per-dispatch tokens with (dev tier); every boundary
     # verifies with the same key. k8s replaces this with SPIRE-issued SVIDs behind the same interface.
     dispatch_signing_key: SecretStr = SecretStr("dev-dispatch-signing-key")
-    # Internal-tier shared secret for the admin-api membership-index edge (Lane M).
+    # Internal-tier shared secret for admin-api settings and meeting-api row-owner authority edges.
     internal_api_secret: SecretStr = SecretStr("")
+    # Dedicated Gateway→Agent origin proof. This exact unprefixed name is shared only by those two
+    # services; it must never alias the broader internal service credential.
+    gateway_identity_secret: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias="GATEWAY_IDENTITY_SECRET",
+    )
+    # Verification-only overlap for one prior Gateway HMAC key. Gateway signs only with the
+    # current key; Agent accepts this key solely during a bounded operator-led rotation.
+    gateway_identity_previous_secret: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias="GATEWAY_IDENTITY_PREVIOUS_SECRET",
+    )
+    require_gateway_identity: bool = False
+    minutes_read_token: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias="ZAKI_READ_TOKEN_MINUTES",
+    )
+    # Operator-held key material for the Agent-owned erasure receipt. The meeting-api receives a
+    # separately named verifier projection of the same logical HMAC key; neither reaches workers.
+    agent_erasure_signing_key_id: str = Field(
+        default="",
+        validation_alias="ZAKI_AGENT_ERASURE_SIGNING_KEY_ID",
+    )
+    agent_erasure_signing_secret: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias="ZAKI_AGENT_ERASURE_SIGNING_SECRET",
+    )
+    # Verification-only overlap for one prior Agent signer. This never signs a new receipt and is
+    # retained only long enough for in-flight durable erasure plans to replay their original proof.
+    agent_erasure_previous_verification_key_id: str = Field(
+        default="",
+        validation_alias="ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+    )
+    agent_erasure_previous_verification_secret: SecretStr = Field(
+        default=SecretStr(""),
+        validation_alias="ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+    )
 
     def is_secret_present(self) -> bool:
         """True when a scoped identity token has been provided (without revealing it)."""

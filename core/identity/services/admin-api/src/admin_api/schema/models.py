@@ -17,7 +17,7 @@ parent keeps the ORM classes only as a legacy READ fallback guarded by
 `to_regclass('public.recordings') IS NOT NULL`, so omitting the tables is safe.
 """
 from sqlalchemy import (
-    Column, String, Text, Integer, DateTime, Float,
+    BigInteger, Column, String, Text, Integer, DateTime, Float,
     ForeignKey, Index, UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
@@ -34,7 +34,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
     email = Column(String(255), unique=True, index=True, nullable=False)
     name = Column(String(100))
     image_url = Column(Text)
@@ -61,9 +61,9 @@ class PlatformSetting(Base):
 class APIToken(Base):
     __tablename__ = "api_tokens"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
     token = Column(String(255), unique=True, index=True, nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
     scopes = Column(ARRAY(Text), nullable=False, server_default=text("'{}'::text[]"))
     name = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
@@ -79,8 +79,8 @@ class APIToken(Base):
 class Meeting(Base):
     __tablename__ = "meetings"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
     platform = Column(String(100), nullable=False)
     platform_specific_id = Column(String(255), index=True, nullable=True)
     status = Column(String(50), nullable=False, default="requested", index=True)
@@ -119,11 +119,25 @@ class Meeting(Base):
     )
 
 
+class MinutesErasureReceipt(Base):
+    """Content-free durable completion proof retained after the meeting row is deleted."""
+
+    __tablename__ = "minutes_erasure_receipts"
+
+    user_id = Column(BigInteger, primary_key=True)
+    meeting_id = Column(BigInteger, primary_key=True)
+    erased_at = Column(DateTime(timezone=True), nullable=False)
+    policy_version = Column(String(80), nullable=False)
+    receipt = Column(JSONB, nullable=False)
+
+    __table_args__ = (Index("ix_minutes_erasure_receipts_user", "user_id"),)
+
+
 class Transcription(Base):
     __tablename__ = "transcriptions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    meeting_id = Column(BigInteger, ForeignKey("meetings.id"), nullable=False, index=True)
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
     text = Column(Text, nullable=False)
@@ -145,8 +159,8 @@ class Transcription(Base):
 class MeetingSession(Base):
     __tablename__ = "meeting_sessions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    meeting_id = Column(BigInteger, ForeignKey("meetings.id"), nullable=False, index=True)
     session_uid = Column(String, nullable=False, index=True)
     session_start_time = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),

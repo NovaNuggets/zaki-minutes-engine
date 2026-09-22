@@ -1,4 +1,4 @@
-"""Auto-join sweep — "scheduled" MEANS the bot joins.
+"""Legacy upstream auto-join tick (not composed by the Zaki launch-v1 runtime).
 
 One tick scans PLANNED rows in status ``scheduled`` whose ``data.scheduled_at`` has arrived
 (within ``lead_s`` before start, up to ``grace_s`` after — never join hours late) and, unless the
@@ -13,11 +13,11 @@ Failures are LOUD, never silent (P18/P10): a cap/quota rejection or spawn failur
 ``data.auto_join_error`` (+ ``data.auto_join_next_retry`` backoff so one bad row doesn't re-fire
 every tick) — the terminal surfaces it on the meeting row.
 
-``auto_join`` defaults ON when the key is absent — planning a meeting with a time means the bot
-comes, opting out is the explicit act.
+The library's historical row semantics default ``auto_join`` on when absent. Zaki deliberately
+does not run this tick: it lacks managed consent, retention, bot attestation, and withdrawal fencing.
+``ZAKI_MINUTES_AUTO_JOIN_ENABLED=true`` therefore fails boot instead of falling back here.
 
-The tick is a pure-ish function over injected ports (repo, runtime, context fetcher, clock) — the
-entrypoint (``__main__``) wraps it in the standard poll loop; tests drive single ticks offline.
+The tick remains a pure-ish upstream compatibility seam over injected ports; tests drive it offline.
 """
 from __future__ import annotations
 
@@ -30,10 +30,10 @@ from .ports import MaxBotsExceeded, QuotaExceeded, SpawnFailed
 from .service import DuplicateMeeting, request_bot
 from .url_validation import UnsafeMeetingUrl
 
-# Sweep cadence/window env vocabulary (config.v1: all optional, sane defaults).
-DEFAULT_LEAD_S = 60          # AUTO_JOIN_LEAD_S — join this many seconds BEFORE scheduled_at
-DEFAULT_GRACE_S = 600        # AUTO_JOIN_GRACE_S — never join more than this AFTER scheduled_at
-DEFAULT_RETRY_BACKOFF_S = 300  # AUTO_JOIN_RETRY_BACKOFF_S — error-stamped rows wait this long
+# Legacy library defaults; no launch-v1 production env projects them.
+DEFAULT_LEAD_S = 60          # legacy library seam; not composed by the Zaki launch-v1 runtime
+DEFAULT_GRACE_S = 600
+DEFAULT_RETRY_BACKOFF_S = 300
 
 
 def _parse_iso(value: Any) -> Optional[datetime]:

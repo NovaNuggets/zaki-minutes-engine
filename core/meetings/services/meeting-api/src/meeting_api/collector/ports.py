@@ -41,6 +41,23 @@ class TranscriptStore(Protocol):
     ``meetings`` / ``transcriptions`` tables (``meeting.data`` JSONB is the recordings/notes
     home — there is NO separate recordings table)."""
 
+    async def owner_for(self, meeting_id: int) -> Optional[int]:
+        """Return the authoritative owner id for one exact meeting row.
+
+        This is an internal attribution lookup, not a user-authorized transcript read.  It exposes
+        no meeting content and returns ``None`` for a malformed or unknown row id.
+        """
+        ...
+
+    async def connect_meeting_doc_by_id(self, meeting_id: int) -> Optional[dict]:
+        """Connect the canonical generated meeting-doc ref to one exact meeting row.
+
+        The store derives both the owner-backed workspace and native-id-backed path from that row;
+        callers cannot supply either identity carrier. Returns the connected doc, or ``None`` when
+        the row is missing or cannot produce a canonical ref.
+        """
+        ...
+
     async def get_transcript(
         self, user_id: int, platform: str, native_meeting_id: str
     ) -> Optional[dict]:
@@ -75,6 +92,28 @@ class TranscriptStore(Protocol):
     ) -> list[dict]:
         """The user's meetings, newest first — a list of api.v1 ``MeetingResponse``-shaped dicts
         (the body of ``MeetingListResponse``)."""
+        ...
+
+    async def list_zaki_read_meetings(
+        self,
+        user_id: int,
+        *,
+        snapshot,
+        visible_at,
+        before_occurred=None,
+        before_id: Optional[int] = None,
+        inclusive: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Owner-only, keyset-paginated rows for the bounded cross-spoke read plane.
+
+        Filtering by the immutable write snapshot and ``(occurred_at,id)`` cursor happens in the
+        store before pagination, so reprocessing cannot reorder "last meeting" chronology.
+        """
+        ...
+
+    async def get_zaki_read_meeting(self, user_id: int, meeting_id: int) -> Optional[dict]:
+        """One exact owner-only row for ``zaki-read.v1``; foreign and absent both return None."""
         ...
 
     async def authorize_subscribe(
@@ -116,9 +155,9 @@ class TranscriptStore(Protocol):
         ...
 
     def transcript_write_lease(
-        self, meeting_id: int
+        self, meeting_id: int, *, scopes: tuple[str, ...] = ("transcript",)
     ) -> AsyncContextManager[TranscriptBatchWriter]:
-        """Guard persistence and all resulting live publication as one consent-checked unit."""
+        """Guard persistence/publication as one consent- and retention-checked unit."""
         ...
 
     async def connect_doc(
@@ -247,4 +286,8 @@ class RedisBus(Protocol):
         """Append one entry to a redis STREAM (``payload`` is the inner JSON, stored under the
         ``payload`` field). The collector is the SINGLE writer of the per-meeting native transcript
         feed ``tc:meeting:{native}`` (P23) — the copilot worker + terminal SSE read it."""
+        ...
+
+    async def xadd_many(self, stream: str, payloads: list[dict]) -> Any:
+        """Append one bounded transcript batch in a single Redis transaction."""
         ...

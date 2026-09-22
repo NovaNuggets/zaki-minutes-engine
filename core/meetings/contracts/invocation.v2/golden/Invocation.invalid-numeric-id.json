@@ -1,0 +1,18 @@
+{
+  "contractVersion": "invocation.v2",
+  "platform": "google_meet",
+  "meetingUrl": "https://meet.google.com/xxx-xxxx-xxx",
+  "botName": "ZAKI Notetaker",
+  "meeting_id": 42,
+  "transcriptIngestUrl": "http://meeting-api:8080/bots/internal/transcripts/ingest",
+  "retentionFenceUrl": "http://meeting-api:8080/bots/internal/transcripts/fence",
+  "captureExpiresAt": "2026-07-17T12:00:00Z",
+  "managedRetention": {
+    "policyVersion": "minutes-capture.v1",
+    "scopeExpiresAt": {
+      "audio": "2026-07-17T12:00:00Z",
+      "transcript": "2026-08-15T12:00:00Z",
+      "summary": "2026-08-15T12:00:00Z"
+    }
+  }
+}

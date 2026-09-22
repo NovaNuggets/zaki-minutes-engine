@@ -1,6 +1,12 @@
 # Live meeting statuses over WebSocket — user dropdown as source of truth
 
-**Status: ⬜ planned**
+**Status: ✅ implemented; historical implementation notes below are retained for design provenance.**
+
+Current truth: Terminal identity comes from the authenticated cookie/API key path; the gateway
+injects the owner subject; meeting status arrives on the user-scoped WebSocket channel; and live
+transcript SSE additionally verifies the canonical meeting row against that owner before opening any
+Redis stream. There is no production `u_live` fallback. File/line citations in the original plan below
+refer to its pre-implementation snapshot and must not be used as current security documentation.
 
 Push per-meeting status to the Vexa EI terminal over the existing gateway `/ws`,
 on a **user-scoped** channel, and replace the terminal's 4s poll. Add an INTENT

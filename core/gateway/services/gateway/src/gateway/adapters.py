@@ -18,23 +18,81 @@ the conformance harness never imports it — it injects its own in-process fakes
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+import hmac
 import os
 from typing import Optional
 
 from .obs import TRACE_HEADER, get_trace_id
+from .ports import DEFAULT_MAX_BUFFERED_BODY_BYTES, DownstreamBodyTooLarge
+
+
+def load_gateway_identity_secret(environment: Mapping[str, str]) -> str:
+    """Load the dedicated Gateway→Agent identity proof or fail before serving traffic.
+
+    The proof is deliberately not ``INTERNAL_API_SECRET``: that credential is projected into
+    several platform services and therefore cannot establish that a request traversed Gateway.
+    Keeping the parser here makes direct process starts obey the same boundary as packaged deploys.
+    """
+
+    value = environment.get("GATEWAY_IDENTITY_SECRET", "")
+    if (
+        not isinstance(value, str)
+        or not 32 <= len(value) <= 512
+        or value != value.strip()
+        or any(not 0x20 <= ord(character) <= 0x7E for character in value)
+    ):
+        raise RuntimeError(
+            "GATEWAY_IDENTITY_SECRET must be unpadded printable ASCII between "
+            "32 and 512 characters"
+        )
+    internal = environment.get("INTERNAL_API_SECRET", "")
+    if (
+        isinstance(internal, str)
+        and internal.isascii()
+        and hmac.compare_digest(value, internal)
+    ):
+        raise RuntimeError(
+            "GATEWAY_IDENTITY_SECRET must be distinct from INTERNAL_API_SECRET"
+        )
+    return value
+
+
+class _BufferedDownstreamResponse:
+    def __init__(self, status_code: int, content: bytes, headers) -> None:
+        self.status_code = status_code
+        self.content = content
+        self.headers = headers
 
 
 class HttpxDownstreamClient:
     """``DownstreamClient`` over an ``httpx.AsyncClient`` — forwards to meeting-api /
     transcription-collector and returns the response (status + content + headers) verbatim."""
 
-    def __init__(self, client):
+    def __init__(self, client, *, max_response_bytes: int = DEFAULT_MAX_BUFFERED_BODY_BYTES):
         self._client = client
+        self._max_response_bytes = max_response_bytes
 
     async def request(self, method, url, *, headers=None, params=None, content=None):
-        return await self._client.request(
+        async with self._client.stream(
             method, url, headers=headers, params=params or None, content=content
-        )
+        ) as resp:
+            declared = resp.headers.get("content-length")
+            if declared:
+                try:
+                    if int(declared) > self._max_response_bytes:
+                        raise DownstreamBodyTooLarge("upstream response too large")
+                except ValueError:
+                    pass
+
+            chunks: list[bytes] = []
+            received = 0
+            async for chunk in resp.aiter_bytes():
+                received += len(chunk)
+                if received > self._max_response_bytes:
+                    raise DownstreamBodyTooLarge("upstream response too large")
+                chunks.append(chunk)
+            return _BufferedDownstreamResponse(resp.status_code, b"".join(chunks), resp.headers)
 
     async def stream(self, method, url, *, headers=None, params=None, content=None):
         """Open a streaming downstream request and yield the body chunks (SSE — agent chat).
@@ -45,6 +103,13 @@ class HttpxDownstreamClient:
         ) as resp:
             async for chunk in resp.aiter_bytes():
                 yield chunk
+
+    async def open_stream(self, method, url, *, headers=None, params=None, content=None):
+        """Open a byte stream; the gateway closes it after the client finishes or disconnects."""
+        request = self._client.build_request(
+            method, url, headers=headers, params=params or None, content=content
+        )
+        return await self._client.send(request, stream=True)
 
 
 class AdminApiAuthorizer:
@@ -122,6 +187,7 @@ def build_production_app(
     meeting_api_url = meeting_api_url or os.getenv("MEETING_API_URL", "http://meeting-api:8080")
     agent_api_url = os.getenv("AGENT_API_URL", "http://agent-api:8100")
     redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
+    gateway_identity_secret = load_gateway_identity_secret(os.environ)
 
     http_client = httpx.AsyncClient(timeout=30.0)
     redis_client = aioredis.from_url(
@@ -143,6 +209,7 @@ def build_production_app(
         agent_api_url=agent_api_url,  # P20·Stage 2: the agent control plane fronted under /api/*
         admin_api_url=admin_api_url,  # /user/webhook self-serve proxies to identity (admin-api)
         rate_limiter=_rate_limiter_from_env(),  # WS-6: per-user DoS guard (generous defaults; env-tunable)
+        gateway_identity_secret=gateway_identity_secret,
     )
 
     # --- fastapi-guard: per-IP rate limiting, IP allow/deny + auto-ban (edge_guard.py) ---

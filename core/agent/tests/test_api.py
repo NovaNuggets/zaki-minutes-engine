@@ -42,6 +42,7 @@ VALID_INV = {
 class _FakeRuntime:
     def __init__(self):
         self.spawned = []
+        self.stopped = []
 
     def spawn(self, workload_id, profile, env):
         self.spawned.append((workload_id, profile, env))
@@ -49,6 +50,10 @@ class _FakeRuntime:
 
     def await_done(self, workload_id, timeout_sec=0.0):
         return "completed"
+
+    def stop(self, workload_id):
+        self.stopped.append(workload_id)
+        return "stopped"
 
 
 class _FakeIdentity:
@@ -137,6 +142,7 @@ def test_chat_streams_sse_and_records_session():
     sessions = c.get("/api/sessions", params={"subject": "u_jane"}).json()["sessions"]
     assert any(s["session"] == "s1" for s in sessions)
     assert r.headers["X-Unit-Id"] == "agent-u_jane-chat-s1"  # the per-thread warm unit id
+    assert r.headers["Cache-Control"] == "no-store"
 
 
 # ── chat credential preflight (config.v1 model_inference) ────────────────────────────────────────
@@ -202,6 +208,33 @@ def test_chat_preflight_honors_user_custom_model_config(monkeypatch):
     r2 = c2.post("/api/chat", json={"prompt": "hi", "subject": "u_jane", "session": "s1"})
     assert r2.status_code == 200 and '"error"' in r2.text
     assert runtime2.spawned == []
+
+
+def test_chat_refuses_blocked_personal_model_before_dispatch():
+    """A revoked personal endpoint is authoritative even when operator credentials exist.
+
+    The front door must return a stable, actionable SSE error without minting/spawning a unit or
+    creating a ghost session.  Falling through to ``Dispatcher.dispatch`` turns this policy state
+    into an unhandled 500 after identity-token minting.
+    """
+    c, runtime = _preflight_client(_FakeModelConfig({
+        "mode": "custom",
+        "model": None,
+        "meeting_model": None,
+        "blocked": True,
+        "config_status": "blocked",
+        "validation_error": "Endpoint is no longer approved by the operator.",
+    }))
+
+    r = c.post("/api/chat", json={"prompt": "hi", "subject": "u_jane", "session": "s1"})
+
+    assert r.status_code == 200
+    assert '"error"' in r.text and '"turn-complete"' in r.text
+    assert "blocked by operator policy" in r.text
+    assert "Endpoint is no longer approved" not in r.text
+    assert runtime.spawned == []
+    sessions = c.get("/api/sessions", params={"subject": "u_jane"}).json()["sessions"]
+    assert sessions == []
 
 
 def test_chat_preflight_fails_open_when_model_config_lookup_errors(monkeypatch):
@@ -343,14 +376,12 @@ def test_chat_resume_reattaches_without_a_second_dispatch():
         "resume re-dispatched a turn — a reconnect must re-attach to the warm unit, not run it twice"
 
 
-def test_meeting_start_threads_transcript_tail_cursor(monkeypatch):
+def test_legacy_native_meeting_start_is_disabled_before_redis_or_dispatch(monkeypatch):
     import redis
 
     class FakeRedis:
-        def xrevrange(self, stream, count=1):
-            assert stream == "tc:meeting:abc-defg-hij"
-            assert count == 1
-            return [("42-0", {})]
+        def xrevrange(self, *_args, **_kwargs):
+            raise AssertionError("legacy start must not inspect a native-keyed transcript")
 
     monkeypatch.setattr(redis, "from_url", lambda *_args, **_kwargs: FakeRedis())
     runtime = _FakeRuntime()
@@ -358,11 +389,15 @@ def test_meeting_start_threads_transcript_tail_cursor(monkeypatch):
         Dispatcher(load_settings(), runtime, _FakeIdentity()), redis_url="redis://test",
     ))
 
-    r = c.post("/api/meeting/start", json={"platform": "google_meet", "native_id": "abc-defg-hij", "subject": "u_jane"})
+    r = c.post(
+        "/api/meeting/start",
+        headers={"X-User-Id": "u_jane"},
+        json={"platform": "google_meet", "native_id": "abc-defg-hij", "subject": "ignored"},
+    )
 
-    assert r.status_code == 202
-    env = runtime.spawned[0][2]
-    assert env["VEXA_TRANSCRIPT_START_ID"] == "42-0"
+    assert r.status_code == 410
+    assert r.json()["detail"] == "native-only meeting start is no longer supported"
+    assert runtime.spawned == []
 
 
 def test_meeting_process_on_sets_desired_state_only(monkeypatch):
@@ -373,7 +408,7 @@ def test_meeting_process_on_sets_desired_state_only(monkeypatch):
 
     class FakeRedis:
         def __init__(self):
-            self.kv = {"proc:meeting:m9:cursor": "37-0"}  # we cleaned up to 37-0 last time
+            self.kv = {"proc:meeting:9:cursor": "37-0"}  # we cleaned up to 37-0 last time
 
         def set(self, k, v, ex=None):
             self.kv[k] = v
@@ -386,18 +421,32 @@ def test_meeting_process_on_sets_desired_state_only(monkeypatch):
         def delete(self, k):
             self.kv.pop(k, None)
 
+        def activate_processing_if_writable(
+            self, *, flag_key, cursor_key, ttl_seconds, token, **_kwargs
+        ):
+            self.set(flag_key, token, ex=ttl_seconds)
+            return True, self.get(cursor_key)
+
     fake = FakeRedis()
     monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
     runtime = _FakeRuntime()
     c = TestClient(create_app(
         Dispatcher(load_settings(), runtime, _FakeIdentity()), redis_url="redis://test",
+        meeting_owner_lookup=lambda user, row: (
+            {"id": 9, "user_id": "u_jane", "native_meeting_id": "m9"}
+            if (user, row) == ("u_jane", "9") else None
+        ),
     ))
 
-    r = c.post("/api/meeting/process", json={"native_id": "m9", "on": True, "subject": "u_jane"})
+    r = c.post(
+        "/api/meeting/process",
+        headers={"X-User-Id": "u_jane"},
+        json={"meeting_id": "9", "native_id": "m9", "on": True, "subject": "ignored"},
+    )
 
     assert r.status_code == 202
     assert r.json()["resumed_from"] == "37-0"           # where the watcher's arm WILL resume
-    assert fake.kv.get("proc:meeting:m9:on") == "1"     # desired state written
+    assert fake.kv.get("proc:meeting:9:on")              # opaque desired-state generation written
     assert runtime.spawned == []                        # NO dispatch from the endpoint — watcher's job
 
 
@@ -418,16 +467,106 @@ def test_meeting_process_no_cursor_reports_full_history(monkeypatch):
         def delete(self, k):
             type(self).kv.pop(k, None)
 
+        def activate_processing_if_writable(
+            self, *, flag_key, cursor_key, ttl_seconds, token, **_kwargs
+        ):
+            self.set(flag_key, token, ex=ttl_seconds)
+            return True, self.get(cursor_key)
+
     monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: FakeRedis())
     runtime = _FakeRuntime()
     c = TestClient(create_app(
         Dispatcher(load_settings(), runtime, _FakeIdentity()), redis_url="redis://test",
+        meeting_owner_lookup=lambda user, row: (
+            {"id": 10, "user_id": "u_jane", "native_meeting_id": "m10"}
+            if (user, row) == ("u_jane", "10") else None
+        ),
     ))
 
-    r = c.post("/api/meeting/process", json={"native_id": "m10", "on": True})
+    r = c.post(
+        "/api/meeting/process",
+        headers={"X-User-Id": "u_jane"},
+        json={"meeting_id": "10", "native_id": "m10", "on": True},
+    )
 
     assert r.json()["resumed_from"] == "0-0"
     assert runtime.spawned == []
+
+
+def test_meeting_process_refuses_a_retention_fenced_meeting(monkeypatch):
+    import redis
+
+    class FencedRedis:
+        def __init__(self):
+            self.kv = {"zaki:retention:meeting:41:fence": {"processed": "1"}}
+
+        def set(self, key, value, ex=None):
+            self.kv[key] = value
+
+        def get(self, key):
+            return self.kv.get(key)
+
+        def delete(self, key):
+            self.kv.pop(key, None)
+
+        def activate_processing_if_writable(self, **_kwargs):
+            return False, None
+
+    fake = FencedRedis()
+    monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        redis_url="redis://test",
+        meeting_owner_lookup=lambda user, row: (
+            {"id": 41, "user_id": "u_jane", "native_meeting_id": "abc-defg-hij"}
+            if (user, row) == ("u_jane", "41") else None
+        ),
+    ))
+
+    response = c.post(
+        "/api/meeting/process",
+        headers={"X-User-Id": "u_jane"},
+        json={"native_id": "abc-defg-hij", "meeting_id": "41", "on": True},
+    )
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == "meeting processing is no longer available"
+    assert "proc:meeting:41:on" not in fake.kv
+
+
+def test_meeting_process_fails_closed_when_retention_authority_is_unavailable(monkeypatch):
+    import redis
+
+    class UnavailableRedis:
+        def __init__(self):
+            self.kv = {}
+
+        def delete(self, key):
+            self.kv.pop(key, None)
+
+        def activate_processing_if_writable(self, **_kwargs):
+            raise TimeoutError("redis unavailable")
+
+    fake = UnavailableRedis()
+    monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        redis_url="redis://test",
+        meeting_owner_lookup=lambda user, row: (
+            {"id": 41, "user_id": "u_jane", "native_meeting_id": "abc-defg-hij"}
+            if (user, row) == ("u_jane", "41") else None
+        ),
+    ))
+
+    response = c.post(
+        "/api/meeting/process",
+        headers={"X-User-Id": "u_jane"},
+        json={"native_id": "abc-defg-hij", "meeting_id": "41", "on": True},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "meeting processing authority is unavailable"
+    assert "proc:meeting:41:on" not in fake.kv
 
 
 def test_meeting_process_off_freezes_cursor(monkeypatch):
@@ -436,7 +575,7 @@ def test_meeting_process_off_freezes_cursor(monkeypatch):
 
     class FakeRedis:
         def __init__(self):
-            self.kv = {"proc:meeting:m9:on": "1", "proc:meeting:m9:cursor": "37-0"}
+            self.kv = {"proc:meeting:9:on": "generation", "proc:meeting:9:cursor": "37-0"}
 
         def set(self, k, v, ex=None):
             self.kv[k] = v
@@ -451,15 +590,25 @@ def test_meeting_process_off_freezes_cursor(monkeypatch):
 
     fake = FakeRedis()
     monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
+    runtime = _FakeRuntime()
     c = TestClient(create_app(
-        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()), redis_url="redis://test",
+        Dispatcher(load_settings(), runtime, _FakeIdentity()), redis_url="redis://test",
+        meeting_owner_lookup=lambda user, row: (
+            {"id": 9, "user_id": "u_jane", "native_meeting_id": "m9"}
+            if (user, row) == ("u_jane", "9") else None
+        ),
     ))
 
-    r = c.post("/api/meeting/process", json={"native_id": "m9", "on": False})
+    r = c.post(
+        "/api/meeting/process",
+        headers={"X-User-Id": "u_jane"},
+        json={"meeting_id": "9", "native_id": "m9", "on": False},
+    )
 
     assert r.json()["processing"] is False
-    assert "proc:meeting:m9:on" not in fake.kv          # flag cleared
-    assert fake.kv["proc:meeting:m9:cursor"] == "37-0"  # cursor frozen
+    assert "proc:meeting:9:on" not in fake.kv          # flag cleared
+    assert fake.kv["proc:meeting:9:cursor"] == "37-0"  # cursor frozen
+    assert runtime.stopped == ["agent-meet-9"]          # active copilot authoritatively stopped
 
 
 def test_meeting_stream_seeds_recent_tail_without_replaying_from_zero(monkeypatch):
@@ -472,12 +621,12 @@ def test_meeting_stream_seeds_recent_tail_without_replaying_from_zero(monkeypatc
             self.calls = 0
 
         def xrevrange(self, stream, count=1):
-            if stream == "tc:meeting:abc":
+            if stream == "tc:meeting:41":
                 return [
                     ("9-0", {"payload": json.dumps({"type": "transcription", "segments": [{"speaker": "Recent", "text": "tail", "start": 9, "segment_id": "recent"}]})}),
                     ("8-0", {"payload": json.dumps({"type": "transcription", "segments": [{"speaker": "Older", "text": "still recent", "start": 8, "segment_id": "older"}]})}),
                 ]
-            if stream == "unit:agent-meet-abc:out":
+            if stream == "unit:agent-meet-41:out":
                 return [
                     ("4-0", {"event": json.dumps({"type": "note", "note": {"id": "n1", "text": "processed tail"}})}),
                 ]
@@ -487,21 +636,22 @@ def test_meeting_stream_seeds_recent_tail_without_replaying_from_zero(monkeypatc
             self.calls += 1
             if self.first_xread is None:
                 self.first_xread = dict(streams)
-                return [("tc:meeting:abc", [("10-0", {"payload": json.dumps({"type": "session_end"})})])]
+                return [("tc:meeting:41", [("10-0", {"payload": json.dumps({"type": "session_end"})})])]
             return []
 
     fake = FakeRedis()
     monkeypatch.setattr(redis, "from_url", lambda *_args, **_kwargs: fake)
     c = TestClient(create_app(
         Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()), redis_url="redis://test",
-        meeting_owner_lookup=_fake_owner_lookup({("u_owner", "abc"): "abc"}),
+        meeting_owner_lookup=_fake_owner_lookup({("u_owner", "41"): "native-41"}),
     ))
 
-    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "abc", "session_uid": "abc"},
+    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "41", "session_uid": "41"},
                   headers={"X-User-Id": "u_owner"}) as r:
         body = "".join(r.iter_text())
 
     assert r.status_code == 200
+    assert r.headers["Cache-Control"] == "no-store"
     assert '"text": "still recent"' in body
     assert '"text": "tail"' in body
     assert '"processed tail"' in body
@@ -509,7 +659,7 @@ def test_meeting_stream_seeds_recent_tail_without_replaying_from_zero(monkeypatc
     # transcript/output resume from their seeded tails; the proc stream from 0-0 (full replay —
     # notes upsert by id client-side, and the whole processed view must render on connect).
     assert fake.first_xread == {
-        "tc:meeting:abc": "9-0", "unit:agent-meet-abc:out": "4-0", "proc:meeting:abc": "0-0",
+        "tc:meeting:41": "9-0", "unit:agent-meet-41:out": "4-0", "proc:meeting:41": "0-0",
     }
 
 
@@ -612,6 +762,155 @@ def test_workspace_upload_saves_hash_prefixed_files_under_subject(tmp_path):
     assert (tmp_path / "u_jane" / files[0]["path"]).read_bytes() == first
     assert (tmp_path / "u_jane" / files[1]["path"]).read_bytes() == second
     assert not (tmp_path / "same.txt").exists()
+
+
+def test_workspace_upload_reads_files_in_bounded_chunks(tmp_path, monkeypatch):
+    from starlette.datastructures import UploadFile as StarletteUploadFile
+
+    from control_plane.workspace_reader import WorkspaceReader
+
+    original_read = StarletteUploadFile.read
+
+    async def reject_unbounded_read(self, size=-1):
+        if size is None or size < 0:
+            raise AssertionError("upload route attempted an unbounded read")
+        return await original_read(self, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", reject_unbounded_read)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ), raise_server_exceptions=False)
+
+    r = c.post("/api/workspace/upload", files=[("files", ("note.txt", b"small", "text/plain"))])
+
+    assert r.status_code == 200
+
+
+def test_workspace_upload_refuses_symlinked_upload_directory(tmp_path):
+    """A worker can write inside its own workspace, including creating symlinks. Agent API mounts the
+    workspace root containing every tenant, so it must never follow that link for a later upload."""
+    from control_plane.workspace_reader import WorkspaceReader
+
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    attacker = tmp_path / "u_jane"
+    attacker.mkdir()
+    (attacker / "uploads").symlink_to(victim, target_is_directory=True)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ))
+
+    response = c.post(
+        "/api/workspace/upload",
+        files=[("files", ("private.txt", b"must-stay-with-attacker", "text/plain"))],
+    )
+
+    assert response.status_code in (400, 507)
+    assert list(victim.iterdir()) == []
+
+
+def test_workspace_upload_ignores_lying_length_and_rejects_aggregate_before_writes(tmp_path, monkeypatch):
+    from control_plane import api as api_module
+    from control_plane.workspace_reader import WorkspaceReader
+
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_TOTAL_BYTES", 10, raising=False)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ))
+
+    r = c.post(
+        "/api/workspace/upload",
+        headers={"Content-Length": "1"},
+        files=[
+            ("files", ("one.txt", b"123456", "text/plain")),
+            ("files", ("two.txt", b"abcdef", "text/plain")),
+        ],
+    )
+
+    assert r.status_code == 413
+    assert r.json() == {"detail": "upload batch exceeds 25MB"}
+    uploads = tmp_path / "u_live" / "uploads"
+    assert not uploads.exists() or list(uploads.iterdir()) == []
+
+
+def test_workspace_upload_rejects_aggregate_without_content_length(tmp_path, monkeypatch):
+    from control_plane import api as api_module
+    from control_plane.workspace_reader import WorkspaceReader
+
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_TOTAL_BYTES", 10, raising=False)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ))
+    boundary = "vexa-upload-boundary"
+    body = iter([
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"one.txt\"\r\n"
+        "Content-Type: text/plain\r\n\r\n".encode(),
+        b"123456",
+        f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"two.txt\"\r\n"
+        "Content-Type: text/plain\r\n\r\n".encode(),
+        b"abcdef",
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+
+    r = c.post(
+        "/api/workspace/upload",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        content=body,
+    )
+
+    assert r.status_code == 413
+    assert r.json() == {"detail": "upload batch exceeds 25MB"}
+    uploads = tmp_path / "u_live" / "uploads"
+    assert not uploads.exists() or list(uploads.iterdir()) == []
+
+
+def test_workspace_upload_enforces_per_file_limit_on_actual_bytes(tmp_path, monkeypatch):
+    from control_plane import api as api_module
+    from control_plane.workspace_reader import WorkspaceReader
+
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_BYTES", 10)
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_TOTAL_BYTES", 100)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ))
+
+    r = c.post(
+        "/api/workspace/upload",
+        headers={"Content-Length": "1"},
+        files=[("files", ("large.txt", b"12345678901", "text/plain"))],
+    )
+
+    assert r.status_code == 413
+    assert r.json() == {"detail": "upload exceeds 25MB"}
+    assert not (tmp_path / "u_live" / "uploads").exists()
+
+
+def test_workspace_upload_bounds_zero_byte_file_fanout(tmp_path, monkeypatch):
+    from control_plane import api as api_module
+    from control_plane.workspace_reader import WorkspaceReader
+
+    monkeypatch.setattr(api_module, "MAX_UPLOAD_FILES", 1)
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()),
+        reader=WorkspaceReader(str(tmp_path)),
+    ))
+
+    r = c.post(
+        "/api/workspace/upload",
+        files=[
+            ("files", ("one.txt", b"", "text/plain")),
+            ("files", ("two.txt", b"", "text/plain")),
+        ],
+    )
+
+    assert r.status_code == 413
+    assert r.json() == {"detail": "too many upload files"}
+    assert not (tmp_path / "u_live" / "uploads").exists()
 
 
 def test_workspace_tree_hidden_mode(tmp_path):
@@ -812,7 +1111,7 @@ def _stream_client(fake_redis, monkeypatch):
     monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake_redis)
     return TestClient(create_app(
         Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()), redis_url="redis://test",
-        meeting_owner_lookup=_fake_owner_lookup({("u_owner", "m1"): "m1"}),
+        meeting_owner_lookup=_fake_owner_lookup({("u_owner", "43"): "native-43"}),
     ))
 
 
@@ -834,7 +1133,7 @@ class _StreamRedis:
             self.xread_last = dict(last)
         if self._reads == 1:
             import json as _j
-            return [("tc:meeting:m1", [("9-0", {"payload": _j.dumps({"type": "session_end"})})])]
+            return [("tc:meeting:43", [("9-0", {"payload": _j.dumps({"type": "session_end"})})])]
         return []   # drain → ending → meeting-end → return
 
 
@@ -844,25 +1143,25 @@ def test_sse_resumes_from_last_event_id_no_reseed(monkeypatch):
     delivered, not skipped."""
     fr = _StreamRedis()
     c = _stream_client(fr, monkeypatch)
-    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "m1", "session_uid": "m1"},
+    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "43", "session_uid": "43"},
                   headers={"Last-Event-ID": "7-0|3-0", "X-User-Id": "u_owner"}) as r:
         assert r.status_code == 200
         _ = r.read()
-    assert fr.xread_last["tc:meeting:m1"] == "7-0"          # resumed from the cursor, NOT "$"
-    assert fr.xread_last["unit:agent-meet-m1:out"] == "3-0"
-    assert "tc:meeting:m1" not in fr.seeded                 # transcript tail NOT re-seeded on resume
+    assert fr.xread_last["tc:meeting:43"] == "7-0"          # resumed from the cursor, NOT "$"
+    assert fr.xread_last["unit:agent-meet-43:out"] == "3-0"
+    assert "tc:meeting:43" not in fr.seeded                 # transcript tail NOT re-seeded on resume
 
 
 def test_sse_fresh_connect_seeds_and_tails(monkeypatch):
     """No Last-Event-ID (fresh connect): seed the bounded transcript tail, then live-tail from there."""
     fr = _StreamRedis()
     c = _stream_client(fr, monkeypatch)
-    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "m1", "session_uid": "m1"},
+    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "43", "session_uid": "43"},
                   headers={"X-User-Id": "u_owner"}) as r:
         assert r.status_code == 200
         _ = r.read()
-    assert "tc:meeting:m1" in fr.seeded                     # fresh connect DID seed the tail
-    assert fr.xread_last["tc:meeting:m1"] == "$"            # then tails live from now
+    assert "tc:meeting:43" in fr.seeded                     # fresh connect DID seed the tail
+    assert fr.xread_last["tc:meeting:43"] == "$"            # then tails live from now
 
 
 # ── SSE cross-tenant ownership regression (P0 — the FIX-FIRST blocker) ────────────────────────────
@@ -916,14 +1215,14 @@ def test_sse_cross_tenant_meeting_stream_is_refused(monkeypatch):
     r = c_no_fallback.get("/api/meeting/stream", params={"meeting_id": "10", "session_uid": "aaa-bbb-ccc"})
     assert r.status_code == 401
 
-    # B's OWN row streams fine.
-    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "20", "session_uid": "xxx-yyy-zzz"},
+    # B's OWN row streams fine, using only the canonical owner-proven row as the carrier key.
+    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "20", "session_uid": "20"},
                   headers={"X-User-Id": "u_bob"}) as r:
         assert r.status_code == 200
         _ = r.read()
 
     # A streams her OWN row fine.
-    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "10", "session_uid": "aaa-bbb-ccc"},
+    with c.stream("GET", "/api/meeting/stream", params={"meeting_id": "10", "session_uid": "10"},
                   headers={"X-User-Id": "u_alice"}) as r:
         assert r.status_code == 200
         _ = r.read()
@@ -936,6 +1235,47 @@ def test_sse_owned_row_but_foreign_session_uid_is_refused(monkeypatch):
     r = c.get("/api/meeting/stream", params={"meeting_id": "20", "session_uid": "aaa-bbb-ccc"},
               headers={"X-User-Id": "u_bob"})
     assert r.status_code == 403
+
+
+def test_sse_owned_row_but_legacy_native_session_uid_is_refused(monkeypatch):
+    """A caller may own the row, but native meeting links are not tenant-unique carrier addresses.
+    The old native-id fallback could join another tenant's legacy out-stream after link reuse."""
+    c = _xtenant_stream_client(monkeypatch)
+    r = c.get("/api/meeting/stream", params={"meeting_id": "20", "session_uid": "xxx-yyy-zzz"},
+              headers={"X-User-Id": "u_bob"})
+    assert r.status_code == 403
+
+
+def test_sse_rejects_noncanonical_row_before_owner_or_redis(monkeypatch):
+    calls = []
+
+    def lookup(user_id, meeting_id):
+        calls.append((user_id, meeting_id))
+        return {"id": 10, "user_id": user_id, "native_meeting_id": "native"}
+
+    c = TestClient(create_app(
+        Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()), redis_url="redis://test",
+        meeting_owner_lookup=lookup,
+    ))
+    r = c.get("/api/meeting/stream", params={"meeting_id": "010", "session_uid": "010"},
+              headers={"X-User-Id": "u_alice"})
+    assert r.status_code == 403
+    assert calls == []
+
+
+def test_sse_rejects_malformed_owner_authority_record(monkeypatch):
+    for record in (
+        {"id": 11, "user_id": "u_alice", "native_meeting_id": "native"},
+        {"id": 10, "user_id": "u_bob", "native_meeting_id": "native"},
+        {"id": "10", "native_meeting_id": "native"},
+    ):
+        c = TestClient(create_app(
+            Dispatcher(load_settings(), _FakeRuntime(), _FakeIdentity()), redis_url="redis://test",
+            meeting_owner_lookup=lambda _user, _meeting, value=record: value,
+        ))
+        r = c.get("/api/meeting/stream", params={"meeting_id": "10", "session_uid": "10"},
+                  headers={"X-User-Id": "u_alice"})
+        assert r.status_code == 403
 
 
 def test_workspace_init_seeds_from_template(tmp_path, monkeypatch):
@@ -1235,7 +1575,7 @@ def test_chat_accepts_context_bundle_and_folds_digest_into_prompt():
     assert start.endswith("what's my next meeting?")
 
 
-def test_chat_doc_surface_stays_lean_and_legacy_active_still_grounds():
+def test_chat_doc_surface_stays_lean_and_native_only_active_fails_closed():
     runtime = _FakeRuntime()
     c = TestClient(create_app(
         Dispatcher(load_settings(), runtime, _FakeIdentity()), stream_reader=_FakeReader(),
@@ -1248,15 +1588,17 @@ def test_chat_doc_surface_stays_lean_and_legacy_active_still_grounds():
     })
     assert r.status_code == 200
     assert "<schedule" not in runtime.spawned[-1][2]["VEXA_START"]  # JSON-encoded, substring still valid
-    # legacy body (active only, no context) → prep grounding from client fields, as before
+    # A native-only legacy body has no owner-proven numeric row. Client display fields must not become
+    # meeting grounding or select a Redis carrier; keep only the caller's prompt.
     r = c.post("/api/chat", headers={"X-User-Id": "u_jane"}, json={
         "prompt": "hi", "session": "s-legacy",
         "active": {"kind": "meeting", "native_id": "abc", "platform": "google_meet",
                    "status": "scheduled", "title": "Legacy"},
     })
     assert r.status_code == 200
-    start = runtime.spawned[-1][2]["VEXA_START"]
-    assert "PREPARE" in start and "Legacy" in start and "<schedule" not in start
+    import json as _json
+    start = _json.loads(runtime.spawned[-1][2]["VEXA_START"])["entrypoint"]["inline"]
+    assert start == "hi"
 
 
 # ── the 'Reconnecting' hang fixes (incident, user 28): attach-gap + no-cursor retry + keepalives ──

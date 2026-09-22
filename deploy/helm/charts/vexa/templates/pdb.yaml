@@ -13,7 +13,8 @@ drains indefinitely, which is typically the opposite of what you
 want.
 */}}
 {{- range $name, $cfg := .Values.podDisruptionBudgets }}
-{{- if $cfg.enabled }}
+{{- $component := index $.Values $name -}}
+{{- if and $cfg.enabled $component.enabled }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

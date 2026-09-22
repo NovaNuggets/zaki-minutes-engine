@@ -18,6 +18,7 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from .identifiers import validate_native_meeting_id, validate_platform
 from .ports import MaxBotsExceeded, MeetingRepo, QuotaExceeded, RuntimeClient, SpawnFailed, TranscriptionNotConfigured
 from .service import DuplicateMeeting, construct_meeting_url, request_bot
 from .url_validation import UnsafeMeetingUrl, validate_meeting_url
@@ -111,8 +112,15 @@ def _resolve_max_concurrent(x_user_limits: Optional[str]) -> Optional[int]:
     return None
 
 
-def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
+def build_router(
+    repo: MeetingRepo,
+    runtime: RuntimeClient,
+    *,
+    create_enabled: bool = True,
+) -> APIRouter:
     """The bot-spawn routes over the injected ``MeetingRepo`` + ``RuntimeClient`` ports."""
+    if not isinstance(create_enabled, bool):
+        raise ValueError("bot create policy must be boolean")
     router = APIRouter()
 
     @router.post("/bots", status_code=201)
@@ -124,6 +132,15 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
         x_user_webhook_secret: Optional[str] = Header(default=None),
         x_user_webhook_events: Optional[str] = Header(default=None),
     ):
+        # ZAKI's downstream deployment requires every new capture to cross the managed Minutes
+        # consent/retention boundary. Keep the legacy route present for a deterministic denial,
+        # but do not parse its body or touch any downstream when managed-only mode is active.
+        if not create_enabled:
+            return JSONResponse(
+                status_code=403,
+                content={"error": {"code": "managed_capture_required"}},
+                headers={"Cache-Control": "no-store"},
+            )
         user_id = _resolve_user_id(x_user_id)
         max_concurrent = _resolve_max_concurrent(x_user_limits)
         # Per-user webhook config the gateway forwarded from identity (persisted into meeting.data).
@@ -143,14 +160,19 @@ def build_router(repo: MeetingRepo, runtime: RuntimeClient) -> APIRouter:
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="body must be an object")
 
-        platform = str(body.get("platform", "")).strip()
-        native_meeting_id = str(body.get("native_meeting_id", "")).strip()
         meeting_url = body.get("meeting_url")
+        try:
+            platform = validate_platform(body.get("platform"))
+            native_meeting_id = validate_native_meeting_id(
+                body.get("native_meeting_id", ""), allow_empty=meeting_url is not None
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
         # A caller-supplied meeting_url is an any-URL passthrough to the bot's browser
         # (zoom/jitsi) — validate at the point of entry (SSRF hygiene, 422 on violation).
         if meeting_url is not None:
             meeting_url = _validate_meeting_url(meeting_url, platform=platform)
-        if not platform or (not native_meeting_id and not meeting_url):
+        if not native_meeting_id and not meeting_url:
             raise HTTPException(
                 status_code=422,
                 detail="'platform' and 'native_meeting_id' (or 'meeting_url') are required",

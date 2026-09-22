@@ -145,6 +145,11 @@ def test_01_health(stack):
         assert code == 200, f"/health on {url} → {code} {body}"
         # runtime returns {status:ok, checks:{...}}; the others {status:ok, service:...}
         assert isinstance(body, dict) and body.get("status") in ("ok",), f"{url} body {body}"
+    # Redis health proves both halves of the boundary: anonymous commands are refused while the
+    # operator-owned credential used by trusted control-plane consumers succeeds.
+    unauthenticated = stack.redis_cli_unauthenticated("PING")
+    assert unauthenticated.startswith("NOAUTH "), unauthenticated
+    assert stack.redis_cli("PING") == "PONG"
     print(f"\n[1/health] 200 on gateway·meeting-api·runtime·admin-api")
 
 
@@ -240,9 +245,15 @@ def test_05_recording_to_minio(stack):
     platform, native_id = "google_meet", f"rec-{uuid.uuid4().hex[:8]}"
     meeting_id, session_uid = _insert_meeting(stack, user_id, platform, native_id)
 
-    # The bot authenticates uploads with a MeetingToken (HS256, signed with ADMIN_TOKEN — the admin
-    # secret meeting-api mints AND verifies with, like main; INTERNAL_API_SECRET is a different concern).
-    token = mint_meeting_token(meeting_id, user_id, platform, native_id, secret=stack.admin_token)
+    # The bot authenticates uploads with a MeetingToken signed by meeting-api's dedicated key.
+    token = mint_meeting_token(
+        meeting_id,
+        user_id,
+        platform,
+        native_id,
+        session_uid=session_uid,
+        secret=stack.meeting_token_secret,
+    )
 
     chunk = _canonical_wav(b"gate-compose-recording-chunk-pcm-payload")
     fields = {
@@ -437,7 +448,12 @@ def test_03_real_bot_spawn_joining(stack):
                 break
             time.sleep(2)
         if appeared != container_name:
-            _code, wl = http("GET", f"{stack.runtime}/workloads/{workload_id}", timeout=15)
+            _code, wl = http(
+                "GET",
+                f"{stack.runtime}/workloads/{workload_id}",
+                headers={"X-Runtime-Control-Secret": stack.runtime_control_secret},
+                timeout=15,
+            )
             reason = wl.get("stopReason") if isinstance(wl, dict) else wl
             pytest.fail(
                 f"bot container {container_name} did not appear (saw {appeared!r}); "
@@ -486,7 +502,12 @@ def test_03_real_bot_spawn_joining(stack):
         print(f"\n[3/bot] real container {container_name} appeared in docker ps; meeting advanced to joining")
     finally:
         # Stop + clean the bot: destroy the runtime workload (docker rm -f), then belt-and-suspenders.
-        http("DELETE", f"{stack.runtime}/workloads/{workload_id}", timeout=30)
+        http(
+            "DELETE",
+            f"{stack.runtime}/workloads/{workload_id}",
+            headers={"X-Runtime-Control-Secret": stack.runtime_control_secret},
+            timeout=30,
+        )
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=30)
 
 

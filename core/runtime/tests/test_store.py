@@ -42,6 +42,30 @@ def test_set_get_roundtrip(store):
     assert got.spec.workloadId == "w1"
     assert got.status.state is RuntimeState.running
     assert got.owner == "alice"
+    assert got.spec.env == {}  # launch env is ephemeral and never enters durable state
+
+
+def test_redis_record_never_serializes_secret_bearing_launch_env():
+    redis = fakeredis.FakeStrictRedis(decode_responses=True)
+    store = RedisStore(redis)
+    sentinel = "meeting-passcode-and-funded-stt-token"
+    spec = WorkloadSpec(
+        workloadId="mtg-41-private",
+        profile="meeting-bot-v2",
+        env={"VEXA_BOT_CONFIG": sentinel, "BOT_CONFIG": sentinel},
+    )
+    status = WorkloadStatus(
+        workloadId=spec.workloadId,
+        profile=spec.profile,
+        state=RuntimeState.running,
+        backend=BackendKind.k8s,
+    )
+
+    store.set(WorkloadRecord(spec=spec, status=status, owner="user:7"))
+
+    raw = redis.get(f"{RedisStore.KEY_PREFIX}{spec.workloadId}")
+    assert sentinel not in raw
+    assert store.get(spec.workloadId).spec.env == {}
 
 
 def test_get_missing_returns_none(store):

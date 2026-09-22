@@ -11,6 +11,7 @@ from .ports import ErasurePlan
 class InMemoryRetentionRepo:
     def __init__(self):
         self._meetings: dict[str, dict] = {}
+        self._receipts: dict[tuple[str, str], dict] = {}
         self._write_condition = asyncio.Condition()
 
     def seed_meeting(
@@ -22,6 +23,8 @@ class InMemoryRetentionRepo:
         summaries: list[str],
         recording_prefixes: list[str],
         recording_objects: int,
+        status: str = "completed",
+        workload_id: str | None = None,
     ) -> None:
         self._meetings[meeting_id] = {
             "user_id": user_id,
@@ -29,9 +32,17 @@ class InMemoryRetentionRepo:
             "summaries": list(summaries),
             "recording_prefixes": list(recording_prefixes),
             "recording_objects": recording_objects,
+            "status": status,
             "state": "open",
             "in_flight_writes": 0,
+            "agent_erasure": None,
+            "minutes_erasure_receipt": None,
+            "runtime_workload_id": workload_id,
         }
+
+    async def completed_erasure(self, user_id: str, meeting_id: str) -> dict | None:
+        receipt = self._receipts.get((user_id, meeting_id))
+        return deepcopy(receipt) if receipt is not None else None
 
     def snapshot(self, meeting_id: str) -> dict | None:
         meeting = self._meetings.get(meeting_id)
@@ -56,11 +67,17 @@ class InMemoryRetentionRepo:
     async def begin_erasure(self, user_id: str, meeting_id: str) -> ErasurePlan | None:
         async with self._write_condition:
             meeting = self._meetings.get(meeting_id)
-            if meeting is None or meeting["user_id"] != user_id:
+            if (
+                meeting is None
+                or meeting["user_id"] != user_id
+                or meeting["status"] not in {"completed", "failed"}
+            ):
                 return None
             meeting["state"] = "erasing"
             while meeting["in_flight_writes"]:
                 await self._write_condition.wait()
+            agent = meeting.get("agent_erasure")
+            counts = agent.get("counts", {}) if isinstance(agent, dict) else {}
             return ErasurePlan(
                 user_id=user_id,
                 meeting_id=meeting_id,
@@ -68,21 +85,131 @@ class InMemoryRetentionRepo:
                 summary_documents=len(meeting["summaries"]),
                 recording_prefixes=tuple(meeting["recording_prefixes"]),
                 recording_objects=meeting["recording_objects"],
+                runtime_workload_id=meeting.get("runtime_workload_id"),
+                agent_tombstoned=isinstance(agent, dict),
+                agent_unit_streams=int(counts.get("agent_unit_streams") or 0),
+                agent_workspace_documents=int(counts.get("agent_workspace_documents") or 0),
+                agent_brain_records=int(counts.get("agent_brain_records") or 0),
+                agent_receipt=deepcopy(agent) if isinstance(agent, dict) else None,
             )
 
-    async def commit_erasure(self, plan: ErasurePlan) -> dict[str, int]:
+    async def record_agent_erasure(self, plan: ErasurePlan, receipt: dict) -> ErasurePlan:
+        async with self._write_condition:
+            meeting = self._meetings.get(plan.meeting_id)
+            if (
+                meeting is None
+                or meeting["user_id"] != plan.user_id
+                or meeting["state"] != "erasing"
+            ):
+                raise RuntimeError("meeting erasure lost its durable plan")
+            current = meeting.get("agent_erasure")
+            if not isinstance(current, dict):
+                current = deepcopy(receipt)
+                meeting["agent_erasure"] = current
+            if (
+                current.get("version") != "erasure.v1"
+                or current.get("owner") != "agent"
+                or current.get("scope") != "meeting"
+                or current.get("subject")
+                != {"user_id": plan.user_id, "meeting_id": plan.meeting_id}
+            ):
+                raise RuntimeError("Agent erasure receipt is invalid")
+            counts = current.get("counts")
+            if not isinstance(counts, dict) or set(counts) != {
+                "agent_unit_streams",
+                "agent_workspace_documents",
+                "agent_brain_records",
+            }:
+                raise RuntimeError("Agent erasure receipt is invalid")
+            return replace(
+                plan,
+                agent_tombstoned=True,
+                agent_unit_streams=int(counts["agent_unit_streams"]),
+                agent_workspace_documents=int(counts["agent_workspace_documents"]),
+                agent_brain_records=int(counts["agent_brain_records"]),
+                agent_receipt=deepcopy(current),
+            )
+
+    async def record_erasure_receipt(self, plan: ErasurePlan, receipt: dict) -> dict:
+        async with self._write_condition:
+            meeting = self._meetings.get(plan.meeting_id)
+            if (
+                meeting is None
+                or meeting["user_id"] != plan.user_id
+                or meeting["state"] != "erasing"
+            ):
+                existing = self._receipts.get((plan.user_id, plan.meeting_id))
+                if existing is not None:
+                    return deepcopy(existing)
+                raise RuntimeError("meeting erasure receipt lost its durable plan")
+            current = meeting.get("minutes_erasure_receipt")
+            if current is None:
+                current = deepcopy(receipt)
+                meeting["minutes_erasure_receipt"] = current
+            return deepcopy(current)
+
+    async def commit_erasure(
+        self,
+        plan: ErasurePlan,
+        *,
+        erased_at=None,
+        policy_version: str | None = None,
+        receipt: dict | None = None,
+    ) -> dict:
         async with self._write_condition:
             meeting = self._meetings.get(plan.meeting_id)
             if meeting is None or meeting["user_id"] != plan.user_id:
+                existing = self._receipts.get((plan.user_id, plan.meeting_id))
+                if receipt is not None and existing is not None:
+                    return deepcopy(existing)
                 return {"meeting_rows": 0, "transcript_rows": 0, "summary_documents": 0}
             deleted = {
                 "meeting_rows": 1,
                 "transcript_rows": len(meeting["transcript_rows"]),
                 "summary_documents": len(meeting["summaries"]),
             }
+            if receipt is not None:
+                stable = meeting.get("minutes_erasure_receipt")
+                if stable != receipt or receipt.get("counts") != {
+                    **deleted,
+                    "recording_objects": int(plan.recording_objects or 0),
+                    "agent_unit_streams": plan.agent_unit_streams,
+                    "agent_workspace_documents": plan.agent_workspace_documents,
+                    "agent_brain_records": plan.agent_brain_records,
+                }:
+                    raise RuntimeError("meeting erasure receipt changed")
+                self._receipts[(plan.user_id, plan.meeting_id)] = deepcopy(receipt)
+            elif plan.agent_tombstoned and erased_at is not None and policy_version:
+                receipt = {
+                    "user_id": plan.user_id,
+                    "meeting_id": plan.meeting_id,
+                    "erased_at": erased_at.isoformat(),
+                    "policy_version": policy_version,
+                    "agent_tombstoned": True,
+                    "deleted": {
+                        **deleted,
+                        "recording_objects": int(plan.recording_objects or 0),
+                        "agent_unit_streams": plan.agent_unit_streams,
+                        "agent_workspace_documents": plan.agent_workspace_documents,
+                        "agent_brain_records": plan.agent_brain_records,
+                    },
+                }
+                self._receipts[(plan.user_id, plan.meeting_id)] = receipt
             del self._meetings[plan.meeting_id]
             self._write_condition.notify_all()
-            return deleted
+            return deepcopy(receipt) if receipt is not None else deleted
+
+    async def purge_carriers(self, plan: ErasurePlan) -> None:
+        async with self._write_condition:
+            meeting = self._meetings.get(plan.meeting_id)
+            if (
+                meeting is None
+                or meeting["user_id"] != plan.user_id
+                or meeting["state"] != "erasing"
+            ):
+                if self._receipts.get((plan.user_id, plan.meeting_id)) is not None:
+                    return
+                raise RuntimeError("meeting erasure carrier purge has no durable plan")
 
     async def record_object_census(
         self, plan: ErasurePlan, recording_objects: int

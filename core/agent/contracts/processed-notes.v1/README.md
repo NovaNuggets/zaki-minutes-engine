@@ -6,6 +6,13 @@ meeting row's durable `data.processed.views[]`, and agent-api's SSE relays it li
 crossed a process + domain boundary unschema'd — a P4 violation — before this contract pinned it.
 The agent-worker is the stream's **single writer** (P23).
 
+Every row-scoped processed write is also governed by Minutes' permanent Redis authority hash
+`zaki:retention:meeting:{row_id}:fence`. Once `processed=1`, Agent atomically refuses activation /
+re-arm, note and cursor XADD/SET, `view_end`, and meeting-unit output; Redis/script failure is
+fail-closed. A known fence is checked before starting a model beat or workspace mirror. Redis cannot
+atomically serialize an already-running model request or filesystem/Brain write, so authoritative
+worker stop and Agent-owned derivative purge remain the separate S09 erasure handoff.
+
 ## Shapes (`$defs`)
 - **`Note`** — one cleaned note, `id == segment_id` (1:1 with the transcript). Re-emitting an id
   **upgrades** the note (baseline at ingest, LLM polish per beat); consumers upsert by id.

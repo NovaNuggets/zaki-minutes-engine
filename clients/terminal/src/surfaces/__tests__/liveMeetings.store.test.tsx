@@ -150,4 +150,44 @@ describe("liveMeetings store", () => {
 
     await waitFor(() => expect(hook.result.current.length).toBe(0));
   });
+
+  it("keeps the public needs_human_help status in the live bucket", async () => {
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const u = String(input);
+      if (u.includes("/api/meetings")) return jsonResp(meetingsPayload("needs_human_help"));
+      return jsonResp({});
+    });
+
+    const { hook } = await startStore();
+
+    expect(hook.result.current[0]).toMatchObject({
+      live_status: "needs_human_help",
+      status: "live",
+      session_uid: String(golden.meeting_id),
+    });
+  });
+
+  it("rejects adjacent meeting ids above the JavaScript safe-integer boundary before state or actions", async () => {
+    const first = JSON.parse('{"id":9007199254740992}').id;
+    const adjacent = JSON.parse('{"id":9007199254740993}').id;
+    expect(first).toBe(adjacent); // demonstrates why coercing either id to a string is unsafe
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const u = String(input);
+      if (u.includes("/api/meetings")) {
+        return jsonResp({ meetings: [
+          { ...meetingsPayload("completed").meetings[0], id: first },
+          { ...meetingsPayload("completed").meetings[0], id: adjacent, native_meeting_id: "different" },
+        ] });
+      }
+      return jsonResp({});
+    });
+
+    const mod = await import("../liveMeetings");
+    const hook = renderHook(() => mod.useLiveMeetings());
+    await waitFor(() => expect(
+      fetchMock.mock.calls.some((call) => String(call[0]).includes("/api/meetings")),
+    ).toBe(true));
+
+    expect(hook.result.current).toEqual([]);
+  });
 });

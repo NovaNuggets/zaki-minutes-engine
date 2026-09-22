@@ -1,10 +1,9 @@
-"""Scoped tokens — mint + validate against the `identity.v1` `ScopedToken` shape.
+"""Scoped tokens — mint + validate against the versioned identity ScopedToken shapes.
 
 Derived from the real admin-api behavior (`services/admin-api/app/main.py::validate_token` +
 `libs/admin-models/admin_models/token_scope.py`), reimplemented clean and DB-free:
 
-- A token carries a `subject` (owning user id), `scopes[]` drawn from {bot, tx, browser}
-  (admin-models `VALID_SCOPES`), an optional `expires_at`, and an optional `email`.
+- identity.v1 carries only {bot, tx, browser}; identity.v2 additively carries {agent}.
 - Validation rejects an **expired** token (parent: `expires_at < utcnow()` → 401 "Token expired")
   and rejects a token **out of scope** for the capability being checked (parent: the request scope
   must intersect the token's DB scopes, else 403).
@@ -18,8 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-# Mirrors admin-models VALID_SCOPES. Frozen so callers can't mutate the capability vocabulary.
-SCOPES: frozenset[str] = frozenset({"bot", "tx", "browser"})
+IDENTITY_V1 = "identity.v1"
+IDENTITY_V2 = "identity.v2"
+CONTRACT_SCOPES: dict[str, frozenset[str]] = {
+    IDENTITY_V1: frozenset({"bot", "tx", "browser"}),
+    IDENTITY_V2: frozenset({"bot", "tx", "browser", "agent"}),
+}
+# The complete vocabulary is exported for introspection; validation always uses CONTRACT_SCOPES.
+SCOPES: frozenset[str] = CONTRACT_SCOPES[IDENTITY_V2]
 
 
 class TokenError(Exception):
@@ -39,15 +44,25 @@ class ScopedToken:
     expires_at: datetime | None = None
     email: str | None = None
     issued_at: datetime | None = None
+    contract_version: str = IDENTITY_V1
 
     def __post_init__(self) -> None:
+        allowed = CONTRACT_SCOPES.get(self.contract_version)
+        if allowed is None:
+            raise ValueError(
+                f"Unknown identity contract {self.contract_version!r}; "
+                f"valid: {sorted(CONTRACT_SCOPES)}"
+            )
         if not self.subject:
             raise ValueError("ScopedToken.subject is required")
         if not self.scopes:
             raise ValueError("ScopedToken.scopes must be non-empty")
-        invalid = [s for s in self.scopes if s not in SCOPES]
+        invalid = [s for s in self.scopes if s not in allowed]
         if invalid:
-            raise ValueError(f"Invalid scope(s) {invalid}; valid: {sorted(SCOPES)}")
+            raise ValueError(
+                f"Invalid scope(s) {invalid} for {self.contract_version}; "
+                f"valid: {sorted(allowed)}"
+            )
 
     def is_expired(self, now: datetime | None = None) -> bool:
         if self.expires_at is None:
@@ -78,6 +93,7 @@ def mint_token(
     expires_at: datetime | None = None,
     email: str | None = None,
     issued_at: datetime | None = None,
+    contract_version: str = IDENTITY_V1,
 ) -> ScopedToken:
     """Mint a scoped token. Rejects unknown/empty scopes at mint time (parent: 422 on bad scope)."""
     return ScopedToken(
@@ -86,6 +102,7 @@ def mint_token(
         expires_at=expires_at,
         email=email,
         issued_at=issued_at or datetime.now(timezone.utc),
+        contract_version=contract_version,
     )
 
 

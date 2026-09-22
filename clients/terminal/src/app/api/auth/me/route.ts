@@ -4,6 +4,7 @@
 import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, USER_INFO_COOKIE } from "../adminApi";
+import { resolveTerminalProxyKey } from "../../../../proxyAuthPolicy.mjs";
 
 export const dynamic = "force-dynamic";
 
@@ -15,6 +16,12 @@ export async function GET() {
   const info = cookieStore.get(USER_INFO_COOKIE)?.value;
 
   if (!token) {
+    if (resolveTerminalProxyKey(undefined, process.env)) {
+      return NextResponse.json(
+        { authenticated: true, shared: true, user: { email: null, name: "Self-host" } },
+        { headers: NO_STORE },
+      );
+    }
     return NextResponse.json({ authenticated: false }, { status: 401, headers: NO_STORE });
   }
 

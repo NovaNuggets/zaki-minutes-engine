@@ -1,7 +1,7 @@
 """MeetingToken minter — a faithful copy of meeting_api.bot_spawn.invocation.mint_meeting_token.
 
 The recordings upload (`POST /internal/recordings/upload`) authenticates with a MeetingToken: an
-HS256 JWS signed with the meeting-api's `token_secret` (== INTERNAL_API_SECRET in the compose stack).
+HS256 JWS signed with meeting-api's dedicated `MEETING_TOKEN_SECRET`.
 We mint one here so the always-on recording proof can drive the bot's real upload path without
 spawning a bot. Kept in lock-step with the shipped minter (same claims, same signing).
 """
@@ -18,8 +18,16 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def mint_meeting_token(meeting_id: int, user_id: int, platform: str, native_meeting_id: str,
-                       *, secret: str, ttl_seconds: int = 7200) -> str:
+def mint_meeting_token(
+    meeting_id: int,
+    user_id: int,
+    platform: str,
+    native_meeting_id: str,
+    *,
+    session_uid: str,
+    secret: str,
+    ttl_seconds: int = 7200,
+) -> str:
     now = int(time.time())
     header = {"alg": "HS256", "typ": "JWT"}
     payload = {
@@ -27,9 +35,10 @@ def mint_meeting_token(meeting_id: int, user_id: int, platform: str, native_meet
         "user_id": user_id,
         "platform": platform,
         "native_meeting_id": native_meeting_id,
-        "scope": "transcribe:write",
+        "session_uid": session_uid,
+        "scope": "transcribe:write lifecycle:write",
         "iss": "meeting-api",
-        "aud": "transcription-collector",
+        "aud": ["transcription-collector", "meeting-lifecycle"],
         "iat": now,
         "exp": now + ttl_seconds,
         "jti": str(uuid.uuid4()),

@@ -132,6 +132,13 @@ def missing_capability_keys(name: str, env: Optional[Mapping[str, str]] = None) 
 _probe_cache: dict = {}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Keep probe credentials bound to the declared endpoint; a Location is not authority."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
 def _reset_probe_cache() -> None:
     """Test seam: forget cached probe results (the cache is per-process, keyed by capability)."""
     _probe_cache.clear()
@@ -147,12 +154,16 @@ def _http_probe(spec: dict, env: Mapping[str, str], timeout: float) -> dict:
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — declared endpoint
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(req, timeout=timeout) as r:  # noqa: S310 — declared endpoint
             status = int(r.status)
     except urllib.error.HTTPError as e:
         status = int(e.code)
     except Exception as e:  # noqa: BLE001 — a probe must never throw past here
         return {"ok": False, "reason": f"unreachable: {e.__class__.__name__}: {e}"}
+    if 300 <= status < 400:
+        return {"ok": False, "status": status,
+                "reason": "redirect refused — the configured endpoint must answer directly"}
     if status in (spec.get("unauthorized_statuses") or [401, 403]):
         return {"ok": False, "status": status,
                 "reason": "unauthorized — the configured token was REJECTED by the endpoint"}

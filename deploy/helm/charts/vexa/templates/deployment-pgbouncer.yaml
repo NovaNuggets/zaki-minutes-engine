@@ -30,6 +30,8 @@ spec:
       labels:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: pgbouncer
+      annotations:
+        checksum/database-secret: {{ include "vexa.databaseSecretRolloutChecksum" . | quote }}
     spec:
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:

@@ -186,6 +186,51 @@ def test_invalid_scope_422(client):
     assert "Invalid scope" in r.json()["detail"]
 
 
+def test_capability_route_advertises_identity_versions(client):
+    response = client.get("/admin/capabilities", headers=_admin())
+    assert response.status_code == 200
+    assert response.json() == {
+        "contracts": {
+            "identity": {
+                "versions": ["identity.v1", "identity.v2"],
+                "preferred": "identity.v2",
+            }
+        }
+    }
+
+
+def test_agent_scope_requires_explicit_identity_v2(client):
+    user_id = client.post("/admin/users", headers=_admin(),
+                          json={"email": "agent-scope@vexa.ai"}).json()["id"]
+    legacy = client.post(f"/admin/users/{user_id}/tokens?scope=agent", headers=_admin())
+    assert legacy.status_code == 422
+
+    minted = client.post(
+        f"/admin/users/{user_id}/tokens?scope=agent&contract_version=identity.v2",
+        headers=_admin(),
+    )
+    assert minted.status_code == 201, minted.text
+    token = minted.json()["token"]
+    assert token.startswith("vxa_agent_")
+    validated = client.post(
+        "/internal/validate",
+        headers={"X-Internal-Secret": INTERNAL_SECRET},
+        json={"token": token},
+    )
+    assert validated.status_code == 200
+    assert validated.json()["scopes"] == ["agent"]
+
+
+def test_unknown_identity_contract_version_is_rejected_before_mint(client):
+    user_id = client.post("/admin/users", headers=_admin(),
+                          json={"email": "unknown-version@vexa.ai"}).json()["id"]
+    response = client.post(
+        f"/admin/users/{user_id}/tokens?scope=bot&contract_version=identity.v99",
+        headers=_admin(),
+    )
+    assert response.status_code == 422
+
+
 def test_admin_tier_auth_enforced(client):
     """The admin tier rejects a missing/wrong X-Admin-API-Key (403)."""
     r = client.post("/admin/users", json={"email": "f@vexa.ai"})           # no key

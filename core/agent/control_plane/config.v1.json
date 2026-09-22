@@ -21,6 +21,13 @@
       "description": "the runtime kernel's runtime.v1 surface the dispatcher spawns workers on (+ schedule.v1 for routines)"
     },
     {
+      "key": "VEXA_RUNTIME_CONTROL_SECRET",
+      "class": "required-explicit",
+      "secret": true,
+      "description": "dedicated operator credential for runtime /workloads and /schedule calls; held by agent-api and never projected into spawned workers",
+      "targets": ["compose"]
+    },
+    {
       "key": "VEXA_AGENT_PROFILE",
       "class": "defaulted",
       "default": "agent",
@@ -309,26 +316,114 @@
       "key": "VEXA_MEETING_API_URL",
       "class": "defaulted",
       "default": "http://meeting-api:8080",
-      "description": "meeting-api base URL \u2014 agent-api owner-scopes the live SSE feed (GET /api/meeting/stream) by hitting GET /meetings/{id} on it before opening the redis transcript stream (P0 cross-tenant leak fix, SSE sibling of the by-id ownership check)",
+      "description": "meeting-api base URL \u2014 agent-api owner-scopes user reads and resolves each transcription watcher's exact numeric row through GET /internal/meetings/{id}/owner before live registration or dispatch",
       "targets": [
         "compose"
       ]
     },
     {
+      "key": "ZAKI_MINUTES_CAPTURE_ENABLED",
+      "class": "defaulted",
+      "default": "false",
+      "description": "operator-owned Minutes capture integration gate; false leaves Agent erasure/provenance integration unmounted",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_MINUTES_READ_ENABLED",
+      "class": "defaulted",
+      "default": "false",
+      "description": "fleet gate for the server-owned Agent Minutes read pipeline; false means the tool and route are not registered",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_MINUTES_READ_BASE_URL",
+      "class": "capability",
+      "capability": "minutes_read",
+      "description": "fixed HTTP(S) Minutes read-plane service origin used only by agent-api",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_READ_TOKEN_MINUTES",
+      "class": "capability",
+      "capability": "minutes_read",
+      "secret": true,
+      "description": "dedicated Minutes cross-spoke read bearer held only by agent-api and the Minutes producer",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_SIGNING_KEY_ID",
+      "class": "defaulted",
+      "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+      "description": "non-secret key identifier stamped on Agent-owned Minutes erasure receipts",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_SIGNING_SECRET",
+      "class": "defaulted",
+      "default": "(unset — required only when ZAKI_MINUTES_CAPTURE_ENABLED=true)",
+      "secret": true,
+      "description": "Agent-only HMAC signer projection for Agent-owned Minutes erasure receipts; never forwarded to workers",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+      "class": "defaulted",
+      "default": "(unset — optional one-key rotation overlap)",
+      "description": "verification-only id for one previous Agent erasure receipt signer; never used to sign new receipts",
+      "targets": ["compose"]
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+      "class": "defaulted",
+      "default": "(unset — optional one-key rotation overlap)",
+      "secret": true,
+      "description": "verification-only secret for replaying in-flight Agent erasure receipts across one signer rotation; never forwarded to workers",
+      "targets": ["compose"]
+    },
+    {
       "key": "VEXA_INTERNAL_API_SECRET",
       "class": "defaulted",
       "default": "(unset)",
-      "description": "Lane M: X-Internal-Secret for the admin-api membership-index internal edge (same value the gateway uses)",
+      "secret": true,
+      "description": "X-Internal-Secret for the admin-api settings edges and meeting-api exact-row owner authority (same value the gateway uses)",
       "targets": [
         "compose"
+      ]
+    },
+    {
+      "key": "GATEWAY_IDENTITY_SECRET",
+      "class": "defaulted",
+      "default": "(unset)",
+      "secret": true,
+      "description": "current dedicated Gateway-to-Agent HMAC key; signs request-bound proofs and is projected only to Gateway and Agent, never transmitted or forwarded to workers",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
+    },
+    {
+      "key": "GATEWAY_IDENTITY_PREVIOUS_SECRET",
+      "class": "defaulted",
+      "default": "(unset — optional one-key rotation overlap)",
+      "secret": true,
+      "description": "verification-only prior Gateway-to-Agent HMAC key; projected to Agent only during rotation and never used by Gateway to sign new requests",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
       ]
     },
     {
       "key": "VEXA_REQUIRE_GATEWAY_IDENTITY",
       "class": "defaulted",
       "default": "false",
-      "description": "when true, reject callers lacking the gateway-signed X-Gateway-Verified identity marker (hardened multi-tenant topology); default false preserves dev/direct-edge access",
-      "targets": []
+      "description": "when true, require a fresh method/path/user-bound Gateway HMAC and one-time nonce claim before trusting injected user identity; packaged multi-user topologies set this true",
+      "targets": [
+        "compose",
+        "helm",
+        "lite"
+      ]
     },
     {
       "key": "TRANSCRIPTION_SERVICE_URL",
@@ -343,6 +438,7 @@
       "key": "TRANSCRIPTION_SERVICE_TOKEN",
       "class": "defaulted",
       "default": "(unset)",
+      "secret": true,
       "description": "SECRET — the token paired with TRANSCRIPTION_SERVICE_URL for the on-demand /balance probe (Settings→Models Test). Never logged or echoed; only a pass/fail summary leaves the service",
       "targets": [
         "compose"
@@ -359,9 +455,94 @@
       "description": "spawned agent-workers will have a model-provider credential path available \u2014 dispatch stamps the model-auth allowlist from this service's env into every worker spec env (uniform across docker/k8s/process backends); the docker runtime additionally brokers/mounts creds itself (see the runtime's config.v1 for the mount mechanics + file probe)",
       "mode": "any",
       "when_unconfigured": "terminal chat / workspace turns fail inside the worker ('Model inference failed: Not logged in') \u2014 set CLAUDE_CODE_OAUTH_TOKEN (subscription OAuth), an ANTHROPIC_* key, VEXA_LLM_API_KEY (completion adapters), or HOST_CLAUDE_CREDENTIALS (docker subscription mount)"
+    },
+    "minutes_read": {
+      "description": "agent-api can call the bounded Minutes cross-spoke read plane with its dedicated credential",
+      "mode": "all",
+      "when_unconfigured": "the minutes_read tool is absent; enabling ZAKI_MINUTES_READ_ENABLED refuses boot until the fixed origin, dedicated token, Identity dual gate, and tombstone-aware content-free Brain answer authorizer exist; model-derived Minutes text remains ephemeral"
     }
   },
   "surface_only": [
+    {
+      "key": "ADMIN_TOKEN",
+      "reason": "explicitly cleared on agent-api to prevent unrelated shared Compose credentials from reaching this service"
+    },
+    {
+      "key": "INTERNAL_API_SECRET",
+      "reason": "explicitly cleared on agent-api because scoped runtime control and Minutes read credentials are the only supported internal authority"
+    },
+    {
+      "key": "RUNTIME_CONTROL_SECRET",
+      "reason": "explicitly cleared on agent-api in the managed Minutes topology because the bundled Agent profile is disabled"
+    },
+    {
+      "key": "MEETING_TOKEN_SECRET",
+      "reason": "explicitly cleared on agent-api because meeting-api alone owns meeting token minting"
+    },
+    {
+      "key": "REDIS_PASSWORD",
+      "reason": "explicitly cleared on agent-api because its scoped Redis URL is the sole supported Redis credential surface"
+    },
+    {
+      "key": "NEXTAUTH_SECRET",
+      "reason": "explicitly cleared on agent-api to prevent Terminal credentials from reaching this service"
+    },
+    {
+      "key": "DB_PASSWORD",
+      "reason": "explicitly cleared on agent-api to prevent database credentials from reaching this service"
+    },
+    {
+      "key": "MINIO_ROOT_USER",
+      "reason": "explicitly cleared on agent-api to prevent object-store credentials from reaching this service"
+    },
+    {
+      "key": "MINIO_ROOT_PASSWORD",
+      "reason": "explicitly cleared on agent-api to prevent object-store credentials from reaching this service"
+    },
+    {
+      "key": "MINIO_ACCESS_KEY",
+      "reason": "explicitly cleared on agent-api to prevent object-store credentials from reaching this service"
+    },
+    {
+      "key": "MINIO_SECRET_KEY",
+      "reason": "explicitly cleared on agent-api to prevent object-store credentials from reaching this service"
+    },
+    {
+      "key": "GOOGLE_CLIENT_SECRET",
+      "reason": "explicitly cleared on agent-api to prevent calendar credentials from reaching this service"
+    },
+    {
+      "key": "MICROSOFT_CLIENT_SECRET",
+      "reason": "explicitly cleared on agent-api to prevent calendar credentials from reaching this service"
+    },
+    {
+      "key": "VEXA_API_KEY",
+      "reason": "explicitly cleared on agent-api to prevent legacy API credentials from reaching this service"
+    },
+    {
+      "key": "ZAKI_MINUTES_INVOCATION_V2_ENABLED",
+      "reason": "explicitly cleared on agent-api because meeting-api alone owns managed Minutes invocation"
+    },
+    {
+      "key": "MINUTES_BROWSER_IMAGE",
+      "reason": "explicitly cleared on agent-api because runtime and meeting-api own meeting-bot image selection"
+    },
+    {
+      "key": "ZAKI_MINUTES_FINALIZED_ENABLED",
+      "reason": "explicitly cleared on agent-api because meeting-api alone owns finalization delivery"
+    },
+    {
+      "key": "MINUTES_TTL_ENABLED",
+      "reason": "explicitly cleared on agent-api because meeting-api alone runs retention cleanup"
+    },
+    {
+      "key": "MINUTES_TTL_INTERVAL_S",
+      "reason": "explicitly cleared on agent-api because meeting-api alone runs retention cleanup"
+    },
+    {
+      "key": "MINUTES_TTL_BATCH_SIZE",
+      "reason": "explicitly cleared on agent-api because meeting-api alone runs retention cleanup"
+    },
     {
       "key": "ANTHROPIC_MODEL",
       "reason": "not read by the control plane \u2014 the runtime brokers it into workers; present on this service historically"
@@ -377,6 +558,66 @@
     {
       "key": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
       "reason": "not read by the control plane \u2014 the runtime brokers it into workers; present on this service historically"
+    },
+    {
+      "key": "RUNTIME_CALLBACK_SECRET",
+      "reason": "explicitly cleared on agent-api because meeting-api alone verifies runtime callbacks; agent-api only receives the separate runtime control credential"
+    },
+    {
+      "key": "VEXA_DEPLOY_MINUTES_CAPTURE_REQUESTED",
+      "reason": "Compose-only startup guard preserves operator intent while the bundled Agent shadows application-facing Minutes settings empty and refuses the unsafe shared-Redis topology"
+    },
+    {
+      "key": "VEXA_DEPLOY_MINUTES_READ_REQUESTED",
+      "reason": "Compose-only startup guard preserves operator intent while the bundled Agent shadows application-facing Minutes settings empty and refuses the unsafe shared-Redis topology"
+    },
+    {
+      "key": "ZAKI_MINUTES_AUTO_JOIN_ENABLED",
+      "reason": "explicitly cleared on agent-api because meeting-api alone owns managed auto-join policy"
+    },
+    {
+      "key": "ZAKI_MINUTES_MANAGED_ONLY",
+      "reason": "explicitly cleared on agent-api because meeting-api alone enforces spawn mediation"
+    },
+    {
+      "key": "ZAKI_MINUTES_HUB_TOKEN",
+      "reason": "explicitly cleared on agent-api; only meeting-api accepts the dedicated external Hub credential"
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID",
+      "reason": "explicitly cleared on agent-api; meeting-api alone holds the Agent receipt verifier identity"
+    },
+    {
+      "key": "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET",
+      "reason": "explicitly cleared on agent-api; meeting-api alone holds the Agent receipt verifier secret"
+    },
+    {
+      "key": "ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns the Minutes receipt signer identity"
+    },
+    {
+      "key": "ZAKI_MINUTES_ERASURE_SIGNING_SECRET",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns the Minutes receipt signer secret"
+    },
+    {
+      "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns the rotating Minutes verifier identity"
+    },
+    {
+      "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns the rotating Minutes verifier secret"
+    },
+    {
+      "key": "ZAKI_MINUTES_FINALIZED_URL",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns platform finalization delivery"
+    },
+    {
+      "key": "ZAKI_MINUTES_FINALIZED_KEY_ID",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns platform finalization signer identity"
+    },
+    {
+      "key": "ZAKI_MINUTES_FINALIZED_SECRET",
+      "reason": "explicitly cleared on agent-api; meeting-api alone owns platform finalization signing material"
     }
   ]
 }

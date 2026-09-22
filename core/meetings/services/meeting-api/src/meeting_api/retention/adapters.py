@@ -6,16 +6,29 @@ SQLAlchemy or asyncpg.  Tests inject protocol-compatible clients/factories into 
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 import json
 import re
 from typing import Optional
 
-from ..recordings.ports import MEETING_WRITE_LOCK_NAMESPACE
+from ..collector import purge_meeting_redis_carriers
+from ..meeting_writes import meeting_write_lock_key
+from ..webhooks.platform_finalized import RedisTranscriptFinalizedOutbox
+from ..webhooks.retry import purge_meeting_webhook_state
 from .ports import ErasurePlan
 
 
 _KEY_SEGMENT = re.compile(r"^[A-Za-z0-9._:-]+$")
+_RUNTIME_WORKLOAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+
+
+def _runtime_workload_id(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not _RUNTIME_WORKLOAD_ID.fullmatch(value):
+        raise ValueError("runtime workload identity is invalid")
+    return value
 
 
 def recording_prefixes_for_meeting(user_id: int | str, data: dict) -> tuple[str, ...]:
@@ -85,22 +98,25 @@ def _summary_document_count(data: dict) -> int:
         count += len(summaries)
     if isinstance(data, dict) and data.get("summary") is not None:
         count += 1
+    processed = data.get("processed") if isinstance(data, dict) else None
+    views = processed.get("views") if isinstance(processed, dict) else None
+    if isinstance(views, list):
+        count += len(views)
     return count
 
 
 class SqlAlchemyRetentionRepo:
     """Owner-scoped erasure over the production ``meetings`` schema.
 
-    The repository uses the same two-key PostgreSQL advisory-lock namespace as recording writers.
+    The repository uses the same signed-bigint PostgreSQL advisory key as recording writers.
     Erasure takes the transaction-scoped exclusive lock, waits for shared writer locks to drain,
     stores ``data.zaki_retention.state=erasing``, then commits. Later writers acquire their shared
     lock and observe that durable state before touching object storage.
     """
 
-    LOCK_NAMESPACE = MEETING_WRITE_LOCK_NAMESPACE
-
-    def __init__(self, session_factory, *, statement_factory=None):
+    def __init__(self, session_factory, *, redis_client=None, statement_factory=None):
         self._session_factory = session_factory
+        self._redis = redis_client
         self._statement_factory = statement_factory
 
     def _statement(self, sql: str):
@@ -120,16 +136,15 @@ class SqlAlchemyRetentionRepo:
 
     async def _exclusive_lock(self, db, meeting_id: int) -> None:
         await db.execute(
-            self._statement(
-                "SELECT pg_advisory_xact_lock(:lock_namespace, :meeting_id)"
-            ),
-            {"lock_namespace": self.LOCK_NAMESPACE, "meeting_id": meeting_id},
+            self._statement("SELECT pg_advisory_xact_lock(:meeting_lock_key)"),
+            {"meeting_lock_key": meeting_write_lock_key(meeting_id)},
         )
 
     async def _owned_meeting(self, db, meeting_id: int, user_id: str | int):
         result = await db.execute(
             self._statement(
-                "SELECT id, user_id, data FROM meetings WHERE id = :meeting_id FOR UPDATE"
+                "SELECT id, user_id, status, data, bot_container_id FROM meetings "
+                "WHERE id = :meeting_id FOR UPDATE"
             ),
             {"meeting_id": meeting_id},
         )
@@ -148,6 +163,69 @@ class SqlAlchemyRetentionRepo:
             {"meeting_id": meeting_id, "retention": json.dumps(metadata, sort_keys=True)},
         )
 
+    @staticmethod
+    def _agent_fields(
+        value: object, *, user_id: str | int | None = None, meeting_id: str | int | None = None
+    ) -> dict:
+        if value is None:
+            return {
+                "agent_tombstoned": False,
+                "agent_unit_streams": 0,
+                "agent_workspace_documents": 0,
+                "agent_brain_records": 0,
+            }
+        if (
+            not isinstance(value, dict)
+            or value.get("version") != "erasure.v1"
+            or value.get("owner") != "agent"
+            or value.get("scope") != "meeting"
+            or not isinstance(value.get("subject"), dict)
+            or (
+                user_id is not None
+                and value["subject"].get("user_id") != str(user_id)
+            )
+            or (
+                meeting_id is not None
+                and value["subject"].get("meeting_id") != str(meeting_id)
+            )
+            or not isinstance(value.get("counts"), dict)
+            or set(value["counts"]) != {
+                "agent_unit_streams",
+                "agent_workspace_documents",
+                "agent_brain_records",
+            }
+        ):
+            raise RuntimeError("Agent erasure receipt is invalid")
+        counts = {}
+        for key in ("agent_unit_streams", "agent_workspace_documents", "agent_brain_records"):
+            count = value["counts"].get(key)
+            if type(count) is not int or count < 0 or count > 2_147_483_647:
+                raise RuntimeError("Agent erasure receipt is invalid")
+            counts[key] = count
+        return {
+            "agent_tombstoned": True,
+            **counts,
+        }
+
+    async def completed_erasure(self, user_id: str, meeting_id: str) -> dict | None:
+        mid = self._meeting_id(meeting_id)
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            return None
+        if mid is None or uid <= 0:
+            return None
+        async with self._session_factory() as db:
+            result = await db.execute(
+                self._statement(
+                    "SELECT receipt FROM minutes_erasure_receipts "
+                    "WHERE user_id = :user_id AND meeting_id = :meeting_id"
+                ),
+                {"user_id": uid, "meeting_id": mid},
+            )
+            receipt = result.scalar_one_or_none()
+            return dict(receipt) if isinstance(receipt, dict) else None
+
     async def begin_erasure(self, user_id: str, meeting_id: str) -> ErasurePlan | None:
         mid = self._meeting_id(meeting_id)
         if mid is None:
@@ -155,10 +233,11 @@ class SqlAlchemyRetentionRepo:
         async with self._session_factory() as db:
             await self._exclusive_lock(db, mid)
             row = await self._owned_meeting(db, mid, user_id)
-            if row is None:
+            if row is None or row["status"] not in {"completed", "failed"}:
                 return None
             data = dict(row["data"]) if isinstance(row["data"], dict) else {}
             metadata = data.get("zaki_retention")
+            row_workload_id = _runtime_workload_id(row.get("bot_container_id"))
             if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
                 prefixes = recording_prefixes_for_meeting(row["user_id"], data)
                 transcript_result = await db.execute(
@@ -175,6 +254,7 @@ class SqlAlchemyRetentionRepo:
                     "recording_objects": None,
                     "transcript_rows": transcript_rows,
                     "summary_documents": summary_documents,
+                    "runtime_workload_id": row_workload_id,
                 }
                 await self._persist_retention(db, mid, metadata)
                 await db.commit()
@@ -188,6 +268,17 @@ class SqlAlchemyRetentionRepo:
                 )
                 transcript_rows = int(metadata.get("transcript_rows") or 0)
                 summary_documents = int(metadata.get("summary_documents") or 0)
+                if "runtime_workload_id" not in metadata:
+                    metadata = {
+                        **metadata,
+                        "runtime_workload_id": row_workload_id,
+                    }
+                    await self._persist_retention(db, mid, metadata)
+                    await db.commit()
+            workload_id = _runtime_workload_id(metadata.get("runtime_workload_id"))
+            agent_fields = self._agent_fields(
+                metadata.get("agent_erasure"), user_id=user_id, meeting_id=meeting_id
+            )
             return ErasurePlan(
                 user_id=str(user_id),
                 meeting_id=str(meeting_id),
@@ -195,6 +286,11 @@ class SqlAlchemyRetentionRepo:
                 summary_documents=summary_documents,
                 recording_prefixes=tuple(prefixes),
                 recording_objects=metadata.get("recording_objects"),
+                runtime_workload_id=workload_id,
+                agent_receipt=deepcopy(metadata.get("agent_erasure"))
+                if isinstance(metadata.get("agent_erasure"), dict)
+                else None,
+                **agent_fields,
             )
 
     async def record_object_census(
@@ -208,6 +304,8 @@ class SqlAlchemyRetentionRepo:
             row = await self._owned_meeting(db, mid, plan.user_id)
             if row is None:
                 raise RuntimeError("meeting erasure census lost its owner")
+            if row["status"] not in {"completed", "failed"}:
+                raise RuntimeError("meeting erasure census requires a terminal meeting")
             data = dict(row["data"]) if isinstance(row["data"], dict) else {}
             metadata = data.get("zaki_retention")
             if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
@@ -220,7 +318,78 @@ class SqlAlchemyRetentionRepo:
                 await db.commit()
             return replace(plan, recording_objects=int(stable_count))
 
-    async def commit_erasure(self, plan: ErasurePlan) -> dict[str, int]:
+    async def record_agent_erasure(self, plan: ErasurePlan, receipt: dict) -> ErasurePlan:
+        mid = self._meeting_id(plan.meeting_id)
+        if mid is None:
+            raise RuntimeError("Agent erasure receipt has an invalid meeting")
+        fields = self._agent_fields(
+            receipt, user_id=plan.user_id, meeting_id=plan.meeting_id
+        )
+        if not fields["agent_tombstoned"]:
+            raise RuntimeError("Agent erasure receipt is invalid")
+        async with self._session_factory() as db:
+            await self._exclusive_lock(db, mid)
+            row = await self._owned_meeting(db, mid, plan.user_id)
+            if row is None or row["status"] not in {"completed", "failed"}:
+                raise RuntimeError("Agent erasure receipt lost its owner")
+            data = dict(row["data"]) if isinstance(row["data"], dict) else {}
+            metadata = data.get("zaki_retention")
+            if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
+                raise RuntimeError("Agent erasure receipt has no durable plan")
+            current = metadata.get("agent_erasure")
+            if current is None:
+                metadata = {**metadata, "agent_erasure": deepcopy(receipt)}
+                await self._persist_retention(db, mid, metadata)
+                await db.commit()
+                current = receipt
+            stable = self._agent_fields(
+                current, user_id=plan.user_id, meeting_id=plan.meeting_id
+            )
+            if not stable["agent_tombstoned"]:
+                raise RuntimeError("Agent erasure receipt is invalid")
+            return replace(plan, agent_receipt=deepcopy(current), **stable)
+
+    async def record_erasure_receipt(self, plan: ErasurePlan, receipt: dict) -> dict:
+        mid = self._meeting_id(plan.meeting_id)
+        if mid is None:
+            raise RuntimeError("Minutes erasure receipt has an invalid meeting")
+        async with self._session_factory() as db:
+            await self._exclusive_lock(db, mid)
+            row = await self._owned_meeting(db, mid, plan.user_id)
+            if row is None:
+                completed = await db.execute(
+                    self._statement(
+                        "SELECT receipt FROM minutes_erasure_receipts "
+                        "WHERE user_id = :user_id AND meeting_id = :meeting_id"
+                    ),
+                    {"user_id": int(plan.user_id), "meeting_id": mid},
+                )
+                stable = completed.scalar_one_or_none()
+                if isinstance(stable, dict):
+                    return deepcopy(stable)
+                raise RuntimeError("Minutes erasure receipt lost its durable plan")
+            data = dict(row["data"]) if isinstance(row["data"], dict) else {}
+            metadata = data.get("zaki_retention")
+            if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
+                raise RuntimeError("Minutes erasure receipt has no durable plan")
+            current = metadata.get("minutes_erasure_receipt")
+            if current is None:
+                current = deepcopy(receipt)
+                metadata = {**metadata, "minutes_erasure_receipt": current}
+                await self._persist_retention(db, mid, metadata)
+                await db.commit()
+            if not isinstance(current, dict):
+                raise RuntimeError("Minutes erasure receipt is invalid")
+            return deepcopy(current)
+
+    async def commit_erasure(
+        self,
+        plan: ErasurePlan,
+        *,
+        erased_at=None,
+        policy_version: str | None = None,
+        receipt: dict | None = None,
+    ) -> dict:
         mid = self._meeting_id(plan.meeting_id)
         if mid is None:
             return {"meeting_rows": 0, "transcript_rows": 0, "summary_documents": 0}
@@ -228,11 +397,36 @@ class SqlAlchemyRetentionRepo:
             await self._exclusive_lock(db, mid)
             row = await self._owned_meeting(db, mid, plan.user_id)
             if row is None:
+                if receipt is not None:
+                    completed = await db.execute(
+                        self._statement(
+                            "SELECT receipt FROM minutes_erasure_receipts "
+                            "WHERE user_id = :user_id AND meeting_id = :meeting_id"
+                        ),
+                        {"user_id": int(plan.user_id), "meeting_id": mid},
+                    )
+                    stable = completed.scalar_one_or_none()
+                    if isinstance(stable, dict):
+                        return deepcopy(stable)
                 return {"meeting_rows": 0, "transcript_rows": 0, "summary_documents": 0}
+            if row["status"] not in {"completed", "failed"}:
+                raise RuntimeError("meeting erasure database commit requires a terminal meeting")
             data = row["data"] if isinstance(row["data"], dict) else {}
             metadata = data.get("zaki_retention")
             if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
                 raise RuntimeError("meeting erasure database commit has no durable plan")
+            stable_agent = self._agent_fields(
+                metadata.get("agent_erasure"),
+                user_id=plan.user_id,
+                meeting_id=plan.meeting_id,
+            )
+            if plan.agent_tombstoned and stable_agent != {
+                "agent_tombstoned": plan.agent_tombstoned,
+                "agent_unit_streams": plan.agent_unit_streams,
+                "agent_workspace_documents": plan.agent_workspace_documents,
+                "agent_brain_records": plan.agent_brain_records,
+            }:
+                raise RuntimeError("meeting erasure Agent receipt changed")
             transcript_result = await db.execute(
                 self._statement(
                     "DELETE FROM transcriptions WHERE meeting_id = :meeting_id"
@@ -251,12 +445,119 @@ class SqlAlchemyRetentionRepo:
                 ),
                 {"meeting_id": mid, "user_id": int(row["user_id"])},
             )
-            await db.commit()
-            return {
+            deleted = {
                 "meeting_rows": int(meeting_result.rowcount or 0),
                 "transcript_rows": int(transcript_result.rowcount or 0),
                 "summary_documents": plan.summary_documents,
             }
+            if receipt is not None:
+                stable_receipt = metadata.get("minutes_erasure_receipt")
+                expected_counts = {
+                    **deleted,
+                    "recording_objects": int(plan.recording_objects or 0),
+                    "agent_unit_streams": plan.agent_unit_streams,
+                    "agent_workspace_documents": plan.agent_workspace_documents,
+                    "agent_brain_records": plan.agent_brain_records,
+                }
+                if stable_receipt != receipt or receipt.get("counts") != expected_counts:
+                    raise RuntimeError("Minutes erasure receipt changed")
+                if erased_at is None or not isinstance(policy_version, str) or not policy_version:
+                    raise RuntimeError("meeting erasure completion metadata is missing")
+                await db.execute(
+                    self._statement(
+                        "INSERT INTO minutes_erasure_receipts "
+                        "(user_id, meeting_id, erased_at, policy_version, receipt) "
+                        "VALUES (:user_id, :meeting_id, :erased_at, :policy_version, "
+                        "CAST(:receipt AS jsonb)) "
+                        "ON CONFLICT (user_id, meeting_id) DO NOTHING"
+                    ),
+                    {
+                        "user_id": int(row["user_id"]),
+                        "meeting_id": mid,
+                        "erased_at": erased_at,
+                        "policy_version": policy_version,
+                        "receipt": json.dumps(receipt, sort_keys=True),
+                    },
+                )
+                stored_result = await db.execute(
+                    self._statement(
+                        "SELECT receipt FROM minutes_erasure_receipts "
+                        "WHERE user_id = :user_id AND meeting_id = :meeting_id"
+                    ),
+                    {"user_id": int(row["user_id"]), "meeting_id": mid},
+                )
+                stored_receipt = stored_result.scalar_one_or_none()
+                if stored_receipt != receipt:
+                    raise RuntimeError("Minutes erasure receipt conflict")
+            elif plan.agent_tombstoned:
+                if erased_at is None or not isinstance(policy_version, str) or not policy_version:
+                    raise RuntimeError("meeting erasure completion metadata is missing")
+                full_receipt = {
+                    "user_id": plan.user_id,
+                    "meeting_id": plan.meeting_id,
+                    "erased_at": erased_at.isoformat(),
+                    "policy_version": policy_version,
+                    "agent_tombstoned": True,
+                    "deleted": {
+                        **deleted,
+                        "recording_objects": int(plan.recording_objects or 0),
+                        "agent_unit_streams": plan.agent_unit_streams,
+                        "agent_workspace_documents": plan.agent_workspace_documents,
+                        "agent_brain_records": plan.agent_brain_records,
+                    },
+                }
+                await db.execute(
+                    self._statement(
+                        "INSERT INTO minutes_erasure_receipts "
+                        "(user_id, meeting_id, erased_at, policy_version, receipt) "
+                        "VALUES (:user_id, :meeting_id, :erased_at, :policy_version, "
+                        "CAST(:receipt AS jsonb)) "
+                        "ON CONFLICT (user_id, meeting_id) DO NOTHING"
+                    ),
+                    {
+                        "user_id": int(row["user_id"]),
+                        "meeting_id": mid,
+                        "erased_at": erased_at,
+                        "policy_version": policy_version,
+                        "receipt": json.dumps(full_receipt, sort_keys=True),
+                    },
+                )
+            await db.commit()
+            return deepcopy(receipt) if receipt is not None else deleted
+
+    async def purge_carriers(self, plan: ErasurePlan) -> None:
+        """Validate the durable fence, then perform bounded Redis I/O outside PostgreSQL."""
+
+        mid = self._meeting_id(plan.meeting_id)
+        if mid is None:
+            raise RuntimeError("meeting erasure carrier purge is invalid")
+        async with self._session_factory() as db:
+            await self._exclusive_lock(db, mid)
+            row = await self._owned_meeting(db, mid, plan.user_id)
+            if row is None:
+                completed = await db.execute(
+                    self._statement(
+                        "SELECT receipt FROM minutes_erasure_receipts "
+                        "WHERE user_id = :user_id AND meeting_id = :meeting_id"
+                    ),
+                    {"user_id": int(plan.user_id), "meeting_id": mid},
+                )
+                if isinstance(completed.scalar_one_or_none(), dict):
+                    return
+                raise RuntimeError("meeting erasure carrier purge lost its owner")
+            if row["status"] not in {"completed", "failed"}:
+                raise RuntimeError("meeting erasure carrier purge requires a terminal meeting")
+            data = row["data"] if isinstance(row["data"], dict) else {}
+            metadata = data.get("zaki_retention")
+            if not isinstance(metadata, dict) or metadata.get("state") != "erasing":
+                raise RuntimeError("meeting erasure carrier purge has no durable plan")
+        # Fence outbound copies before deleting the source carriers. Both operations leave only
+        # content-free tombstones, so a retry/recovery worker cannot resurrect or redeliver PII.
+        await purge_meeting_webhook_state(self._redis, mid)
+        await RedisTranscriptFinalizedOutbox(self._redis).cancel(mid)
+        await purge_meeting_redis_carriers(
+            self._redis, mid, raw=True, processed=True
+        )
 
 
 class S3RetentionStorage:

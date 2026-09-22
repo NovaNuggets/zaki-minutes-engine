@@ -19,6 +19,7 @@ from urllib.parse import quote
 import requests_unixsocket
 
 from .backend import WorkloadHandle
+from .models import Resources
 from .mounts import workspace_binds
 from .profiles import Runnable
 
@@ -174,7 +175,14 @@ class DockerBackend:
             )
         return target
 
-    def start(self, workload_id: str, runnable: Runnable, env: dict[str, str]) -> WorkloadHandle:
+    def start(
+        self,
+        workload_id: str,
+        runnable: Runnable,
+        env: dict[str, str],
+        *,
+        resources: Optional[Resources] = None,
+    ) -> WorkloadHandle:
         if not runnable.image:
             raise ValueError("docker backend requires an image")
         name = self._cname(workload_id)
@@ -207,23 +215,24 @@ class DockerBackend:
         if api_mounts:
             host_config["Mounts"] = api_mounts
 
-        # The Runtime BROKERS model credentials. Subscription credentials are mounted read-only;
-        # API-style provider env (the VEXA_LLM_* completion dials + the claude-code runner's
-        # ANTHROPIC_*) is copied from the trusted runtime service into spawned workers.
-        creds = os.getenv("HOST_CLAUDE_CREDENTIALS")
+        # Legacy compose deployments let Runtime broker model credentials. Restrict that authority
+        # to an authenticated Agent dispatch: meeting bots are untrusted workloads and must receive
+        # neither the subscription file nor model-provider secrets.
+        agent_dispatch = runnable.broker_model_credentials
+        creds = os.getenv("HOST_CLAUDE_CREDENTIALS") if agent_dispatch else None
         if creds:
             binds.append(f"{creds}:/root/.claude/.credentials.json:ro")
         # DEV hot-mount (parallels the dev.yml service hot-reload): bind the HOST agent_api source over
         # the image's baked copy so a SPAWNED worker runs the latest worker.py with NO image rebuild —
         # the next spawn picks up the change. Host path (daemon-resolved); set only in dev.
-        dev_src = os.getenv("VEXA_AGENT_SRC_MOUNT")
+        dev_src = os.getenv("VEXA_AGENT_SRC_MOUNT") if agent_dispatch else None
         if dev_src:
             binds.append(f"{dev_src}:/app/src/agent_api:ro")
         if binds:
             host_config["Binds"] = binds
 
         spawn_env = dict(env)
-        for key in (
+        for key in (() if not agent_dispatch else (
             # llm-module dials (provider-agnostic): completion endpoint/credential/model + the
             # harness runner selection. Dispatch-stamped values win (`key not in spawn_env`).
             "VEXA_LLM_PROVIDER",
@@ -241,7 +250,7 @@ class DockerBackend:
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-        ):
+        )):
             value = os.getenv(key)
             if value and key not in spawn_env:
                 spawn_env[key] = value

@@ -4,8 +4,8 @@ Front door (P6): import from here, never a deep module path.
 
 A ``MeetingSession`` is one bot CONNECTION to a meeting — N per meeting, keyed by
 ``session_uid`` (the ``connectionId`` the bot is constructed with). ``bot_spawn`` eager-creates a
-row on spawn; ``recordings`` looks it up by ``session_uid`` when the bot uploads a chunk, so the
-upload resolves its meeting even before the bot reports ``active``.
+row on spawn; ``recordings`` looks it up by ``(meeting_id, session_uid)`` when the bot uploads a
+chunk, so the upload resolves the exact tenant row even before the bot reports ``active``.
 
 This sub-package also owns the meeting-api's single SQLAlchemy mirror (``Meeting`` /
 ``Transcription`` / ``MeetingSession``) — the SSOT every other module (``collector``,

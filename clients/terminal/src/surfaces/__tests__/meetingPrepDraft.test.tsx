@@ -46,6 +46,14 @@ describe("meetingPrep draft — lazy row creation", () => {
     expect(planned.createPlannedMeeting).not.toHaveBeenCalled();
   });
 
+  it("delegates managed capture to Hub instead of rendering an unusable Notetaker control", async () => {
+    renderDraft();
+    await screen.findByPlaceholderText("What's this meeting about?");
+
+    expect(screen.queryByRole("button", { name: /send zaki notetaker/i })).toBeNull();
+    expect(screen.getByText(/capture controls are available in the ZAKI Hub/i)).toBeTruthy();
+  });
+
   it("the first real input (title blur) creates the row, then hands off to prep:<id>", async () => {
     renderDraft();
     const titleInput = await screen.findByPlaceholderText("What's this meeting about?");

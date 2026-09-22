@@ -14,13 +14,14 @@ start — members of the bound workspace get the same live feed the copilot ride
 
 ## 1. Start the copilot
 
-The id invariant is `meeting_id == session_uid == native_id`.
+The durable meeting **row id** is the processing and stream carrier: `meeting_id == session_uid`.
+The reusable provider link id (`native_meeting_id`) is metadata only and is never a Redis carrier key.
 
 ```bash
-curl -X POST "$API_BASE/agent/meeting/start" \
+curl -X POST "$API_BASE/bots" \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"native_id":"abc-defg-hij","platform":"google_meet","title":"Acme renewal"}'
-# → 202, the live-meeting record
+  -d '{"native_meeting_id":"abc-defg-hij","platform":"google_meet","bot_name":"Zaki Minutes"}'
+# → 201, an owner-scoped meeting record; save its numeric `id` (41 below)
 ```
 
 ## 2. Turn processing on
@@ -30,9 +31,12 @@ Processing is opt-in. Toggle it on to start consuming the transcript:
 ```bash
 curl -X POST "$API_BASE/agent/meeting/process" \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"native_id":"abc-defg-hij","platform":"google_meet","on":true}'
+  -d '{"meeting_id":"41","native_id":"abc-defg-hij","platform":"google_meet","on":true}'
 # → { ..., "processing": true, "resumed_from": "<cursor-id>" }
 ```
+
+The retired native-only `POST /agent/meeting/start` endpoint returns `410`; it cannot establish
+owner-scoped consent or bind work to the meeting's retention fence.
 
 ## 3. Stream the merged feed
 
@@ -40,7 +44,7 @@ Subscribe to the SSE stream that merges transcript and copilot output:
 
 ```bash
 curl -N -H "X-API-Key: $API_KEY" \
-  "$API_BASE/agent/meeting/stream?meeting_id=abc-defg-hij&session_uid=abc-defg-hij"
+  "$API_BASE/agent/meeting/stream?meeting_id=41&session_uid=41"
 ```
 
 Event types on the stream: `transcript`, `card` (a proposal), `message-delta`, `tool-call`, `ping`,
@@ -55,10 +59,10 @@ Toggle processing off to stop consuming without ending the meeting; the per-meet
 Turn it back on and it resumes from exactly where it stopped:
 
 ```bash
-# pause — clears the flag, freezes the cursor
+# pause — revokes the worker generation, confirms runtime stop, freezes the cursor
 curl -X POST "$API_BASE/agent/meeting/process" \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  -d '{"native_id":"abc-defg-hij","platform":"google_meet","on":false}'
+  -d '{"meeting_id":"41","native_id":"abc-defg-hij","on":false}'
 # → { ..., "processing": false }
 ```
 

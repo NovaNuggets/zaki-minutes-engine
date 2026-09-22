@@ -26,7 +26,9 @@ the conformance harness — the conformance assertions therefore drive THIS ship
 """
 from __future__ import annotations
 
-from typing import Optional
+from collections.abc import Mapping
+import hmac
+from typing import Callable, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -35,7 +37,8 @@ from . import bot_spawn as _bot_spawn
 from . import recordings as _recordings
 from .collector.app import build_router as _build_collector_router
 from .collector.ports import RedisBus, TranscriptStore
-from .lifecycle.machine import LifecycleSink, MeetingStore
+from .lifecycle.machine import BotStatus, LifecycleSink, MeetingStore
+from .managed_auth import validate_hub_token, validated_hmac_secret_bytes
 from .obs import TraceMiddleware
 
 
@@ -53,6 +56,9 @@ def create_app(
     # lifecycle store
     meeting_store: Optional[MeetingStore] = None,
     token_secret: Optional[str] = None,
+    # Runtime workload callbacks use a dedicated service credential. Bot lifecycle and recording
+    # writes use only the per-spawn MeetingToken; no platform-wide service secret enters a bot.
+    runtime_callback_secret: Optional[str] = None,
     # user-stop (DELETE /bots) redis command publisher
     command_publisher: Optional["object"] = None,
     # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
@@ -62,9 +68,45 @@ def create_app(
     # meeting's remaining redis segments to Postgres + persist the processed doc into meeting.data,
     # so a finished meeting's transcript is durable IMMEDIATELY. Best-effort — never fails the callback.
     transcript_finalizer: Optional["object"] = None,
+    # Operator-owned transcript.finalized edge. This is deliberately independent of the user's
+    # webhook URL/secret/subscriptions and stays absent unless the operator flag is enabled.
+    minutes_finalized_enabled: bool = False,
+    minutes_finalized_outbox: Optional["object"] = None,
+    minutes_finalized_sink: Optional["object"] = None,
     # calendar-sync user edges (async callables from the composition root; None → routes 503)
     calendar_sync_now: Optional["object"] = None,
     calendar_sync_status: Optional["object"] = None,
+    # Minutes' cross-spoke reference read plane.  The router is physically absent while the
+    # operator flag is false; when enabled it also requires a dedicated token and per-user opt-in
+    # authority.  This is intentionally separate from ordinary Vexa API-key authentication.
+    zaki_read_enabled: bool = False,
+    zaki_read_token: Optional[str] = None,
+    zaki_read_scope: Optional["object"] = None,
+    zaki_read_now: Optional[Callable] = None,
+    # Launch-facing managed Minutes capture.  Like the read plane this is physically absent while
+    # disabled.  Identity owns the per-user policy; Minutes owns the operator flag and Redis fence.
+    minutes_capture_enabled: bool = False,
+    minutes_invocation_v2_enabled: bool = False,
+    minutes_settings: Optional["object"] = None,
+    minutes_capture_fencer: Optional["object"] = None,
+    minutes_now: Optional[Callable] = None,
+    minutes_redis_url: Optional[str] = None,
+    minutes_meeting_api_url: Optional[str] = None,
+    # Dedicated BFF→Minutes service authentication. User/quota headers are trusted only after this
+    # timing-safe gate succeeds; the value is never shared with bots or browser JavaScript.
+    minutes_hub_token: Optional[str] = None,
+    # Downstream complete-mediation policy. When true, ordinary POST /bots remains as a
+    # deterministic denial and only the managed Minutes capture route may create workloads.
+    managed_minutes_only: bool = False,
+    # Cross-spoke GDPR path. It stays mounted independently of capture/read activation so turning
+    # the product off can never strand already-captured data without a deletion path.
+    minutes_retention_repo: Optional["object"] = None,
+    minutes_retention_storage: Optional["object"] = None,
+    minutes_agent_eraser: Optional["object"] = None,
+    minutes_erasure_signing_key_id: Optional[str] = None,
+    minutes_erasure_signing_secret: Optional[str | bytes] = None,
+    minutes_erasure_verification_keys: Optional[Mapping[str, str | bytes]] = None,
+    minutes_erasure_nonce_factory: Optional[Callable[[], str]] = None,
 ) -> FastAPI:
     """Build the unified meeting-api app from the injected ports.
 
@@ -76,6 +118,35 @@ def create_app(
     app = FastAPI(title="Vexa Meeting API (v0.12)", version="0.12.0")
     # The edge: read/mint X-Trace-Id and bind it for the request (logevent.v1 trace_id).
     app.add_middleware(TraceMiddleware)
+
+    if not isinstance(minutes_finalized_enabled, bool):
+        raise ValueError("Minutes platform finalized flag must be boolean")
+    platform_finalized_dependencies = (
+        minutes_finalized_outbox,
+        minutes_finalized_sink,
+    )
+    if minutes_finalized_enabled:
+        if (
+            transcript_finalizer is None
+            or any(dependency is None for dependency in platform_finalized_dependencies)
+        ):
+            raise ValueError(
+                "Minutes platform finalized delivery requires finalizer, outbox, and operator sink"
+            )
+        if (
+            any(
+                not callable(getattr(minutes_finalized_outbox, method, None))
+                for method in ("enqueue", "process", "drain")
+            )
+            or not callable(getattr(minutes_finalized_sink, "deliver", None))
+            or not isinstance(getattr(minutes_finalized_sink, "key_id", None), str)
+        ):
+            raise ValueError("Minutes platform finalized boundaries are invalid")
+    elif any(dependency is not None for dependency in platform_finalized_dependencies):
+        raise ValueError(
+            "Minutes platform finalized dependencies require the operator flag"
+        )
+    app.state.minutes_finalized_enabled = minutes_finalized_enabled
 
     # --- shared liveness probe (gate:health): the unified process is up. No auth. The ADDITIVE
     # `capabilities` rows are the config.v1 tri-states (stt · object_storage) incl. the cached STT
@@ -90,6 +161,12 @@ def create_app(
     # --- bot_spawn ports (resolved FIRST: the meeting_repo is also the lifecycle-persistence target) ---
     if meeting_repo is None:
         meeting_repo = _bot_spawn_fakes().InMemoryMeetingRepo()
+    if minutes_finalized_enabled and not callable(
+        getattr(meeting_repo, "list_terminal_meeting_ids", None)
+    ):
+        raise ValueError(
+            "Minutes platform finalized recovery requires a terminal meeting read port"
+        )
     if runtime is None:
         runtime = _bot_spawn_fakes().FakeRuntimeClient()
 
@@ -100,10 +177,27 @@ def create_app(
     app.state.webhook_sink = webhook_sink
     # The lifecycle callback publishes each persisted FSM advance to bm:meeting:{id}:status so the
     # gateway /ws (which SUBSCRIBEs that channel) forwards a ws.v1 BotStatus frame to the dashboard.
-    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis, transcript_finalizer)
+    _mount_lifecycle(
+        app,
+        sink,
+        meeting_repo,
+        webhook_sink,
+        redis,
+        transcript_finalizer,
+        minutes_finalized_outbox if minutes_finalized_enabled else None,
+        minutes_finalized_sink if minutes_finalized_enabled else None,
+        token_secret,
+        runtime_callback_secret,
+    )
 
     # --- bot_spawn: POST /bots (invocation.v1 + runtime.v1) ---
-    app.include_router(_bot_spawn.build_router(meeting_repo, runtime))
+    if not isinstance(managed_minutes_only, bool):
+        raise ValueError("managed Minutes complete-mediation flag must be boolean")
+    app.include_router(_bot_spawn.build_router(
+        meeting_repo,
+        runtime,
+        create_enabled=not managed_minutes_only,
+    ))
 
     # --- user-stop: DELETE /bots/{platform}/{native_meeting_id} (lifecycle/stop.py over redis) ---
     from .lifecycle.stop_router import InMemoryCommandPublisher, build_stop_router
@@ -115,12 +209,182 @@ def create_app(
     # workload (the leave command alone is fire-and-forget — a booting bot may never receive it → orphan).
     app.include_router(build_stop_router(meeting_repo, command_publisher, runtime))
 
+    # --- Managed Minutes capture / consent withdrawal. The downstream deployment also enables
+    # ``managed_minutes_only`` so legacy POST /bots cannot bypass this product boundary. ---
+    if not isinstance(minutes_capture_enabled, bool):
+        raise ValueError("managed Minutes operator flag must be boolean")
+    erasure_dependencies = (
+        minutes_retention_repo,
+        minutes_retention_storage,
+        minutes_agent_eraser,
+        minutes_erasure_signing_key_id,
+        minutes_erasure_signing_secret,
+        minutes_erasure_verification_keys,
+        minutes_erasure_nonce_factory,
+    )
+    erasure_boundary_present = any(
+        dependency is not None for dependency in erasure_dependencies
+    )
+    erasure_boundary_configured = all(
+        dependency is not None for dependency in erasure_dependencies
+    )
+    if erasure_boundary_present and not erasure_boundary_configured:
+        raise ValueError(
+            "Minutes erasure requires repo, storage, Agent eraser, and Minutes signing boundary"
+        )
+    managed_minutes_dependencies = (minutes_settings, minutes_capture_fencer)
+    if any(dependency is not None for dependency in managed_minutes_dependencies) and any(
+        dependency is None for dependency in managed_minutes_dependencies
+    ):
+        raise ValueError("managed Minutes requires settings authority and carrier fencer")
+    managed_user_routes_enabled = (
+        minutes_capture_enabled or erasure_boundary_configured
+    )
+    if managed_user_routes_enabled and minutes_settings is None:
+        raise ValueError("managed Minutes requires settings authority and carrier fencer")
+    if not isinstance(minutes_invocation_v2_enabled, bool):
+        raise ValueError("managed Minutes invocation.v2 flag must be boolean")
+    if minutes_capture_enabled and not minutes_invocation_v2_enabled:
+        raise ValueError(
+            "managed Minutes capture requires the explicit invocation.v2 runtime route"
+        )
+    if minutes_capture_enabled and (
+        not isinstance(token_secret, str) or not token_secret or redis is None
+    ):
+        raise ValueError(
+            "managed Minutes capture requires a MeetingToken signing key and transcript bus"
+        )
+    # Active capture and the complete historical-erasure boundary both retain the user control
+    # edge. The separate ``managed_minutes_only`` switch merely denies legacy POST /bots; deploys
+    # intentionally keep it true while Minutes is default-off, so it must never imply Hub trust or
+    # require a Hub secret by itself.
+    if managed_user_routes_enabled and minutes_settings is not None:
+        validated_hub_token = validate_hub_token(minutes_hub_token)
+        if (
+            isinstance(token_secret, str)
+            and token_secret
+            and hmac.compare_digest(validated_hub_token, token_secret)
+        ):
+            raise ValueError("managed Minutes requires a dedicated Hub token")
+        from datetime import datetime, timezone
+
+        from .managed_minutes import build_router as build_managed_minutes_router
+
+        app.include_router(build_managed_minutes_router(
+            repo=meeting_repo,
+            runtime=runtime,
+            publisher=command_publisher,
+            carrier_fencer=minutes_capture_fencer,
+            settings_provider=minutes_settings,
+            now=minutes_now or (lambda: datetime.now(timezone.utc)),
+            token_secret=token_secret,
+            redis_url=minutes_redis_url,
+            meeting_api_url=minutes_meeting_api_url,
+            hub_token=validated_hub_token,
+            operator_enabled=minutes_capture_enabled,
+        ))
+
+    if erasure_boundary_configured:
+        validated_hub_token = validate_hub_token(minutes_hub_token)
+        try:
+            signing_secret_bytes = validated_hmac_secret_bytes(
+                minutes_erasure_signing_secret
+            )
+        except ValueError:
+            raise ValueError("Minutes erasure signing boundary is invalid") from None
+        if (
+            not isinstance(minutes_erasure_signing_key_id, str)
+            or not minutes_erasure_signing_key_id
+            or not isinstance(minutes_erasure_verification_keys, Mapping)
+            or not minutes_erasure_verification_keys
+            or not callable(minutes_erasure_nonce_factory)
+            or not callable(minutes_agent_eraser)
+            or not callable(
+                getattr(minutes_agent_eraser, "verify_durable_receipt", None)
+            )
+            or not callable(getattr(runtime, "scrub_workload", None))
+        ):
+            raise ValueError("Minutes erasure signing boundary is invalid")
+        normalized_verification_keys = dict(minutes_erasure_verification_keys)
+        try:
+            verification_secret_bytes = {
+                key_id: validated_hmac_secret_bytes(secret)
+                for key_id, secret in normalized_verification_keys.items()
+                if isinstance(key_id, str) and key_id
+            }
+        except ValueError:
+            raise ValueError("Minutes erasure signing boundary is invalid") from None
+        if (
+            not 1 <= len(normalized_verification_keys) <= 2
+            or len(verification_secret_bytes) != len(normalized_verification_keys)
+            or len(set(verification_secret_bytes.values()))
+            != len(verification_secret_bytes)
+        ):
+            raise ValueError("Minutes erasure signing boundary is invalid")
+        hub_token_bytes = validated_hub_token.encode("ascii")
+        if any(
+            hmac.compare_digest(secret, hub_token_bytes)
+            for secret in verification_secret_bytes.values()
+        ):
+            raise ValueError("managed Minutes requires a dedicated Hub token")
+        current_verification_secret = verification_secret_bytes.get(
+            minutes_erasure_signing_key_id
+        )
+        if current_verification_secret != signing_secret_bytes:
+            raise ValueError("Minutes erasure signing boundary is invalid")
+        from datetime import datetime, timezone
+
+        from .managed_erasure import build_router as build_managed_erasure_router
+
+        app.include_router(build_managed_erasure_router(
+            repo=minutes_retention_repo,
+            storage=minutes_retention_storage,
+            agent_eraser=minutes_agent_eraser,
+            runtime_scrubber=runtime,
+            now=minutes_now or (lambda: datetime.now(timezone.utc)),
+            signing_key_id=minutes_erasure_signing_key_id,
+            signing_secret=minutes_erasure_signing_secret,
+            verification_keys=normalized_verification_keys,
+            nonce_factory=minutes_erasure_nonce_factory,
+            hub_token=validated_hub_token,
+        ))
+
     # --- collector: transcripts + meetings + ws-authorize (api.v1) ---
     if transcript_store is None:
         transcript_store = _collector_fakes().InMemoryTranscriptStore()
     app.include_router(_build_collector_router(transcript_store, redis,
                                             calendar_sync_now=calendar_sync_now,
                                             calendar_sync_status=calendar_sync_status))
+    # Managed invocation.v2 bots never receive Redis. The ingress edge is physically absent while
+    # capture is off; when enabled, each write is bound to the spawn-scoped MeetingToken plus the
+    # authoritative session and then enters the existing collector retention lease.
+    if minutes_capture_enabled:
+        from .collector.bot_ingress import build_bot_ingress_router
+
+        app.include_router(build_bot_ingress_router(
+            store=transcript_store,
+            redis=redis,
+            meeting_repo=meeting_repo,
+            token_secret=token_secret,
+            carrier_fencer=minutes_capture_fencer,
+        ))
+
+    # --- Agent → Minutes cross-spoke READ only (zaki-read.v1).  Default-off means no route
+    # exists at all.  Enabling without both operator-owned dependencies is a composition error,
+    # not a silently permissive fallback. ---
+    if not isinstance(zaki_read_enabled, bool):
+        raise ValueError("zaki-read.v1 operator flag must be boolean")
+    if zaki_read_enabled:
+        from datetime import datetime, timezone
+
+        from .zaki_read import build_router as build_zaki_read_router
+
+        app.include_router(build_zaki_read_router(
+            store=transcript_store,
+            token=zaki_read_token,
+            scope=zaki_read_scope,
+            now=zaki_read_now or (lambda: datetime.now(timezone.utc)),
+        ))
 
     # --- recordings: chunk upload + finalize → meeting.data JSONB (recording.v1) ---
     if recording_repo is None:
@@ -142,6 +406,10 @@ def _mount_lifecycle(
     webhook_sink: "object" = None,
     redis: "object" = None,
     transcript_finalizer: "object" = None,
+    minutes_finalized_outbox: "object" = None,
+    minutes_finalized_sink: "object" = None,
+    token_secret: Optional[str] = None,
+    runtime_callback_secret: Optional[str] = None,
 ) -> None:
     """Register the lifecycle.v1 callback route on the unified app (the lifecycle receiver's
     ``/bots/internal/callback/lifecycle`` handler, sharing the app's TraceMiddleware).
@@ -158,15 +426,30 @@ def _mount_lifecycle(
     callback reconciles against the durable status. After a persisted advance it PUBLISHES a ws.v1
     ``BotStatus`` frame to ``bm:meeting:{id}:status`` for the gateway ``/ws`` to forward to clients.
     """
+    import asyncio
+    import hmac
     from copy import deepcopy
+    from weakref import WeakValueDictionary
 
     import jsonschema
 
     from .lifecycle.machine import IllegalTransition, TransitionSource
-    from .lifecycle.receiver import conforms
-    from .lifecycle.webhook import build_status_change_envelope, build_typed_envelope
-    from .meeting_writes import capture_is_withdrawn
+    from .bot_spawn.ports import MeetingStatusWrite
+    from .lifecycle.receiver import (
+        LifecycleBodyError,
+        authorize_internal_callback,
+        conforms,
+        read_lifecycle_json,
+        read_runtime_json,
+    )
+    from .bot_spawn.invocation import conforms_runtime_event, verify_meeting_token
+    from .lifecycle.webhook import (
+        build_status_change_envelope,
+        build_typed_envelope,
+    )
+    from .meeting_writes import capture_is_withdrawn, minutes_transcript_is_finalizable
     from .obs import log_event
+    from .public_status import public_meeting_status
     from .webhooks import clean_meeting_data
 
     def _iso(v):
@@ -183,7 +466,7 @@ def _mount_lifecycle(
             "platform": row.get("platform"),
             "native_meeting_id": row.get("native_meeting_id"),
             "constructed_meeting_url": row.get("constructed_meeting_url"),
-            "status": row.get("status"),
+            "status": public_meeting_status(row.get("status")),
             "completion_reason": data.get("completion_reason"),
             "failure_stage": data.get("failure_stage"),
             "start_time": _iso(row.get("start_time")),
@@ -195,8 +478,75 @@ def _mount_lifecycle(
 
     app.state.status_change_webhooks = []
     app.state.typed_webhooks = []
+    app.state.transcript_finalized_webhooks = []
+    # Serialize a single process's mutable FSM projection. This is deliberately only the first
+    # layer: ``MeetingRepo.update_meeting_status`` also enforces a DB-transaction CAS across replicas.
+    lifecycle_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+    minutes_finalized_backfill_before_id = None
 
-    async def _apply_lifecycle_event(
+    async def _drain_minutes_finalized():
+        nonlocal minutes_finalized_backfill_before_id
+        if minutes_finalized_outbox is None:
+            return []
+        try:
+            # Reconstruct intents from the durable terminal projection before draining Redis.
+            # This closes the database-commit → Redis-enqueue process-death window.  The scan is
+            # bounded and reads row ids/status only: no transcript or user-webhook payload enters
+            # this operator-owned path.
+            terminal_ids = await meeting_repo.list_terminal_meeting_ids(
+                before_id=minutes_finalized_backfill_before_id,
+                limit=100,
+            )
+            for terminal_id in terminal_ids:
+                await minutes_finalized_outbox.enqueue(terminal_id)
+            if terminal_ids and len(terminal_ids) == 100:
+                minutes_finalized_backfill_before_id = min(terminal_ids)
+            else:
+                # One complete bounded pass has reached the oldest terminal row. Start a new
+                # newest-first pass next tick so a prior enqueue outage cannot strand later rows.
+                minutes_finalized_backfill_before_id = None
+        except Exception:
+            # PostgreSQL recovery is additive to already-durable Redis work. A read outage must
+            # never prevent an existing intent from reaching its finalizer/operator sink.
+            log_event(
+                "minutes_platform_finalized_backfill_failed",
+                audience="system",
+                level="warning",
+                span="lifecycle.callback",
+                fields={"reason": "retry_required"},
+            )
+        try:
+            results = await minutes_finalized_outbox.drain(
+                transcript_finalizer, minutes_finalized_sink
+            )
+        except Exception:
+            log_event(
+                "minutes_platform_finalized_drain_failed",
+                audience="system",
+                level="warning",
+                span="lifecycle.callback",
+                fields={"reason": "retry_required"},
+            )
+            return []
+        for result in results:
+            if result.newly_finalized and result.envelope is not None:
+                app.state.transcript_finalized_webhooks.append(result.envelope)
+            if not result.delivered:
+                log_event(
+                    "minutes_platform_finalize_pending",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    fields={
+                        "meeting_id": result.meeting_id,
+                        "stage": result.stage,
+                    },
+                )
+        return results
+
+    app.state.minutes_finalized_drain = _drain_minutes_finalized
+
+    async def _apply_lifecycle_event_unlocked(
         body: dict,
         *,
         transition_source: "TransitionSource" = TransitionSource.BOT_CALLBACK,
@@ -226,29 +576,58 @@ def _mount_lifecycle(
                 422,
                 {"status": "error", "detail": f"lifecycle.v1 schema violation: {e.message}"},
             )
-        # LIFECYCLE-409 fix: rehydrate the in-memory FSM record from the DB's CURRENT status before
-        # applying the event. The in-memory MeetingStore is non-durable — after a meeting-api restart
-        # it is empty, so a bot's terminal `completed` event would land on a fresh status=None record
-        # → can_transition(None, COMPLETED) is False → IllegalTransition → 409, the bot retries 3x,
-        # all 409, and the meeting stays stuck `active`. Seeding the record from the persisted status
-        # first makes active/stopping → completed a legal transition again. Best-effort: a DB hiccup
-        # must never fail the callback (we fall back to the in-process record as-is).
+        # Reconcile the process-local projection from the durable status before EVERY advance. A
+        # replica may be behind another replica; process memory is never allowed to overrule the DB.
+        # The subsequent write carries this observed status as a compare-and-set expectation, closing
+        # the read→write race. A failed read is retryable: applying against guesses would reintroduce
+        # exactly the stale-writer bug this boundary exists to prevent.
         connection_id = body.get("connection_id")
         persisted = None
         if connection_id:
-            existing = sink.store.get(connection_id)
-            needs_rehydrate = existing is None or existing.status is None
-            needs_stop_reconcile = body.get("status") in ("completed", "failed")
-            if needs_rehydrate or needs_stop_reconcile:
-                try:
-                    persisted = await meeting_repo.get_status_by_session(session_uid=connection_id)
-                except Exception as e:  # noqa: BLE001 — rehydration is best-effort
-                    persisted = None
-                    log_event("lifecycle_rehydrate_failed", audience="system", level="warning",
-                              span="lifecycle.callback", fields={"error": str(e)})
-                if needs_rehydrate and persisted:
-                    sink.store.rehydrate(connection_id, persisted)
+            try:
+                persisted = await meeting_repo.get_status_by_session(session_uid=connection_id)
+            except Exception as e:  # noqa: BLE001 — transient storage failure; caller retries
+                log_event(
+                    "lifecycle_rehydrate_failed",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    fields={"stage": "rehydrate", "error_type": type(e).__name__},
+                )
+                return (
+                    503,
+                    {
+                        "status": "error",
+                        "detail": "lifecycle state was not committed; retry",
+                    },
+                )
+            if persisted is not None:
+                sink.store.reconcile_status(connection_id, persisted)
         accepted_record = deepcopy(sink.store.get(connection_id)) if connection_id else None
+
+        def _restore_speculative_record(*, durable_status=None) -> None:
+            if accepted_record is not None:
+                sink.store.replace(accepted_record)
+            elif connection_id:
+                sink.store.discard(connection_id)
+            if connection_id and durable_status is not None:
+                sink.store.reconcile_status(connection_id, durable_status)
+
+        def _accepted_durable_noop(row: dict) -> tuple[int, dict]:
+            durable_data = row.get("data") if isinstance(row.get("data"), dict) else {}
+            return (
+                200,
+                {
+                    "status": "accepted",
+                    "connection_id": connection_id,
+                    "meeting_status": row.get("status"),
+                    "completion_reason": durable_data.get("completion_reason"),
+                    "failure_stage": durable_data.get("failure_stage"),
+                    "transition_source": transition_source.value,
+                    "status_transition": durable_data.get("status_transition", []),
+                    "data": durable_data,
+                },
+            )
         try:
             change = sink.apply_change(
                 body,
@@ -260,6 +639,57 @@ def _mount_lifecycle(
                 ),
             )
         except IllegalTransition as e:
+            # Consent withdrawal can terminalize the durable row while a bot callback is already in
+            # flight. The FSM correctly calls that late edge illegal, but retrying it forever is both
+            # pointless and hostile to teardown. Ask the row-locked write guard to distinguish the
+            # privacy-specific suppression from an ordinary illegal transition; the persisted and
+            # in-memory transition maps are aligned, so this probe cannot apply an illegal bot edge.
+            try:
+                rejected_write = await meeting_repo.update_meeting_status(
+                    session_uid=e.connection_id,
+                    status=e.to.value,
+                    expected_status=persisted,
+                    force_terminal=False,
+                )
+            except Exception as persist_error:  # noqa: BLE001 — retry storage failures
+                log_event(
+                    "lifecycle_rejection_check_failed",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    fields={
+                        "stage": "rejection_check",
+                        "error_type": type(persist_error).__name__,
+                    },
+                )
+                _restore_speculative_record()
+                return (
+                    503,
+                    {
+                        "status": "error",
+                        "detail": "lifecycle state was not committed; retry",
+                    },
+                )
+            if isinstance(rejected_write, MeetingStatusWrite):
+                durable_row = rejected_write.row
+                if (
+                    rejected_write.disposition == "suppressed"
+                    and (
+                        e.to.value not in ("completed", "failed")
+                        or rejected_write.previous_status != persisted
+                    )
+                ):
+                    _restore_speculative_record(durable_status=durable_row.get("status"))
+                    return _accepted_durable_noop(durable_row)
+                if rejected_write.disposition == "conflict":
+                    _restore_speculative_record(durable_status=durable_row.get("status"))
+                    return (
+                        503,
+                        {
+                            "status": "error",
+                            "detail": "lifecycle state changed concurrently; retry",
+                        },
+                    )
             return (
                 409,
                 {
@@ -284,33 +714,107 @@ def _mount_lifecycle(
         meeting_row = None
         if rec.status is not None and not change.no_op:
             try:
-                meeting_row = await meeting_repo.update_meeting_status(
+                write_result = await meeting_repo.update_meeting_status(
                     session_uid=rec.connection_id,
                     status=rec.status.value,
                     completion_reason=rec.completion_reason.value if rec.completion_reason else None,
                     failure_stage=rec.failure_stage.value if rec.failure_stage else None,
                     data=rec.data if isinstance(rec.data, dict) else None,
+                    expected_status=persisted,
+                    force_terminal=force_terminal_on_destroy,
                 )
-            except Exception as e:  # noqa: BLE001 — persistence is best-effort
+            except Exception as e:  # noqa: BLE001 — transient storage failure; caller must retry
                 log_event("lifecycle_persist_failed", audience="system", level="warning",
-                          span="lifecycle.callback", fields={"error": str(e)})
+                          span="lifecycle.callback", fields={
+                              "stage": "persist",
+                              "error_type": type(e).__name__,
+                          })
+                _restore_speculative_record()
+                return (
+                    503,
+                    {
+                        "status": "error",
+                        "detail": "lifecycle state was not committed; retry",
+                    },
+                )
+            if write_result is None:
+                log_event(
+                    "lifecycle_persist_missing",
+                    audience="system",
+                    level="warning",
+                    span="lifecycle.callback",
+                    fields={"connection_id": rec.connection_id},
+                )
+                _restore_speculative_record()
+                return (
+                    503,
+                    {
+                        "status": "error",
+                        "detail": "lifecycle state was not committed; retry",
+                    },
+                )
+            if isinstance(write_result, MeetingStatusWrite):
+                meeting_row = write_result.row
+                write_disposition = write_result.disposition
+            else:
+                # Compatibility for a third-party MeetingRepo implementing the older dict return.
+                meeting_row = write_result
+                write_disposition = "applied"
+            if write_disposition in ("conflict", "rejected"):
+                durable_status = meeting_row.get("status") if isinstance(meeting_row, dict) else None
+                _restore_speculative_record(durable_status=durable_status)
+                if write_disposition == "conflict":
+                    return (
+                        503,
+                        {
+                            "status": "error",
+                            "detail": "lifecycle state changed concurrently; retry",
+                        },
+                    )
+                return (
+                    409,
+                    {
+                        "status": "error",
+                        "detail": (
+                            f"Invalid durable transition: {durable_status} → {rec.status.value} "
+                            f"(connection_id={rec.connection_id})"
+                        ),
+                        "connection_id": rec.connection_id,
+                        "from": durable_status,
+                        "to": rec.status.value,
+                    },
+                )
+        else:
+            write_disposition = "idempotent"
         meeting_data = (
             meeting_row.get("data")
             if isinstance(meeting_row, dict) and isinstance(meeting_row.get("data"), dict)
             else {}
         )
+        meeting_capture = meeting_data.get("zaki_capture")
+        teardown_was_already_confirmed = (
+            isinstance(meeting_capture, dict)
+            and meeting_capture.get("teardown_state") == "confirmed"
+        )
         suppressed_withdrawn_advance = (
             not change.no_op
             and rec.status is not None
-            and rec.status.value not in ("completed", "failed")
             and isinstance(meeting_row, dict)
             and capture_is_withdrawn(meeting_data)
-            and meeting_row.get("status") != rec.status.value
+            and (
+                meeting_row.get("status") != rec.status.value
+                or teardown_was_already_confirmed
+            )
         )
         if suppressed_withdrawn_advance and accepted_record is not None:
             accepted_record.stop_requested = True
             sink.store.replace(accepted_record)
-        visible_change = not change.no_op and not suppressed_withdrawn_advance
+        durable_noop = write_disposition != "applied"
+        visible_change = (
+            not change.no_op
+            and not durable_noop
+            and not suppressed_withdrawn_advance
+        )
         if visible_change:
             envelope = build_status_change_envelope(change)
             app.state.status_change_webhooks.append(envelope)
@@ -321,20 +825,75 @@ def _mount_lifecycle(
         # This guarantees a completed meeting's transcript is durable even if the periodic
         # db-writer never gets another tick (crash/restart right after completion). Best-effort:
         # the periodic loop retries anything this misses; never fail the bot's callback.
-        if (
+        transcript_finalized_envelope = None
+        terminal_transition = (
             transcript_finalizer is not None
-            and not change.no_op
             and rec.status is not None
             and rec.status.value in ("completed", "failed")
+        )
+        if (
+            terminal_transition
+            and visible_change
             and isinstance(meeting_row, dict)
             and meeting_row.get("id") is not None
         ):
-            try:
-                await transcript_finalizer(meeting_row["id"])
-            except Exception as e:  # noqa: BLE001 — the db-writer loop is the retry path
-                log_event("transcript_finalize_failed", audience="system", level="warning",
-                          span="lifecycle.callback",
-                          fields={"meeting_id": meeting_row.get("id"), "error": str(e)})
+            meeting_data = (
+                meeting_row.get("data")
+                if isinstance(meeting_row.get("data"), dict)
+                else {}
+            )
+            platform_event_authorized = minutes_transcript_is_finalizable(meeting_data)
+            if minutes_finalized_outbox is not None and platform_event_authorized:
+                try:
+                    meeting_id = meeting_row["id"]
+                    # Persist intent before touching transcript carriers. A process death or
+                    # finalizer failure therefore leaves a restart-safe retry record.
+                    await minutes_finalized_outbox.enqueue(meeting_id)
+                    attempt = await minutes_finalized_outbox.process(
+                        meeting_id, transcript_finalizer, minutes_finalized_sink
+                    )
+                    if attempt.newly_finalized and attempt.envelope is not None:
+                        transcript_finalized_envelope = attempt.envelope
+                        app.state.transcript_finalized_webhooks.append(
+                            transcript_finalized_envelope
+                        )
+                    if not attempt.delivered:
+                        log_event(
+                            "minutes_platform_finalize_pending",
+                            audience="system",
+                            level="warning",
+                            span="lifecycle.callback",
+                            fields={
+                                "meeting_id": meeting_id,
+                                "stage": attempt.stage,
+                            },
+                        )
+                except Exception:
+                    log_event(
+                        "minutes_platform_finalize_failed",
+                        audience="system",
+                        level="warning",
+                        span="lifecycle.callback",
+                        fields={
+                            "meeting_id": meeting_row.get("id"),
+                            "reason": "retry_required",
+                        },
+                    )
+            else:
+                try:
+                    await transcript_finalizer(meeting_row["id"])
+                except Exception as e:  # noqa: BLE001 — legacy periodic retry remains the backstop
+                    log_event("transcript_finalize_failed", audience="system", level="warning",
+                              span="lifecycle.callback",
+                              fields={
+                                  "meeting_id": meeting_row.get("id"),
+                                  "stage": "finalize",
+                                  "error_type": type(e).__name__,
+                              })
+        elif terminal_transition and minutes_finalized_outbox is not None:
+            # A redelivered terminal is an FSM no-op, but it is still a retry signal for durable
+            # finalization work left pending by an earlier crash/failure.
+            await _drain_minutes_finalized()
         # Build the TYPED event the transition maps to (meeting.started on active,
         # meeting.completed with the post-meeting envelope on completion, bot.failed on terminal
         # failure) — additive alongside meeting.status_change, never instead of it. Built AFTER the
@@ -373,8 +932,8 @@ def _mount_lifecycle(
         # Publish each persisted FSM advance to bm:meeting:{id}:status in the canonical 0.10.6 WS
         # contract shape (the source of truth; api-gateway forwards the redis payload verbatim):
         #   {type:"meeting.status", meeting:{id,platform,native_id}, payload:{status}, user_id, ts}
-        # `status` is the raw BotStatus value (e.g. 'needs_help'); clients translate to their own
-        # vocabulary on THEIR side (the core emits the contract, never a client's naming). Skipped on
+        # Internal lifecycle/storage keeps `needs_help`; public WS frames translate it to the
+        # canonical api.v1 `needs_human_help` vocabulary at this boundary. Skipped on
         # a no-op advance (idempotent replay) / unknown session. Best-effort: never fail the callback.
         if redis is not None and visible_change and isinstance(meeting_row, dict) and rec.status is not None:
             meeting_id = meeting_row.get("id")
@@ -389,7 +948,7 @@ def _mount_lifecycle(
                         "platform": meeting_row.get("platform"),
                         "native_id": meeting_row.get("native_meeting_id"),
                     },
-                    "payload": {"status": rec.status.value},
+                    "payload": {"status": public_meeting_status(rec.status.value)},
                     "user_id": meeting_row.get("user_id"),
                     "ts": datetime.now(timezone.utc).isoformat(),
                 }
@@ -408,7 +967,7 @@ def _mount_lifecycle(
                         "type": "meeting.status",
                         "meeting_id": meeting_id,
                         "native": meeting_row.get("native_meeting_id"),
-                        "status": rec.status.value,
+                        "status": public_meeting_status(rec.status.value),
                         "when": frame["ts"],
                     }
                     try:
@@ -436,7 +995,7 @@ def _mount_lifecycle(
         # so this lifecycle reap must key by the row id to land on the live stream the worker blocks on.
         if (
             redis is not None
-            and not change.no_op
+            and visible_change
             and rec.status is not None
             and rec.status.value in ("completed", "failed")
             and isinstance(meeting_row, dict)
@@ -460,16 +1019,30 @@ def _mount_lifecycle(
                     log_event("meeting_copilot_reap_failed", audience="system", level="warning",
                               span="lifecycle.callback",
                               fields={"meeting_row_id": meeting_row_id, "error": str(e)})
+        report_durable_projection = (
+            (suppressed_withdrawn_advance or durable_noop)
+            and isinstance(meeting_row, dict)
+        )
         reported_status = (
             meeting_row.get("status")
-            if suppressed_withdrawn_advance and isinstance(meeting_row, dict)
+            if report_durable_projection
             else (rec.status.value if rec.status else None)
         )
-        reported_data = meeting_data if suppressed_withdrawn_advance else rec.data
+        reported_data = meeting_data if report_durable_projection else rec.data
         reported_transitions = (
             meeting_data.get("status_transition", [])
-            if suppressed_withdrawn_advance
+            if report_durable_projection
             else rec.status_transition
+        )
+        reported_completion_reason = (
+            meeting_data.get("completion_reason")
+            if report_durable_projection
+            else (rec.completion_reason.value if rec.completion_reason else None)
+        )
+        reported_failure_stage = (
+            meeting_data.get("failure_stage")
+            if report_durable_projection
+            else (rec.failure_stage.value if rec.failure_stage else None)
         )
         log_event(
             "meeting_lifecycle_advanced", audience="user", span="lifecycle.callback",
@@ -482,13 +1055,38 @@ def _mount_lifecycle(
                 "status": "accepted",
                 "connection_id": rec.connection_id,
                 "meeting_status": reported_status,
-                "completion_reason": rec.completion_reason.value if rec.completion_reason else None,
-                "failure_stage": rec.failure_stage.value if rec.failure_stage else None,
+                "completion_reason": reported_completion_reason,
+                "failure_stage": reported_failure_stage,
                 "transition_source": change.transition_source.value,
                 "status_transition": reported_transitions,
                 "data": reported_data,
             },
         )
+
+    async def _apply_lifecycle_event(
+        body: dict,
+        *,
+        transition_source: "TransitionSource" = TransitionSource.BOT_CALLBACK,
+        force_terminal_on_destroy: bool = False,
+    ) -> tuple[int, dict]:
+        """Serialize the mutable local FSM for one connection; DB CAS handles other replicas."""
+        connection_id = body.get("connection_id") if isinstance(body, dict) else None
+        if not isinstance(connection_id, str):
+            return await _apply_lifecycle_event_unlocked(
+                body,
+                transition_source=transition_source,
+                force_terminal_on_destroy=force_terminal_on_destroy,
+            )
+        lock = lifecycle_locks.get(connection_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            lifecycle_locks[connection_id] = lock
+        async with lock:
+            return await _apply_lifecycle_event_unlocked(
+                body,
+                transition_source=transition_source,
+                force_terminal_on_destroy=force_terminal_on_destroy,
+            )
 
     # Expose the in-process entry so the runtime-callback synthetic-terminal path can advance the FSM
     # DIRECTLY (no HTTP self-POST to 127.0.0.1:PORT). Same instance, same store, same side effects.
@@ -496,7 +1094,65 @@ def _mount_lifecycle(
 
     @app.post("/bots/internal/callback/lifecycle")
     async def lifecycle_callback(request: Request) -> JSONResponse:
-        body = await request.json()
+        claims = None
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer ") and authorization.count(" ") == 1:
+            bearer = authorization[len("Bearer "):]
+            try:
+                claims = verify_meeting_token(
+                    bearer,
+                    purpose="lifecycle",
+                    secret=token_secret,
+                )
+            except ValueError:
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "detail": "forbidden"},
+                )
+        else:
+            # Only the explicit two-key in-process development escape can omit a MeetingToken.
+            # X-Internal-Secret is never consulted by this production route.
+            if token_secret is not None:
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "detail": "forbidden"},
+                )
+            denial = authorize_internal_callback(request, None)
+            if denial is not None:
+                return denial
+        try:
+            body = await read_lifecycle_json(request)
+        except LifecycleBodyError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"status": "error", "detail": exc.detail},
+            )
+        if claims is not None:
+            connection_id = body.get("connection_id") if isinstance(body, dict) else None
+            if not isinstance(connection_id, str) or not hmac.compare_digest(
+                claims["session_uid"], connection_id
+            ):
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "detail": "forbidden"},
+                )
+            try:
+                authoritative_meeting_id = await meeting_repo.get_meeting_id_by_session(
+                    session_uid=connection_id
+                )
+            except Exception:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "error",
+                        "detail": "lifecycle authorization unavailable; retry",
+                    },
+                )
+            if authoritative_meeting_id != claims["meeting_id"]:
+                return JSONResponse(
+                    status_code=403,
+                    content={"status": "error", "detail": "forbidden"},
+                )
         status_code, content = await _apply_lifecycle_event(
             body, transition_source=TransitionSource.BOT_CALLBACK
         )
@@ -526,10 +1182,41 @@ def _mount_lifecycle(
         completed`` is illegal for a bot-driven edge). The direct in-process call advances the SAME FSM
         instance, and the runtime-destroy source forces the terminal edge on real teardown evidence, so
         the meeting reaches terminal, the reaper stops, and the copilot ``session_end`` reap fires."""
+        if not isinstance(runtime_callback_secret, str) or not runtime_callback_secret:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "detail": "runtime callback authentication unavailable",
+                },
+            )
+        provided = request.headers.get("X-Runtime-Callback-Secret", "")
+        if not hmac.compare_digest(provided, runtime_callback_secret):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "detail": "forbidden"},
+            )
         try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001
-            body = {}
+            body = await read_runtime_json(request)
+            conforms_runtime_event(body)
+        except LifecycleBodyError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"status": "error", "detail": exc.detail},
+            )
+        except (jsonschema.ValidationError, TypeError) as exc:
+            detail = (
+                exc.message
+                if isinstance(exc, jsonschema.ValidationError)
+                else "body must be an object"
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "detail": f"runtime.v1 schema violation: {detail}",
+                },
+            )
         workload_id = body.get("workloadId") or body.get("workload_id")
         state = body.get("state")
         log_event(
@@ -559,10 +1246,21 @@ def _mount_lifecycle(
             await synthesize_terminal_for_dead_workload(
                 meeting_repo, workload_id, state, _drive_terminal,
                 log=_logging.getLogger("meeting_api.runtime.callback"),
+                raise_on_transient=True,
             )
-        except Exception as e:  # noqa: BLE001 — the runtime ACK must never fail on the terminal backstop
+        except Exception as e:  # noqa: BLE001 — any lost terminal work must be redelivered
             log_event("runtime_callback_terminal_error", audience="system", level="warning",
-                      span="runtime.callback", fields={"error": str(e)})
+                      span="runtime.callback", fields={
+                          "stage": "terminal_synthesis",
+                          "error_type": type(e).__name__,
+                      })
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "detail": "runtime callback processing failed; retry",
+                },
+            )
         return JSONResponse(status_code=200, content={"status": "accepted"})
 
 

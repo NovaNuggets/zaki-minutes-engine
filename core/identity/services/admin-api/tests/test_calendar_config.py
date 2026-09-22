@@ -2,7 +2,7 @@
 
 The ICS feed URL is a SECRET (Google/Outlook secret-address feeds): stored in user.data JSONB,
 masked on every user-facing read, surfaced in the clear ONLY over the X-Internal-Secret edge that
-meeting-api's poller calls. `/internal/users/{id}/bot-context` is the auto-join sweep's stand-in
+meeting-api's poller calls. `/internal/users/{id}/bot-context` is the managed launch path's stand-in
 for the spawn-context headers the gateway injects on POST /bots.
 
 Same testcontainers-PG harness as O-STACK-3 (skips without docker).
@@ -75,6 +75,53 @@ def test_calendar_rejects_non_http_url(client):
     assert r.status_code == 422
 
 
+def test_calendar_rejects_cleartext_hosted_feed_url(client):
+    _uid, tok = _user_token(client, email="cal-http@vexa.ai")
+
+    response = client.put(
+        "/user/calendar",
+        headers={"X-API-Key": tok},
+        json={"ics_url": "http://calendar.example.com/private/basic.ics"},
+    )
+
+    assert response.status_code == 422
+    assert "https" in response.json()["detail"].lower()
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:8080/calendar.ics",
+    "http://calendar.localhost:8080/calendar.ics",
+    "http://127.0.0.1:8080/calendar.ics",
+    "http://[::1]:8080/calendar.ics",
+])
+def test_calendar_allows_cleartext_only_for_explicit_loopback_hosts(client, url):
+    _uid, tok = _user_token(client, email=f"cal-loopback-{abs(hash(url))}@vexa.ai")
+
+    response = client.put(
+        "/user/calendar",
+        headers={"X-API-Key": tok},
+        json={"ics_url": url},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("url", [
+    "http://localhost:not-a-port/calendar.ics",
+    "http://[::1/calendar.ics",
+])
+def test_calendar_rejects_malformed_loopback_urls(client, url):
+    _uid, tok = _user_token(client, email=f"cal-malformed-{abs(hash(url))}@vexa.ai")
+
+    response = client.put(
+        "/user/calendar",
+        headers={"X-API-Key": tok},
+        json={"ics_url": url},
+    )
+
+    assert response.status_code == 422
+
+
 def test_calendar_rejects_embed_page_url(client):
     """The #1 paste mistake: Google Calendar's EMBED page (HTML) instead of the ICS feed. The
     422 must TEACH — name the 'Secret address in iCal format' fix, not just refuse."""
@@ -85,10 +132,24 @@ def test_calendar_rejects_embed_page_url(client):
     assert "Secret address in iCal format" in r.json()["detail"]
 
 
-def test_calendar_auto_join_defaults_true(client):
+def test_calendar_auto_join_is_unavailable_and_defaults_false(client):
     _uid, tok = _user_token(client, email="cal3@vexa.ai")
     r = client.get("/user/calendar", headers={"X-API-Key": tok})
-    assert r.json()["auto_join"] is True
+    assert r.json()["auto_join_available"] is False
+    assert r.json()["auto_join"] is False
+
+
+def test_calendar_rejects_enabling_unavailable_auto_join(client):
+    _uid, tok = _user_token(client, email="cal-autojoin@vexa.ai")
+
+    response = client.put(
+        "/user/calendar",
+        headers={"X-API-Key": tok},
+        json={"ics_url": ICS, "auto_join": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Calendar auto-join is unavailable in launch v1"
 
 
 def test_internal_calendar_configs_secret_gated(client):
@@ -103,7 +164,7 @@ def test_internal_calendar_configs_secret_gated(client):
     r = client.get("/internal/calendar-configs", headers={"X-Internal-Secret": INTERNAL_SECRET})
     assert r.status_code == 200, r.text
     configs = r.json()["configs"]
-    assert {"user_id": uid, "ics_url": ICS, "auto_join": True} in configs
+    assert {"user_id": uid, "ics_url": ICS, "auto_join": False} in configs
     # only users WITH a feed appear
     assert all(c["ics_url"] for c in configs)
 

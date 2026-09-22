@@ -2,11 +2,11 @@
 /** Meeting-prep tab (center) — a PLANNED meeting's home while it hasn't happened yet.
  *
  *  Opens when a row in an intent status (`idle`/`scheduled`) is clicked. Everything here edits the
- *  SAME meetings row the bot will later claim: title / time / link (PATCH by row id), the auto-join
- *  toggle, and the WORKSPACE BIND — the sharing mechanism (members of the bound workspace see this
+ *  SAME meetings row a managed Hub capture can later claim: title / time / link (PATCH by row id), and the
+ *  WORKSPACE BIND — the sharing mechanism (members of the bound workspace see this
  *  meeting, its live feed, and later its transcript). "Share" mints a workspace invite link; the
  *  prep JTBD is: bind (or create) a prep workspace → research into it with the agent → share it
- *  with the people you're meeting → the bot auto-joins at start → notes land on the same row.
+ *  with the people you're meeting. Managed capture controls live in the separately credentialed Hub.
  *  Once the row leaves the intent statuses the row click routes to the live meeting tab instead. */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { registerTab, type TabProps } from "../contributions";
@@ -231,21 +231,6 @@ function MeetingPrepTab({ params }: TabProps) {
     finally { if (mounted.current) setBusy(false); }
   };
 
-  const sendNow = async () => {
-    if (!m?.native_id) return;
-    setBusy(true); setErr(null);
-    try {
-      const platformSlug = m.platform === "Google Meet" ? "google_meet" : m.platform.toLowerCase().replace(/\s+/g, "_");
-      const r = await fetch("/api/bots", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: platformSlug, native_meeting_id: m.native_id, ...(m.meeting_url ? { meeting_url: m.meeting_url } : {}), bot_name: "Vexa" }),
-      });
-      if (!r.ok) throw new Error((await r.text().catch(() => "")).slice(0, 180) || `${r.status}`);
-      refreshMeetings();
-    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
-    finally { setBusy(false); }
-  };
-
   const share = async () => {
     if (!m?.workspace_id) return;
     setBusy(true); setErr(null);
@@ -312,7 +297,6 @@ function MeetingPrepTab({ params }: TabProps) {
     finally { setBusy(false); }
   };
 
-  const autoJoin = m?.auto_join !== false;   // absent = ON
   const headline = useMemo(() => m?.title_custom || m?.title || "Planned meeting", [m]);
   // own-workspace brief (frame 6): only hunted while the meeting is unbound — a bound workspace's
   // README is the brief and wins.
@@ -359,13 +343,7 @@ function MeetingPrepTab({ params }: TabProps) {
               borderBottom: "1px dashed var(--line2)", outline: "none" }} />
         )}
 
-        {m.auto_join_error && (
-          <div role="alert" style={{ margin: "0 0 14px", padding: "8px 12px", borderRadius: 8, background: "var(--dangerbg)", color: "var(--danger)", fontSize: 12.5, lineHeight: 1.5 }}>
-            ⚠ Auto-join failed: {m.auto_join_error}
-          </div>
-        )}
-
-        {/* ── meta line (prep-v3 carve): when · Join · auto-join — the raw URL lives behind ⋯ ── */}
+        {/* ── meta line (prep-v3 carve): when · Open meeting — the raw URL lives behind ⋯ ── */}
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
           <DateTimePicker
             value={m.scheduled_at}
@@ -375,19 +353,12 @@ function MeetingPrepTab({ params }: TabProps) {
             onClear={() => void patch({ scheduled_at: null })}
           />
           {m.meeting_url && (
-            /* "Open meeting" not "Join" — the human opens the URL; the notetaker is a separate verb
-               (first-run-onboarding frame 6: Join/Send-bot/Auto-join read as flavors of one verb). */
+            /* "Open meeting" not "Join" — the human opens the URL; ZAKI Notetaker is a separate,
+               explicit managed action. */
             <a href={m.meeting_url} target="_blank" rel="noreferrer"
               style={{ background: "var(--accent)", color: "var(--on-accent)", borderRadius: 7, padding: "5px 14px", fontSize: 12.5, fontWeight: 600, textDecoration: "none" }}>
               Open meeting
             </a>
-          )}
-          {!readOnly && (
-            <label style={{ display: "inline-flex", alignItems: "center", gap: 7, fontSize: 12, color: "var(--t2)", cursor: "pointer", userSelect: "none" }}>
-              <input type="checkbox" checked={autoJoin} disabled={busy}
-                onChange={(e) => void patch({ auto_join: e.target.checked })} />
-              Auto-join{!m.native_id && <span style={{ color: "var(--t3)", fontSize: 11 }}>(needs a link)</span>}
-            </label>
           )}
         </div>
         {/* no link yet → the input is the honest primary control; with a link it lives in ⋯ */}
@@ -471,11 +442,9 @@ function MeetingPrepTab({ params }: TabProps) {
             </button>
           )}
           {!readOnly && (
-            <button disabled={busy || !m.native_id} onClick={() => void sendNow()}
-              title={m.native_id ? "Send the bot now instead of waiting" : "Attach a meeting link first"}
-              style={{ background: "none", border: "none", color: m.native_id ? "var(--accent)" : "var(--t3)", fontSize: 12, fontWeight: 600, cursor: m.native_id ? "pointer" : "default", padding: 0, borderBottom: `1px dotted ${m.native_id ? "var(--accent)" : "var(--t3)"}` }}>
-              Send notetaker now
-            </button>
+            <span style={{ color: "var(--t3)", fontSize: 11.5 }}>
+              Managed capture controls are available in the ZAKI Hub.
+            </span>
           )}
           {!readOnly && (
             <button onClick={() => setMoreOpen((v) => !v)} title="More — edit link, unbind, delete"

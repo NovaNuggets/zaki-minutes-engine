@@ -15,8 +15,11 @@ from fastapi.testclient import TestClient
 from meeting_api.bot_spawn import mint_meeting_token
 from meeting_api.recordings import (
     InvalidRecordingMetadata,
+    RecordingChunkConflict,
     build_router,
     finalize_master,
+    RecordingLimitExceeded,
+    RecordingNotReady,
     upload_chunk,
 )
 from meeting_api.recordings.fakes import InMemoryRecordingRepo, InMemoryStorage
@@ -390,7 +393,7 @@ async def test_finalize_master_builds_and_stamps():
     for seq in range(3):
         receipt = await upload_chunk(
             repo, storage, token_meeting_id=MEETING_ID, session_uid=SESSION_UID,
-            data=_wav(), media_format="wav", chunk_seq=seq, is_final=False,
+            data=_wav(), media_format="wav", chunk_seq=seq, is_final=seq == 2,
         )
         rid = receipt["recording_id"]
     master_key = await finalize_master(repo, storage, meeting_id=MEETING_ID, recording_id=rid)
@@ -403,6 +406,325 @@ async def test_finalize_master_builds_and_stamps():
     assert mf["storage_path"] == master_key
 
 
+async def test_finalize_requires_a_declared_final_chunk_before_any_storage_read():
+    class ReadTrackingStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.reads: list[tuple[str, str]] = []
+
+        async def list(self, prefix):
+            self.reads.append(("list", prefix))
+            return await super().list(prefix)
+
+        async def get(self, key):
+            self.reads.append(("get", key))
+            return await super().get(key)
+
+        async def size(self, key):
+            self.reads.append(("size", key))
+            return await super().size(key)
+
+        async def exists(self, key):
+            self.reads.append(("exists", key))
+            return await super().exists(key)
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = ReadTrackingStorage()
+    receipt = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(),
+        media_format="wav",
+        chunk_seq=0,
+        is_final=False,
+    )
+    storage.reads.clear()
+
+    with pytest.raises(RecordingNotReady):
+        await finalize_master(
+            repo,
+            storage,
+            meeting_id=MEETING_ID,
+            recording_id=receipt["recording_id"],
+        )
+
+    assert storage.reads == []
+    assert not any(key.endswith("/master.wav") for key in storage.blobs)
+
+
+async def test_finalize_requires_a_complete_contiguous_manifest_without_listing():
+    class NoListStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.body_reads = 0
+
+        async def list(self, prefix):
+            raise AssertionError("master finalization must not enumerate an object prefix")
+
+        async def get(self, key):
+            self.body_reads += 1
+            return await super().get(key)
+
+    repo, _ = _seeded()
+    storage = NoListStorage()
+    receipt = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(),
+        media_format="wav",
+        chunk_seq=0,
+        is_final=False,
+    )
+    await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(),
+        media_format="wav",
+        chunk_seq=2,
+        is_final=True,
+    )
+    storage.body_reads = 0
+
+    with pytest.raises(RecordingNotReady):
+        await finalize_master(
+            repo,
+            storage,
+            meeting_id=MEETING_ID,
+            recording_id=receipt["recording_id"],
+        )
+
+    assert storage.body_reads == 0
+    assert not any(key.endswith("/master.wav") for key in storage.blobs)
+
+
+async def test_get_vs_final_upload_race_cannot_publish_a_truncated_master():
+    import asyncio
+
+    class CoordinatedRepo(InMemoryRecordingRepo):
+        def __init__(self):
+            super().__init__()
+            self.finalizer_holds_manifest = asyncio.Event()
+            self.release_finalizer = asyncio.Event()
+
+        @asynccontextmanager
+        async def manifest_write(self, recording_id, media_type):
+            async with super().manifest_write(recording_id, media_type):
+                if asyncio.current_task().get_name() == "finalizer":
+                    self.finalizer_holds_manifest.set()
+                    await self.release_finalizer.wait()
+                yield
+
+    repo = CoordinatedRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = InMemoryStorage()
+    first = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(4),
+        media_format="wav",
+        chunk_seq=0,
+        is_final=False,
+    )
+    finalizer = asyncio.create_task(
+        finalize_master(
+            repo,
+            storage,
+            meeting_id=MEETING_ID,
+            recording_id=first["recording_id"],
+        ),
+        name="finalizer",
+    )
+    await asyncio.wait_for(repo.finalizer_holds_manifest.wait(), timeout=0.5)
+    final_upload = asyncio.create_task(
+        upload_chunk(
+            repo,
+            storage,
+            token_meeting_id=MEETING_ID,
+            session_uid=SESSION_UID,
+            data=_wav(8),
+            media_format="wav",
+            chunk_seq=1,
+            is_final=True,
+        ),
+        name="final-upload",
+    )
+    await asyncio.sleep(0)
+    assert not final_upload.done()
+    repo.release_finalizer.set()
+
+    with pytest.raises(RecordingNotReady):
+        await finalizer
+    await final_upload
+    assert not any(key.endswith("/master.wav") for key in storage.blobs)
+
+    master_key = await finalize_master(
+        repo,
+        storage,
+        meeting_id=MEETING_ID,
+        recording_id=first["recording_id"],
+    )
+    assert storage.blobs[master_key] == __import__(
+        "meeting_api.recording_codec", fromlist=["build_recording_master"]
+    ).build_recording_master([_wav(4), _wav(8)], "wav")
+
+
+async def test_finalized_master_rejects_a_new_late_chunk_and_remains_immutable():
+    repo, storage = _seeded()
+    receipt = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(4),
+        media_format="wav",
+        chunk_seq=0,
+        is_final=True,
+    )
+    master_key = await finalize_master(
+        repo,
+        storage,
+        meeting_id=MEETING_ID,
+        recording_id=receipt["recording_id"],
+    )
+    master_before = storage.blobs[master_key]
+
+    with pytest.raises(RecordingChunkConflict):
+        await upload_chunk(
+            repo,
+            storage,
+            token_meeting_id=MEETING_ID,
+            session_uid=SESSION_UID,
+            data=_wav(8),
+            media_format="wav",
+            chunk_seq=1,
+            is_final=False,
+        )
+
+    assert storage.blobs[master_key] == master_before
+    media = (await repo.get_recordings(MEETING_ID))[0]["media_files"][0]
+    assert media["chunk_count"] == 1
+
+
+async def test_upload_enforces_chunk_count_and_aggregate_bounds_before_storage_io():
+    class TrackingStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.calls: list[str] = []
+
+        async def upload(self, key, data, *, content_type):
+            self.calls.append("upload")
+            await super().upload(key, data, content_type=content_type)
+
+        async def get(self, key):
+            self.calls.append("get")
+            return await super().get(key)
+
+        async def exists(self, key):
+            self.calls.append("exists")
+            return await super().exists(key)
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = TrackingStorage()
+    one = _wav(4)
+    await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=one,
+        media_format="wav",
+        chunk_seq=0,
+        is_final=False,
+        max_chunks=2,
+        max_total_bytes=len(one),
+    )
+    storage.calls.clear()
+
+    with pytest.raises(RecordingLimitExceeded):
+        await upload_chunk(
+            repo,
+            storage,
+            token_meeting_id=MEETING_ID,
+            session_uid=SESSION_UID,
+            data=one,
+            media_format="wav",
+            chunk_seq=1,
+            is_final=True,
+            max_chunks=2,
+            max_total_bytes=len(one),
+        )
+    assert storage.calls == []
+
+    with pytest.raises(RecordingLimitExceeded):
+        await upload_chunk(
+            repo,
+            storage,
+            token_meeting_id=MEETING_ID,
+            session_uid=SESSION_UID,
+            data=b"",
+            media_format="wav",
+            chunk_seq=2,
+            is_final=True,
+            max_chunks=2,
+            max_total_bytes=len(one),
+        )
+    assert storage.calls == []
+
+
+async def test_finalize_rejects_an_over_limit_manifest_before_storage_body_reads():
+    class TrackingStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.body_reads = 0
+            self.uploads = 0
+
+        async def get(self, key):
+            self.body_reads += 1
+            return await super().get(key)
+
+        async def upload(self, key, data, *, content_type):
+            self.uploads += 1
+            await super().upload(key, data, content_type=content_type)
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    storage = TrackingStorage()
+    receipt = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(),
+        media_format="wav",
+        chunk_seq=0,
+        is_final=True,
+    )
+    storage.body_reads = 0
+    storage.uploads = 0
+
+    with pytest.raises(RecordingLimitExceeded):
+        await finalize_master(
+            repo,
+            storage,
+            meeting_id=MEETING_ID,
+            recording_id=receipt["recording_id"],
+            max_total_bytes=len(_wav()) - 1,
+        )
+
+    assert storage.body_reads == 0
+    assert storage.uploads == 0
+
+
 async def test_upload_before_session_is_pending():
     repo, storage = _seeded()
     receipt = await upload_chunk(
@@ -410,6 +732,26 @@ async def test_upload_before_session_is_pending():
         data=_wav(), media_format="wav", chunk_seq=0, is_final=False,
     )
     assert receipt == {"status": "pending"}
+
+
+async def test_upload_resolves_session_by_meeting_and_uid_when_two_tenants_share_the_uid():
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    repo.seed(meeting_id=2, user_id=8, session_uid=SESSION_UID)
+    storage = InMemoryStorage()
+
+    receipt = await upload_chunk(
+        repo,
+        storage,
+        token_meeting_id=MEETING_ID,
+        session_uid=SESSION_UID,
+        data=_wav(),
+        media_format="wav",
+    )
+
+    assert receipt["status"] == "completed"
+    assert len(await repo.get_recordings(MEETING_ID)) == 1
+    assert await repo.get_recordings(2) == []
 
 
 @pytest.mark.parametrize(
@@ -484,7 +826,14 @@ def _resign_meeting_token(*, header_update=None, claim_update=None, claim_remove
     import hmac
     import json
 
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID,
+        USER,
+        "google_meet",
+        "abc",
+        session_uid=SESSION_UID,
+        secret=SECRET,
+    )
     header_b64, payload_b64, _ = token.split(".")
     header = json.loads(base64.urlsafe_b64decode(header_b64 + "=" * (-len(header_b64) % 4)))
     claims = json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)))
@@ -514,7 +863,9 @@ def test_upload_route_requires_token():
 
 def test_upload_route_accepts_valid_token():
     client = _client()
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
     r = client.post(
         "/internal/recordings/upload",
         headers={"Authorization": f"Bearer {token}"},
@@ -523,6 +874,78 @@ def test_upload_route_accepts_valid_token():
     )
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
+
+
+def test_upload_route_rejects_a_token_bound_to_another_session():
+    client = _client()
+    token = mint_meeting_token(
+        MEETING_ID,
+        USER,
+        "google_meet",
+        "abc",
+        session_uid="another-session",
+        secret=SECRET,
+    )
+
+    response = client.post(
+        "/internal/recordings/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"session_uid": SESSION_UID, "media_format": "wav", "chunk_seq": 0},
+        files={"file": ("c.wav", _wav(), "audio/wav")},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Recording token session mismatch"}
+
+
+def test_platform_internal_secret_is_never_a_recording_upload_credential(monkeypatch):
+    monkeypatch.setenv("INTERNAL_API_SECRET", "internal-secret")
+    client = _client()
+
+    response = client.post(
+        "/internal/recordings/upload",
+        headers={"Authorization": "Bearer internal-secret"},
+        data={"session_uid": SESSION_UID, "media_format": "wav", "chunk_seq": 0},
+        files={"file": ("c.wav", _wav(), "audio/wav")},
+    )
+
+    assert response.status_code == 401
+    assert "Invalid recording upload token" in response.json()["detail"]
+
+
+def test_platform_internal_secret_cannot_select_a_meeting_from_metadata(
+    monkeypatch,
+):
+    import json
+
+    from fastapi import FastAPI
+
+    monkeypatch.setenv("INTERNAL_API_SECRET", "internal-secret")
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    repo.seed(meeting_id=2, user_id=8, session_uid=SESSION_UID)
+    app = FastAPI()
+    app.include_router(build_router(repo, InMemoryStorage(), token_secret=SECRET))
+    client = TestClient(app)
+
+    response = client.post(
+        "/internal/recordings/upload",
+        headers={"Authorization": "Bearer internal-secret"},
+        data={
+            "metadata": json.dumps(
+                {
+                    "meeting_id": MEETING_ID,
+                    "session_uid": SESSION_UID,
+                    "format": "wav",
+                }
+            )
+        },
+        files={"file": ("c.wav", _wav(), "audio/wav")},
+    )
+
+    assert response.status_code == 401, response.text
+    assert repo._meetings[MEETING_ID]["recordings"] == []
+    assert repo._meetings[2]["recordings"] == []
 
 
 def test_upload_route_rejects_a_divergent_same_sequence_replay_without_mutation():
@@ -534,7 +957,9 @@ def test_upload_route_rejects_a_divergent_same_sequence_replay_without_mutation(
     app = FastAPI()
     app.include_router(build_router(repo, storage, token_secret=SECRET))
     client = TestClient(app)
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
     request = {
         "headers": {"Authorization": f"Bearer {token}"},
         "data": {
@@ -625,7 +1050,9 @@ def test_upload_route_rejects_tokens_without_a_valid_meeting_identity(
 
 def test_upload_route_reports_invalid_storage_metadata_without_echoing_it():
     client = _client()
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
     response = client.post(
         "/internal/recordings/upload",
         headers={"Authorization": f"Bearer {token}"},
@@ -654,7 +1081,9 @@ def test_upload_route_rejects_an_oversized_chunk_before_storage_or_database_muta
     app = FastAPI()
     app.include_router(build_router(repo, storage, token_secret=SECRET))
     client = TestClient(app)
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
 
     response = client.post(
         "/internal/recordings/upload",
@@ -665,6 +1094,32 @@ def test_upload_route_rejects_an_oversized_chunk_before_storage_or_database_muta
 
     assert response.status_code == 413
     assert response.json() == {"detail": "Recording chunk exceeds the upload limit"}
+    assert storage.blobs == {}
+    assert repo._meetings[MEETING_ID]["recording_prefixes"] == []
+    assert repo._meetings[MEETING_ID]["recordings"] == []
+
+
+def test_upload_route_reports_aggregate_limit_without_mutating_storage(monkeypatch):
+    from fastapi import FastAPI
+
+    monkeypatch.setenv("RECORDING_MAX_TOTAL_BYTES", str(len(_wav()) - 1))
+    repo, storage = _seeded()
+    app = FastAPI()
+    app.include_router(build_router(repo, storage, token_secret=SECRET))
+    client = TestClient(app)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
+
+    response = client.post(
+        "/internal/recordings/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        data={"session_uid": SESSION_UID, "media_format": "wav", "chunk_seq": 0},
+        files={"file": ("c.wav", _wav(), "audio/wav")},
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Recording exceeds configured limits"}
     assert storage.blobs == {}
     assert repo._meetings[MEETING_ID]["recording_prefixes"] == []
     assert repo._meetings[MEETING_ID]["recordings"] == []
@@ -684,7 +1139,9 @@ def test_upload_route_reports_conflict_after_erasure_starts():
     app = FastAPI()
     app.include_router(build_router(repo, InMemoryStorage(), token_secret=SECRET))
     client = TestClient(app, raise_server_exceptions=False)
-    token = mint_meeting_token(MEETING_ID, USER, "google_meet", "abc", secret=SECRET)
+    token = mint_meeting_token(
+        MEETING_ID, USER, "google_meet", "abc", session_uid=SESSION_UID, secret=SECRET
+    )
 
     response = client.post(
         "/internal/recordings/upload",
@@ -719,6 +1176,144 @@ def test_master_route_reports_conflict_after_erasure_starts():
     assert response.status_code == 409
     assert response.json() == {"detail": "Meeting is no longer writable"}
     assert "private state detail" not in response.text
+
+
+def test_master_route_reports_incomplete_manifest_as_content_free_conflict():
+    from fastapi import FastAPI
+
+    repo, storage = _seeded()
+    import asyncio
+
+    receipt = asyncio.run(
+        upload_chunk(
+            repo,
+            storage,
+            token_meeting_id=MEETING_ID,
+            session_uid=SESSION_UID,
+            data=_wav(),
+            media_format="wav",
+            chunk_seq=0,
+            is_final=False,
+        )
+    )
+    app = FastAPI()
+    app.include_router(build_router(repo, storage, token_secret=SECRET))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get(
+        f"/recordings/{receipt['recording_id']}/master",
+        headers={"x-user-id": str(USER)},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Recording is not available"}
+    assert SESSION_UID not in response.text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/recordings/41",
+        "/recordings/41/master",
+        "/recordings/41/media/11/raw",
+    ],
+)
+def test_past_audio_expiry_makes_every_recording_read_uniformly_unavailable_without_storage_io(
+    path,
+):
+    from fastapi import FastAPI
+
+    class NoReadStorage(InMemoryStorage):
+        def __init__(self):
+            super().__init__()
+            self.calls: list[str] = []
+
+        async def list(self, prefix):
+            self.calls.append("list")
+            return await super().list(prefix)
+
+        async def get(self, key):
+            self.calls.append("get")
+            return await super().get(key)
+
+        async def size(self, key):
+            self.calls.append("size")
+            return await super().size(key)
+
+        async def exists(self, key):
+            self.calls.append("exists")
+            return await super().exists(key)
+
+        async def upload(self, key, data, *, content_type):
+            self.calls.append("upload")
+            await super().upload(key, data, content_type=content_type)
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    repo._meetings[MEETING_ID]["data"] = {
+        "zaki_capture": {"state": "authorized"},
+        "zaki_retention": {
+            "state": "open",
+            "scope_expiries": {"audio": "2020-01-01T00:00:00Z"},
+            "expired_scopes": [],
+        },
+    }
+    master_key = f"recordings/{USER}/41/{SESSION_UID}/audio/master.wav"
+    repo._meetings[MEETING_ID]["recordings"] = [
+        {
+            "id": 41,
+            "meeting_id": MEETING_ID,
+            "session_uid": SESSION_UID,
+            "source": "bot",
+            "status": "completed",
+            "media_files": [
+                {
+                    "id": 11,
+                    "type": "audio",
+                    "format": "wav",
+                    "is_final": True,
+                    "finalized_by": "recording_finalizer.master",
+                    "storage_path": master_key,
+                }
+            ],
+        }
+    ]
+    storage = NoReadStorage()
+    storage.blobs[master_key] = _wav()
+    app = FastAPI()
+    app.include_router(build_router(repo, storage, token_secret=SECRET))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.get(path, headers={"x-user-id": str(USER)})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Recording not found"}
+    assert storage.calls == []
+
+
+def test_past_audio_expiry_filters_the_recording_collection_without_storage_io():
+    from fastapi import FastAPI
+
+    repo = InMemoryRecordingRepo()
+    repo.seed(meeting_id=MEETING_ID, user_id=USER, session_uid=SESSION_UID)
+    repo._meetings[MEETING_ID]["data"] = {
+        "zaki_capture": {"state": "authorized"},
+        "zaki_retention": {
+            "state": "open",
+            "scope_expiries": {"audio": "2020-01-01T00:00:00Z"},
+            "expired_scopes": [],
+        },
+    }
+    repo._meetings[MEETING_ID]["recordings"] = [{"id": 41, "media_files": []}]
+    storage = InMemoryStorage()
+    app = FastAPI()
+    app.include_router(build_router(repo, storage, token_secret=SECRET))
+    client = TestClient(app)
+
+    response = client.get("/recordings", headers={"x-user-id": str(USER)})
+
+    assert response.status_code == 200
+    assert response.json() == {"recordings": []}
 
 
 # ── G4: object-storage I/O must not block the event loop ─────────────────────────────────────────

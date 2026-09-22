@@ -2,8 +2,8 @@
 # Vexa Lite (v0.12) — single-container build + deploy
 # =============================================================================
 # `make lite` (from repo root) → this Makefile's `all`: provisions PostgreSQL + MinIO sidecar
-# containers, pulls/builds the all-in-one image, runs it on the host network with the process
-# backend, and verifies the front doors. The app image is lean; postgres/minio stay external.
+# containers, pulls/builds the all-in-one image, runs it on a private bridge with loopback-published
+# front doors, and verifies them. The app image is lean; postgres/minio stay external.
 .PHONY: all up down init-db test env preflight build push build-and-push set-latest set-dev setup-builder help
 
 # --- Paths ---
@@ -34,6 +34,8 @@ APP_CONTAINER   ?= vexa-lite
 HOST_GATEWAY_PORT   ?= 8056
 HOST_TERMINAL_PORT  ?= 3001
 HOST_AGENT_PORT     ?= 8100
+HOST_BIND          ?= 127.0.0.1
+TERMINAL_PUBLIC_URL ?= http://localhost:$(HOST_TERMINAL_PORT)
 MINIO_ACCESS_KEY ?= vexa-access-key
 MINIO_SECRET_KEY ?= vexa-secret-key
 MINIO_BUCKET     ?= vexa
@@ -53,11 +55,10 @@ help:
 
 # ── Deploy lifecycle ──────────────────────────────────────────────────────────────────────────────
 all: env preflight up init-db test
-	@HOST=$$(hostname -I 2>/dev/null | awk '{print $$1}'); HOST=$${HOST:-localhost}; \
 	echo ""; echo "Vexa Lite is running."; \
-	echo "  Terminal:  http://$$HOST:$(HOST_TERMINAL_PORT)"; \
-	echo "  API docs:  http://$$HOST:$(HOST_GATEWAY_PORT)/docs"; \
-	echo "  Agent API: http://$$HOST:$(HOST_AGENT_PORT)"
+	echo "  Terminal:  http://localhost:$(HOST_TERMINAL_PORT)"; \
+	echo "  API docs:  http://localhost:$(HOST_GATEWAY_PORT)/docs"; \
+	echo "  Agent API: http://localhost:$(HOST_AGENT_PORT)"
 
 ## env — ensure a repo-root .env exists (seed from compose/.env if present, else a minimal template).
 env:
@@ -126,14 +127,15 @@ up: preflight
 	docker rm -f $(APP_CONTAINER) 2>/dev/null || true; \
 	docker run -d --name $(APP_CONTAINER) --shm-size=2g --network $(NETWORK) --restart unless-stopped \
 		--env-file $(ENV_FILE) \
-		-p $(HOST_GATEWAY_PORT):8056 -p $(HOST_TERMINAL_PORT):3001 -p $(HOST_AGENT_PORT):8100 \
+		-p $(HOST_BIND):$(HOST_GATEWAY_PORT):8056 -p $(HOST_BIND):$(HOST_TERMINAL_PORT):3001 -p $(HOST_BIND):$(HOST_AGENT_PORT):8100 \
 		-e DB_HOST=$(PG_CONTAINER) -e DB_PORT=5432 -e DB_NAME=vexa -e DB_USER=postgres -e DB_PASSWORD=postgres \
 		-e ADMIN_API_TOKEN=$$ADMIN_TK -e ADMIN_TOKEN=$$ADMIN_TK \
 		-e TRANSCRIPTION_SERVICE_URL=$$TX_URL -e TRANSCRIPTION_SERVICE_TOKEN=$$TX_TOKEN \
 		-e MINIO_ENDPOINT=$(MINIO_CONTAINER):9000 -e MINIO_ACCESS_KEY=$(MINIO_ACCESS_KEY) \
 		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) -e MINIO_BUCKET=$(MINIO_BUCKET) -e MINIO_SECURE=false \
 		-e VEXA_PUBLIC_API_URL=http://localhost:$(HOST_GATEWAY_PORT) \
-		-e TERMINAL_PUBLIC_URL=http://localhost:$(HOST_TERMINAL_PORT) \
+		-e TERMINAL_PUBLIC_URL=$(TERMINAL_PUBLIC_URL) \
+		-e VEXA_TERMINAL_HOST_BIND=$(HOST_BIND) \
 		$$CLAUDE_MOUNT \
 		$$IMG > /dev/null; \
 	echo "  Waiting for the gateway (up to 3 min)..."; \

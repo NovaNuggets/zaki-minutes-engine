@@ -65,7 +65,9 @@ export interface ActsSource {
 /** recording.v1 sink — accumulates capture chunks and assembles the master. The real
  *  adapter is @vexa/recording's assembler → upload; the orchestrator only signals close. */
 export interface RecordingSink {
-  close(key: string): void;
+  /** Flush the final durable recording signal. Managed sinks return a promise that the
+   * orchestrator must await before it reports terminal completion. */
+  close(key: string): void | Promise<void>;
 }
 
 /** One captured-signal.v1 frame as it crosses the capture-bridge tap — the VERBATIM raw

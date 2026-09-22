@@ -5,9 +5,8 @@ A chat grounded in a meeting behaves differently by the meeting's lifecycle phas
 
   prep  (intent: idle/scheduled)      — no transcript exists; steer toward preparation
         (agenda, attendee research, a brief written into the bound workspace).
-  live  (requested→active→stopping)   — fold the live transcript; answer from it.
-  post  (completed/failed/stopped)    — fold the PROCESSED notes (cleaned transcript);
-        steer toward recap, decisions, action items, follow-ups.
+  live  (requested→active→stopping)   — require the bounded Minutes read path.
+  post  (completed/failed/stopped)    — require the bounded Minutes read path.
 
 The templates below are the hardcoded FALLBACK. The governed control surface is the
 platform-operated ``_global`` workspace (the same repo `system_mounts.global_mount`
@@ -114,6 +113,17 @@ NO_RECORD_POST = (
     "The meeting \"{title}\" ({platform}/{native}) has ended{failed}, but no transcript or "
     "processed notes were captured for it. Tell the user plainly that no record of this meeting "
     "exists — do not reconstruct or invent its content.\n\n"
+)
+
+# Raw/processed meeting text must never be copied into the generic chat prompt. That prompt is
+# durably replicated into the chat Redis input stream and harness continuity storage, neither of
+# which can be purged by a row-scoped Minutes erasure receipt. The dedicated Minutes reader owns a
+# bounded, non-persistent turn instead; until it is composed, fail honest without reopening Redis.
+MINUTES_READ_REQUIRED = (
+    "The focused meeting's transcript and processed notes are sensitive and intentionally not "
+    "embedded in this durable chat turn. Use the dedicated, bounded Minutes read path when it is "
+    "enabled. If that path is unavailable, tell the user that meeting content cannot be read safely "
+    "from this chat yet; do not reconstruct or invent it.\n\n"
 )
 
 _SECTION_RE = re.compile(r"^##\s+(prep|live|post|schedule|workspace_focus)\s*$", re.MULTILINE)

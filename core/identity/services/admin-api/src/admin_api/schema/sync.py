@@ -8,10 +8,12 @@ dropping tables, columns, or data:
   partial DB      → add missing tables, then missing columns, then missing indexes
   current DB      → no-op (idempotent)
 
-This v0.12 carve keeps `create_all(checkfirst=True)` + the additive column/index sync. We do
-NOT need the `prerequisites=` two-base bridge the parent used (it split identity vs meeting
-bases) because the v0.12 schema co-locates both in one `Base.metadata` — create_all already
-emits tables in FK order.
+This v0.12 carve keeps `create_all(checkfirst=True)` + the additive column/index sync and one
+explicitly monotonic type migration: model-owned identifier columns widen from int4 to int8. The
+widening is transactionally idempotent and preserves data, constraints, and old-image readability.
+We do NOT need the `prerequisites=` two-base bridge the parent used (it split identity vs meeting
+bases) because the v0.12 schema co-locates both in one `Base.metadata` — create_all already emits
+tables in FK order.
 """
 import logging
 
@@ -86,6 +88,54 @@ def _sync_columns(conn: Connection, base):
             conn.execute(text(stmt))
 
 
+def _quoted_identifier(conn: Connection, dotted_name: str) -> str:
+    """Quote a trusted catalog/model identifier, including schema-qualified sequence names."""
+    preparer = conn.dialect.identifier_preparer
+    return ".".join(preparer.quote(part.strip('"')) for part in dotted_name.split("."))
+
+
+def _sync_bigint_columns(conn: Connection, base):
+    """Widen model-declared BIGINT identifiers on existing v0.12 int4 databases.
+
+    PostgreSQL permits a foreign-key pair to be widened one side at a time inside the same
+    transaction. ``sorted_tables`` visits referenced tables before their children. Only int2/int4
+    are widened; an unexpected type is a boot error rather than a guessed destructive conversion.
+    SERIAL sequences are widened too, otherwise they would still stop at 2^31-1.
+    """
+    inspector = inspect(conn)
+    existing_tables = set(inspector.get_table_names())
+    for table in base.metadata.sorted_tables:
+        if table.name not in existing_tables:
+            continue
+        actual = {column["name"]: type(column["type"]).__name__.upper()
+                  for column in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if type(column.type).__name__.upper() != "BIGINTEGER":
+                continue
+            current = actual.get(column.name)
+            if current == "BIGINT":
+                continue
+            if current not in {"INTEGER", "SMALLINT"}:
+                raise RuntimeError(
+                    f"schema-sync refuses to coerce {table.name}.{column.name} "
+                    f"from unexpected type {current!r} to BIGINT"
+                )
+            table_name = _quoted_identifier(conn, table.name)
+            column_name = _quoted_identifier(conn, column.name)
+            conn.execute(text(
+                f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT"
+            ))
+            if column.primary_key:
+                sequence = conn.execute(
+                    text("SELECT pg_get_serial_sequence(:table_name, :column_name)"),
+                    {"table_name": table.name, "column_name": column.name},
+                ).scalar()
+                if sequence:
+                    conn.execute(text(
+                        f"ALTER SEQUENCE {_quoted_identifier(conn, sequence)} AS BIGINT"
+                    ))
+
+
 def _sync_indexes(conn: Connection, base):
     inspector = inspect(conn)
     existing_tables = set(inspector.get_table_names())
@@ -114,6 +164,7 @@ def _sync_indexes(conn: Connection, base):
 def _ensure_schema_sync(conn: Connection, base):
     base.metadata.create_all(conn, checkfirst=True)   # missing tables, FK order
     _sync_columns(conn, base)                          # additive columns
+    _sync_bigint_columns(conn, base)                   # monotonic int4 -> int8 identifier widening
     _sync_indexes(conn, base)                          # additive indexes
 
 

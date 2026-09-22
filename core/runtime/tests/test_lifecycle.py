@@ -72,10 +72,12 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.starts: list[str] = []
+        self.start_resources = {}
         self.exit_codes: dict[str, int | None] = {}
 
-    def start(self, workload_id, runnable, env):
+    def start(self, workload_id, runnable, env, *, resources=None):
         self.starts.append(workload_id)
+        self.start_resources[workload_id] = resources
         self.exit_codes[workload_id] = None
         return WorkloadHandle(id=workload_id, impl=workload_id)
 
@@ -104,7 +106,23 @@ def test_create_is_idempotent_touch_while_running():
     touched = rt.create(WorkloadSpec(workloadId="w1", profile="test", env={"A": "2"}))
     assert touched.state is RuntimeState.running
     assert be.starts == ["w1"]                          # ONE spawn — the second create touched
-    assert rt.store.get("w1").spec.env == {"A": "1"}    # the running workload keeps its original spec
+    # The first launch still owns the live process, but secret-bearing launch env is never durable.
+    assert rt.store.get("w1").spec.env == {}
+
+
+def test_create_delivers_workload_resource_contract_to_backend():
+    be = _FakeBackend()
+    rt = Runtime(backend=be, profiles={"test": ["true"]})
+    spec = WorkloadSpec(
+        workloadId="bounded",
+        profile="test",
+        env={},
+        resources={"cpu": 0.75, "memoryMb": 640},
+    )
+
+    rt.create(spec)
+
+    assert be.start_resources["bounded"] == spec.resources
 
 
 def test_touch_at_quota_cap_never_raises():

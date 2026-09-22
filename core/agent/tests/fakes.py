@@ -50,12 +50,17 @@ class FakeRuntime(RuntimePort):
 
     def __init__(self) -> None:
         self.spawned: list[tuple[str, str, dict[str, str]]] = []
+        self.stopped: list[str] = []
 
     def spawn(self, workload_id: str, profile: str, env: dict[str, str]) -> str:
         self.spawned.append((workload_id, profile, env))
         return workload_id
 
     def await_done(self, workload_id: str, timeout_sec: float = 0.0) -> str:
+        return "stopped"
+
+    def stop(self, workload_id: str) -> str:
+        self.stopped.append(workload_id)
         return "stopped"
 
 

@@ -1,5 +1,5 @@
 /** Direct email login — no SMTP, no magic link. POST {email} → find-or-create the user at admin-api,
- *  mint an APIToken (scopes bot,tx,browser), set the httpOnly `vexa-token` + `vexa-user-info` cookies.
+ *  mint an APIToken (scopes bot,tx,browser,agent), set the httpOnly `vexa-token` + `vexa-user-info` cookies.
  *
  *  Mirrors the dashboard's VEXA_ALLOW_DIRECT_LOGIN branch (without importing it). No email is ever sent.
  *  Must never be cached — a cached response would pin one identity for every subsequent login.
@@ -7,6 +7,9 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { cookies } from "next/headers";
 import { AUTH_COOKIE, USER_INFO_COOKIE, findOrCreateUserToken } from "../adminApi";
+import { readBoundedText } from "../../boundedBody";
+import { MAX_AUTH_REQUEST_BYTES } from "../../proxyLimits";
+import { directLoginEmailAllowed, directLoginEnabled } from "../../../../proxyAuthPolicy.mjs";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
@@ -23,30 +26,44 @@ function isSecureRequest(): boolean {
 }
 
 export async function POST(request: NextRequest) {
-  let email: unknown;
+  // Default-off, local-only debug surface. Refuse before inspecting attacker-controlled input or
+  // spending the admin credential; normal OAuth/session auth is a separate route and is unchanged.
+  if (!directLoginEnabled(process.env)) {
+    return NextResponse.json({ error: "not_found" }, { status: 404, headers: NO_STORE });
+  }
+
+  let body: unknown;
   try {
-    ({ email } = await request.json());
+    const raw = await readBoundedText(request, MAX_AUTH_REQUEST_BYTES);
+    if (raw === null) {
+      return NextResponse.json({ error: "Request body is too large" }, { status: 413, headers: NO_STORE });
+    }
+    body = JSON.parse(raw);
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400, headers: NO_STORE });
   }
+
+  const email = body && typeof body === "object" && !Array.isArray(body)
+    ? (body as { email?: unknown }).email
+    : undefined;
 
   if (typeof email !== "string" || !email.trim()) {
     return NextResponse.json({ error: "Email is required" }, { status: 400, headers: NO_STORE });
   }
   const normalized = email.trim().toLowerCase();
-  if (!EMAIL_RE.test(normalized)) {
+  if (normalized.length > 320 || !EMAIL_RE.test(normalized)) {
     return NextResponse.json({ error: "Invalid email format" }, { status: 400, headers: NO_STORE });
   }
-  // Direct email login is a DEBUG path only — real sign-in goes through Google/Microsoft OAuth
-  // (api/auth/[...nextauth]). Restrict it to test accounts so it can't be used as a password-less bypass.
-  if (!normalized.includes("test")) {
+  if (!directLoginEmailAllowed(normalized, process.env)) {
     return NextResponse.json(
-      { error: "Direct email login is for test accounts only — use Google or Microsoft sign-in." },
+      { error: "Direct email login is not allowed for this account." },
       { status: 403, headers: NO_STORE },
     );
   }
 
-  const result = await findOrCreateUserToken(normalized);
+  // A debug allowlisted identity may never become the first administrator. OAuth retains the normal
+  // bootstrap path; this route explicitly suppresses it even on a fresh instance.
+  const result = await findOrCreateUserToken(normalized, { bootstrapAdmin: false });
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: result.status || 500, headers: NO_STORE });
   }

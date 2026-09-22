@@ -84,20 +84,40 @@ function MeetingCanvasBody({ meetingId }: { meetingId?: string }) {
 
   // null = untouched → follow the default (which can flip once the durable notes hydrate).
   const [override, setOverride] = useState<boolean | null>(null);
+  const [processingPending, setProcessingPending] = useState(false);
+  const [processingError, setProcessingError] = useState<string | null>(null);
   const processing = deriveProcessingView({ override, live, hasNotes, durableTerminal });
 
   // LIVE: the toggle ALSO controls backend processing — ON enables the copilot (full-history backfill
   // the first time, else resume); OFF disables it. COMPLETED: pure view switch — there is nothing to
   // arm any more, so we must NOT hit the process endpoint (a stale-live row counts as completed).
-  const toggleProcessing = () => {
+  const toggleProcessing = async () => {
+    if (processingPending) return;
     const next = !processing;
-    setOverride(next);
-    if (meetingId && effectiveLive) {
-      void fetch("/api/meeting/process", {
+    setProcessingError(null);
+    if (!effectiveLive) {
+      setOverride(next);
+      return;
+    }
+    if (!meetingId) {
+      setProcessingError("Couldn’t change meeting processing. Try again.");
+      return;
+    }
+    setProcessingPending(true);
+    try {
+      const response = await fetch("/api/meeting/process", {
         method: "POST", headers: { "Content-Type": "application/json" },
         // meeting_id = the ROW id (the copilot keys on it); native_id = the display native (kg doc name).
         body: JSON.stringify({ meeting_id: meetingId, native_id: nativeId ?? meetingId, on: next }),
-      }).catch(() => { /* best-effort — the view still reflects the toggle */ });
+      });
+      if (!response.ok) throw new Error("processing toggle was not confirmed");
+      // The visible state changes only after the control plane confirms the consent transition.  This
+      // is especially important for OFF: a failed runtime stop must never be rendered as disabled.
+      setOverride(next);
+    } catch {
+      setProcessingError("Couldn’t change meeting processing. Try again.");
+    } finally {
+      setProcessingPending(false);
     }
   };
 
@@ -109,7 +129,9 @@ function MeetingCanvasBody({ meetingId }: { meetingId?: string }) {
       <div style={{ flex: "none", display: "flex", alignItems: "center", gap: 10, padding: `8px ${MEETING_CANVAS_CONTENT_INSET}px 0` }}>
         <button
           type="button"
-          onClick={toggleProcessing}
+          onClick={() => { void toggleProcessing(); }}
+          disabled={processingPending}
+          aria-busy={processingPending}
           aria-pressed={processing}
           title={processing ? "Showing the cleaned, copilot-processed view" : (effectiveLive ? "Showing the raw transcript — flip on for processing" : "Showing the raw transcript")}
           style={{
@@ -124,6 +146,11 @@ function MeetingCanvasBody({ meetingId }: { meetingId?: string }) {
           {label}
         </button>
         <span style={{ fontSize: 11.5, color: "var(--t3)" }}>{processing ? "cleaned + copilot" : "raw transcript"}</span>
+        {processingError ? (
+          <span role="alert" style={{ fontSize: 11.5, color: "var(--danger, #b42318)" }}>
+            {processingError}
+          </span>
+        ) : null}
       </div>
       <MeetingHealthBanner />
       <main style={{ flex: 1, minHeight: 0, overflow: "auto" }}>

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import pathlib
 
+import yaml
+
 from llm.claude_code import ClaudeCodeHarness, _link_skills_into_workspace
 from worker.worker import serve
 
@@ -315,9 +317,63 @@ class ProcMeetingStream(MeetingStream):
     def set(self, key, value):
         self.kv[key] = value
 
+    def carrier_is_writable(self, *, fence_key, scope):
+        return True
+
+    def xadd_if_writable(self, name, fields, *, fence_key, scope):
+        self.xadd(name, fields)
+        return True
+
+    def set_if_writable(self, key, value, *, fence_key, scope):
+        self.set(key, value)
+        return True
+
     def proc_notes(self, proc_stream):
         return [json.loads(f["note"]) for name, f in self.out if name == proc_stream and "note" in f]
 
+
+class FencedProcMeetingStream(ProcMeetingStream):
+    def xadd_if_writable(self, name, fields, *, fence_key, scope):
+        assert fence_key == "zaki:retention:meeting:41:fence"
+        assert scope == "processed"
+        return False
+
+    def set_if_writable(self, key, value, *, fence_key, scope):
+        assert fence_key == "zaki:retention:meeting:41:fence"
+        assert scope == "processed"
+        return False
+
+
+class DynamicFenceProcMeetingStream(ProcMeetingStream):
+    def __init__(self, inbox):
+        super().__init__(inbox)
+        self.fenced = False
+
+    def carrier_is_writable(self, *, fence_key, scope):
+        return not self.fenced
+
+    def xadd_if_writable(self, name, fields, *, fence_key, scope):
+        if self.fenced:
+            return False
+        return super().xadd_if_writable(
+            name, fields, fence_key=fence_key, scope=scope
+        )
+
+    def set_if_writable(self, key, value, *, fence_key, scope):
+        if self.fenced:
+            return False
+        return super().set_if_writable(
+            key, value, fence_key=fence_key, scope=scope
+        )
+
+
+class FenceAfterCursorProcMeetingStream(DynamicFenceProcMeetingStream):
+    def set_if_writable(self, key, value, *, fence_key, scope):
+        accepted = super().set_if_writable(
+            key, value, fence_key=fence_key, scope=scope
+        )
+        self.fenced = True
+        return accepted
 
 def _notes_card_turn(segments):
     """A card_turn that returns an LLM-style UPGRADE note for each input segment (id == segment_id)."""
@@ -345,6 +401,74 @@ def test_serve_meeting_emits_one_proc_note_per_segment_keyed_by_segment_id():
     assert all(n["text"] for n in notes)
     # the cards beat stays on its OWN topic — proc notes are NOT mixed into out_topic
     assert all(name != "proc:meeting:m1" for name, _ in s.out if name == "unit:u:out")
+
+
+def test_processed_fence_stops_late_agent_beat_without_recreating_any_output():
+    s = FencedProcMeetingStream(inbox=[
+        _transcript("9-0", {**_seg("Jane", "private late beat"), "segment_id": "a"}),
+        ("10-0", {"payload": json.dumps({"type": "session_end"})}),
+    ])
+
+    serve_meeting(
+        s,
+        transcript_stream="tc:meeting:41",
+        out_topic="unit:agent-meet-41:out",
+        card_turn=_notes_card_turn,
+        idle_ms=10,
+        proc_stream="proc:meeting:41",
+        cursor_key="proc:meeting:41:cursor",
+    )
+
+    assert s.out == []
+    assert s.kv == {}
+
+
+def test_processed_fence_gates_post_meeting_out_topic_while_doc_turn_is_running():
+    s = DynamicFenceProcMeetingStream(inbox=[
+        ("10-0", {"payload": json.dumps({"type": "session_end"})}),
+    ])
+
+    def doc_turn(_cards):
+        s.fenced = True
+        yield {"type": "message-delta", "text": "private summary"}
+
+    serve_meeting(
+        s,
+        transcript_stream="tc:meeting:41",
+        out_topic="unit:agent-meet-41:out",
+        card_turn=_notes_card_turn,
+        doc_turn=doc_turn,
+        idle_ms=10,
+        proc_stream="proc:meeting:41",
+        cursor_key="proc:meeting:41:cursor",
+    )
+
+    assert [fields for name, fields in s.out if name == "unit:agent-meet-41:out"] == []
+
+
+def test_processed_fence_prevents_a_known_erased_window_from_reaching_the_llm():
+    s = FenceAfterCursorProcMeetingStream(inbox=[
+        _transcript("9-0", {**_seg("Jane", "private late beat"), "segment_id": "a"}),
+        ("10-0", {"payload": json.dumps({"type": "session_end"})}),
+    ])
+    calls = 0
+
+    def card_turn(_segments):
+        nonlocal calls
+        calls += 1
+        yield {"type": "message-delta", "text": "private summary"}
+
+    serve_meeting(
+        s,
+        transcript_stream="tc:meeting:41",
+        out_topic="unit:agent-meet-41:out",
+        card_turn=card_turn,
+        idle_ms=10,
+        proc_stream="proc:meeting:41",
+        cursor_key="proc:meeting:41:cursor",
+    )
+
+    assert calls == 0
 
 
 def test_serve_meeting_persists_and_advances_cursor():
@@ -465,6 +589,48 @@ def test_upsert_meeting_file_writes_then_updates_idempotently(tmp_path):
     before = path.read_text()
     upsert_meeting_transcript_file(path, _MEETING_META, {"id": "a", "speaker": "Jane", "text": "hello there, everyone"})
     assert path.read_text() == before
+
+
+def test_meeting_transcript_frontmatter_serializes_untrusted_values_as_yaml_data(tmp_path):
+    from worker.worker import render_meeting_transcript
+
+    meta = {
+        "type": "meeting",
+        "id": "41",
+        "title": "Meeting 41\nowner: attacker",
+        "meeting_id": "41",
+        "session_uid": "41",
+        "platform": "google_meet\nadmin: true",
+        "date": "2026-07-15",
+    }
+    rendered = render_meeting_transcript(meta, [])
+    frontmatter = yaml.safe_load(rendered.split("---\n", 2)[1])
+
+    assert frontmatter == meta
+    assert set(frontmatter) == {
+        "type", "id", "title", "meeting_id", "session_uid", "platform", "date"
+    }
+
+
+def test_meeting_transcript_structures_untrusted_note_fields_without_markup_injection(tmp_path):
+    path = tmp_path / "kg" / "entities" / "meeting" / "41.md"
+    meta = {**_MEETING_META, "id": "41", "meeting_id": "41", "title": "Meeting 41"}
+    note = {
+        "id": "segment -->\n# injected heading",
+        "speaker": "Jane\n---\nowner: attacker **",
+        "text": "hello <script>alert(1)</script>",
+    }
+
+    upsert_meeting_transcript_file(path, meta, note)
+    first = path.read_text()
+    upsert_meeting_transcript_file(path, meta, note)
+    second = path.read_text()
+
+    assert first == second
+    assert first.count("<!-- id:") == 1
+    assert "\n# injected heading" not in first
+    assert "<script>" not in first
+    assert "\nowner: attacker" not in first
 
 
 def test_serve_meeting_upserts_workspace_file_from_proc_notes(tmp_path):
@@ -756,65 +922,30 @@ def test_run_turn_starts_fresh_when_resume_transcript_is_too_large(tmp_path, mon
 
 
 def test_meeting_doc_turn_authors_entity_with_frontmatter_and_links(tmp_path):
-    """The real post-meeting WRITE turn: a fake `claude` writes the entity; assert the harness turn drove a
-    write to kg/entities/meeting/<native>.md with the meeting frontmatter + grouped wikilinks, and the
-    prompt carried the surfaced cards."""
+    """The post-meeting writer deterministically updates the canonical row document."""
     from worker import worker
 
-    native = "nba-agyz-gbe"
-    seen_prompt: dict = {}
-
-    def fake_exec(argv, cwd):
-        # argv is `claude -p <prompt> --output-format ...` — the prompt follows the `-p` flag.
-        seen_prompt["prompt"] = argv[argv.index("-p") + 1]
-        seen_prompt["tools"] = argv
-        # Author the entity exactly where the prompt demands (idempotent target path).
-        doc = pathlib.Path(cwd) / "kg" / "entities" / "meeting" / f"{native}.md"
-        doc.parent.mkdir(parents=True, exist_ok=True)
-        doc.write_text(
-            "---\n"
-            "type: meeting\n"
-            f"id: {native}\n"
-            "title: Meeting nba-agyz-gbe\n"
-            f"meeting_id: {native}\n"
-            f"session_uid: {native}\n"
-            "platform: google_meet\n"
-            "date: 2026-06-25\n"
-            "---\n\n"
-            "Priya joined and committed to sending a quote.\n\n"
-            "## Attendees\n- [[Priya]]\n\n## Actions\n- [[Send quote]]\n"
-        )
-        # minimal claude --output-format stream-json line so the parser yields a `done`.
-        yield json.dumps({"type": "result", "subtype": "success", "result": "wrote", "session_id": "s1"})
-
+    row_id = "41"
     cards = [
         {"kind": "person", "title": "Priya", "body": "lead"},
         {"kind": "action", "title": "Send quote", "body": "by Fri"},
     ]
-    # meeting_doc_turn drives the harness via run_turn_over_workspace; patch the factory seam.
-    import unittest.mock as mock
-    with mock.patch.object(worker, "harness_factory", lambda: ClaudeCodeHarness(exec_fn=fake_exec)):
-        evs = list(worker.meeting_doc_turn(
-            tmp_path, cards, native=native, meeting_id=native, session_uid=native,
-            platform="google_meet", date="2026-06-25", title="Meeting nba-agyz-gbe",
-        ))
+    evs = list(worker.meeting_doc_turn(
+        tmp_path, cards, row_id=row_id, platform="google_meet", date="2026-06-25",
+    ))
 
-    assert any(e.get("type") == "commit" for e in evs)  # the entity write was committed (governance passed)
-    assert "kg/entities/meeting/{}.md".format(native) in seen_prompt["prompt"]
-    assert '"Priya"' in seen_prompt["prompt"] and '"Send quote"' in seen_prompt["prompt"]
-
-    doc = (tmp_path / "kg" / "entities" / "meeting" / f"{native}.md").read_text()
-    assert "type: meeting" in doc and f"id: {native}" in doc
-    assert "session_uid:" in doc and "platform: google_meet" in doc and "date: 2026-06-25" in doc
+    assert evs == [{"type": "message-delta", "text": "Updated meeting 41."}]
+    doc = (tmp_path / "kg" / "entities" / "meeting" / f"{row_id}.md").read_text()
+    fm = yaml.safe_load(doc.split("---\n", 2)[1])
+    assert fm["type"] == "meeting" and fm["id"] == "41" and fm["title"] == "Meeting 41"
+    assert fm["session_uid"] == "41" and fm["platform"] == "google_meet" and fm["date"] == "2026-06-25"
     assert "[[Priya]]" in doc and "[[Send quote]]" in doc
     # idempotent: a second run updates the same path, not a duplicate
-    with mock.patch.object(worker, "harness_factory", lambda: ClaudeCodeHarness(exec_fn=fake_exec)):
-        list(worker.meeting_doc_turn(
-            tmp_path, cards, native=native, meeting_id=native, session_uid=native,
-            platform="google_meet", date="2026-06-25", title="Meeting nba-agyz-gbe",
-        ))
+    list(worker.meeting_doc_turn(
+        tmp_path, cards, row_id=row_id, platform="google_meet", date="2026-06-25",
+    ))
     found = list((tmp_path / "kg" / "entities" / "meeting").glob("*.md"))
-    assert [p.name for p in found] == [f"{native}.md"]
+    assert [p.name for p in found] == [f"{row_id}.md"]
 
 
 def test_parse_cards_tolerant():

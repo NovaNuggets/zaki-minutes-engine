@@ -1,0 +1,19 @@
+{
+  "version": "erasure.v1",
+  "owner": "agent",
+  "scope": "meeting",
+  "subject": {
+    "user_id": 9007199254740992,
+    "meeting_id": 9007199254740993
+  },
+  "counts": {
+    "agent_unit_streams": 1,
+    "agent_workspace_documents": 2,
+    "agent_brain_records": 3
+  },
+  "issued_at": "2026-07-15T12:30:00Z",
+  "key_id": "erasure-golden-2026-07",
+  "nonce": "01J2M3N4P5Q6R7S8T9V0WXYZE9",
+  "digest": "sha256=f2194320dab3cc9b75c84d39a27e0882ef0a127db8248c53a10da30647ef0081",
+  "signature": "sha256=391296f2aea719bf8162bb439c8d2dcd147e8411cc163ad05ca34241893b8783"
+}

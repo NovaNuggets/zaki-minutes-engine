@@ -73,8 +73,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       supervisor redis-server postgresql-client \
       xvfb fluxbox x11vnc novnc python3-websockify \
       pulseaudio xdotool xclip socat ffmpeg libsndfile1 \
-      curl git ca-certificates \
- && usermod -aG pulse-access root 2>/dev/null || true \
+      curl git ca-certificates util-linux \
+ && (getent group pulse-access >/dev/null || groupadd --system pulse-access) \
+ && groupadd --system vexa-bot \
+ && useradd --system --gid vexa-bot --groups pulse-access \
+      --home-dir /var/lib/vexa-bot --shell /usr/sbin/nologin vexa-bot \
+ && install -d -o root -g root -m 0711 /var/lib/vexa-bot \
+ && test "$(id -u vexa-bot)" -ne 0 \
+ && id -nG vexa-bot | tr ' ' '\n' | grep -qx pulse-access \
+ && usermod -aG pulse-access root \
  && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # uv (the per-service venvs are resolved from each service's own pyproject + uv.lock).
@@ -130,8 +137,10 @@ COPY core/gateway/services/gateway/src /app/gateway/src
 # meeting-api (PYTHONPATH=/app/meeting-api/src; repo_root walk-up == /app/meeting-api)
 COPY core/meetings/services/meeting-api/src /app/meeting-api/src
 COPY core/meetings/contracts/invocation.v1/invocation.schema.json /app/meeting-api/meetings/contracts/invocation.v1/invocation.schema.json
+COPY core/meetings/contracts/invocation.v2/invocation.schema.json /app/meeting-api/meetings/contracts/invocation.v2/invocation.schema.json
 COPY core/meetings/contracts/lifecycle.v1/lifecycle.schema.json   /app/meeting-api/meetings/contracts/lifecycle.v1/lifecycle.schema.json
 COPY core/meetings/contracts/webhook.v1/webhook.schema.json       /app/meeting-api/meetings/contracts/webhook.v1/webhook.schema.json
+COPY core/meetings/contracts/minutes-finalized.v1/minutes-finalized.schema.json /app/meeting-api/meetings/contracts/minutes-finalized.v1/minutes-finalized.schema.json
 COPY core/runtime/contracts/runtime.v1/runtime.schema.json        /app/meeting-api/runtime/contracts/runtime.v1/runtime.schema.json
 COPY core/runtime/contracts/schedule.v1/schedule.schema.json      /app/meeting-api/runtime/contracts/schedule.v1/schedule.schema.json
 # agent control plane + worker (PYTHONPATH=/app/agent; repo_root walk-up == /app/agent).
@@ -146,6 +155,7 @@ COPY core/agent/contracts       /app/agent/contracts
 COPY core/agent/workspace-seeds /app/agent/workspace-seeds
 COPY core/agent/tools-seed      /app/agent/tools-seed
 COPY core/meetings/contracts/transcript.v1/transcript.schema.json /app/agent/meetings/contracts/transcript.v1/transcript.schema.json
+COPY core/meetings/contracts/zaki-read.v1/zaki-read.schema.json    /app/agent/meetings/contracts/zaki-read.v1/zaki-read.schema.json
 COPY core/agent/contracts/workspace.v1/workspace.schema.json      /app/agent/agent/contracts/workspace.v1/workspace.schema.json
 COPY core/agent/contracts/invoke.v1/invoke.schema.json            /app/agent/agent/contracts/invoke.v1/invoke.schema.json
 COPY core/agent/contracts/unit.v1/unit.schema.json                /app/agent/agent/contracts/unit.v1/unit.schema.json
@@ -175,8 +185,18 @@ COPY --from=terminal-builder /app/terminal /app/terminal
 COPY deploy/lite/bin/vexa-bot-launch deploy/lite/bin/vexa-agent-worker deploy/lite/bin/setup-pulseaudio-sinks.sh deploy/lite/bin/provision-key.sh /usr/local/bin/
 COPY deploy/lite/supervisord.conf /etc/supervisor/conf.d/vexa.conf
 COPY deploy/lite/entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/local/bin/vexa-bot-launch /usr/local/bin/vexa-agent-worker \
-      /usr/local/bin/setup-pulseaudio-sinks.sh /usr/local/bin/provision-key.sh /entrypoint.sh
+RUN chmod 0755 /usr/local/bin/vexa-bot-launch /usr/local/bin/vexa-agent-worker \
+      /usr/local/bin/setup-pulseaudio-sinks.sh /usr/local/bin/provision-key.sh /entrypoint.sh \
+ && install -d -m 0700 /run/vexa \
+ && : > /run/vexa/.bot-deny-probe \
+ && chmod 0600 /run/vexa/.bot-deny-probe \
+ && setpriv --reuid=vexa-bot --regid=vexa-bot --init-groups \
+      --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
+      sh -ec 'test -r /app/core/meetings/services/bot/dist/index.js; \
+              command -v node >/dev/null; test -w /tmp; \
+              ! test -x /run/vexa; ! test -r /run/vexa/.bot-deny-probe; \
+              id -nG | tr " " "\n" | grep -qx pulse-access' \
+ && rm -f /run/vexa/.bot-deny-probe
 
 # ── Env defaults (every var supervisord interpolates must be SET; entrypoint derives the rest) ────
 ENV LOG_LEVEL=info \
@@ -184,15 +204,18 @@ ENV LOG_LEVEL=info \
     BOT_COMMAND=/usr/local/bin/vexa-bot-launch \
     AGENT_WORKER_COMMAND=/usr/local/bin/vexa-agent-worker \
     DB_HOST=localhost DB_PORT=5432 DB_NAME=vexa DB_USER=postgres DB_PASSWORD=postgres \
-    REDIS_HOST=localhost REDIS_PORT=6379 \
+    REDIS_HOST=localhost REDIS_PORT=6379 REDIS_MAXMEMORY=512mb \
     ADMIN_API_TOKEN=changeme INTERNAL_API_SECRET=lite-internal-secret \
+    RUNTIME_CONTROL_SECRET=lite-runtime-control-secret RUNTIME_CALLBACK_SECRET=lite-runtime-callback-secret \
+    MEETING_TOKEN_SECRET=lite-meeting-token-secret \
+    GATEWAY_IDENTITY_SECRET=lite-gateway-identity-secret-local-v1 \
     TRANSCRIPTION_SERVICE_URL= TRANSCRIPTION_SERVICE_TOKEN= \
     MINIO_ENDPOINT= MINIO_ACCESS_KEY= MINIO_SECRET_KEY= MINIO_BUCKET=vexa MINIO_SECURE=false \
-    VEXA_AGENT_DEFAULT_SUBJECT=u_live VEXA_DISPATCH_SIGNING_KEY=dev-dispatch-signing-key \
+    VEXA_AGENT_DEFAULT_SUBJECT= VEXA_DISPATCH_SIGNING_KEY=dev-dispatch-signing-key \
     VEXA_BOT_API_KEY= VEXA_AGENT_MODEL= VEXA_MEETING_MODEL= HOST_CLAUDE_CREDENTIALS= \
     ANTHROPIC_API_KEY= ANTHROPIC_AUTH_TOKEN= ANTHROPIC_BASE_URL= ANTHROPIC_MODEL= \
     ANTHROPIC_DEFAULT_OPUS_MODEL= ANTHROPIC_DEFAULT_SONNET_MODEL= ANTHROPIC_DEFAULT_HAIKU_MODEL= \
-    VEXA_PUBLIC_API_URL=http://localhost:8056 VEXA_API_KEY= \
+    VEXA_PUBLIC_API_URL=http://localhost:8056 VEXA_API_KEY= VEXA_TERMINAL_SHARED_KEY_MODE=true \
     TERMINAL_PUBLIC_URL=http://localhost:3001 \
     NEXTAUTH_SECRET=vexa-lite-nextauth-secret JWT_SECRET=vexa-lite-jwt-secret
 

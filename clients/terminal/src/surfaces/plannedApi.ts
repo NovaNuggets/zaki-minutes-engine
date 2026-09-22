@@ -19,7 +19,6 @@ export interface PlannedMeetingBody {
   scheduled_at?: string | null;   // ISO8601; null clears (PATCH) → status flips to idle
   meeting_url?: string | null;    // parsed server-side → platform/native; null detaches the link
   workspace_id?: string | null;   // the sharing bind; null unbinds
-  auto_join?: boolean;            // default true on create — "scheduled" means the bot joins
 }
 
 /** A meeting row as the list endpoints return it (the DTO subset planned flows care about). */
@@ -51,14 +50,15 @@ export async function deletePlannedMeeting(id: string | number): Promise<void> {
 export interface CalendarConfig {
   ics_url_set: boolean;
   ics_url_masked: string | null;
-  auto_join: boolean;   // the GLOBAL default stamped onto imported meetings
+  auto_join_available: false;
+  auto_join: false;
 }
 
 export async function getCalendarConfig(): Promise<CalendarConfig> {
   return jsonOrThrow(await fetch("/api/user/calendar", { cache: "no-store" }));
 }
 
-export async function setCalendarConfig(body: { ics_url?: string | null; auto_join?: boolean }): Promise<CalendarConfig> {
+export async function setCalendarConfig(body: { ics_url?: string | null }): Promise<CalendarConfig> {
   return jsonOrThrow(await fetch("/api/user/calendar", {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   }));

@@ -22,14 +22,30 @@ spec:
         app.kubernetes.io/component: minio-init
     spec:
       restartPolicy: Never
+      securityContext:
+        fsGroup: {{ .Values.minio.initFsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: {{ .Values.minio.initRunAsGroup }}
+        runAsNonRoot: true
+        runAsUser: {{ .Values.minio.initRunAsUser }}
+        seccompProfile:
+          type: RuntimeDefault
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: minio-init
-          image: minio/mc:latest
-          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: {{ .Values.minio.initRunAsGroup }}
+            runAsNonRoot: true
+            runAsUser: {{ .Values.minio.initRunAsUser }}
+          image: {{ include "vexa.dependencyImageRef" (list .Values.minio.clientImage) | quote }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           # v0.10.5 Pack A.3 — replace `sleep 5` with poll-until-ready (#249).
           # On a fresh PVC, MinIO can take 30+ seconds to attach + initialize.
           # Hardcoded 5s sleep races MinIO startup → `mc mb` runs against an
@@ -60,10 +76,24 @@ spec:
               echo "Bucket {{ .Values.minio.bucket }} ensured"
               exit 0
           env:
+            - name: MC_CONFIG_DIR
+              value: /tmp/.mc
             - name: MINIO_ROOT_USER
-              value: {{ .Values.minio.accessKey | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MINIO_ACCESS_KEY
             - name: MINIO_ROOT_PASSWORD
-              value: {{ .Values.minio.secretKey | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MINIO_SECRET_KEY
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- /* v0.10.5 Pack A.1 — tolerations on Job spec for tainted pools. */}}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:

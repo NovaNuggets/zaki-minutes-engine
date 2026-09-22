@@ -156,6 +156,11 @@ def overlay_model_config(env: dict[str, str], config: dict, *, allowlist: str = 
     here — docker_backend's ``key not in spawn_env``). Models are gated by the operator's
     allowlist: a non-allowlisted model is DROPPED (deployment default applies), never an error —
     a stale pref must not brick a turn."""
+    if config.get("blocked"):
+        # An explicitly selected personal origin that lost operator approval must never silently
+        # switch to deployment credentials. Abort before exporting either tier.
+        raise ValueError("personal model configuration is blocked by operator policy")
+
     model = (config.get("model") or "").strip()
     if model and _allowlisted(model, allowlist):
         env["VEXA_AGENT_MODEL"] = model     # harness turns (chat/docs/routines)
@@ -170,10 +175,16 @@ def overlay_model_config(env: dict[str, str], config: dict, *, allowlist: str = 
                        meeting_model)
     if (config.get("mode") or "").strip() != "custom":
         return
+    # Custom Settings is a complete credential-owner tier. Stamp blank sentinels for every
+    # deployment model credential/base before the later env passthrough; runtime backends also
+    # copy only absent keys, so blanks prevent both layers from filling a user URL with an
+    # operator secret. An incomplete custom tier therefore fails loud instead of falling through.
+    for key in MODEL_AUTH_ENV_ALLOWLIST:
+        env[key] = ""
     base_url = (config.get("base_url") or "").strip()
     api_key = (config.get("api_key") or "").strip()
     if not base_url:
-        return  # custom mode without an endpoint is inert — deployment credentials still apply
+        return
     env["ANTHROPIC_BASE_URL"] = base_url
     env["VEXA_LLM_PROVIDER"] = "openai-compat"
     env["VEXA_LLM_BASE_URL"] = base_url
@@ -303,6 +314,17 @@ def build_unit_env(settings: Settings, invocation: dict, *, unit_id: str, token:
             # meeting-api db-writer (which knows its own row ids) drains proc:meeting:{numeric} into the
             # meeting row's data JSONB for durability.
             env["VEXA_MEETING_NUMERIC_ID"] = str(meeting["numeric_meeting_id"])
+        if meeting.get("processing_token"):
+            # Consent generation: every managed meeting worker proves this opaque token still matches
+            # ``proc:meeting:{row}:on`` before reading transcript, invoking a model, or writing a
+            # derivative.  OFF deletes the flag before stopping the workload; a later ON gets a new
+            # token, so an old/stale worker cannot wake back up under the new consent grant.
+            env["VEXA_MEETING_PROCESSING_FLAG_KEY"] = f"proc:meeting:{row_id}:on"
+            env["VEXA_MEETING_PROCESSING_TOKEN"] = str(meeting["processing_token"])
+            if meeting.get("processing_expires_at_ms") is not None:
+                env["VEXA_MEETING_PROCESSING_EXPIRES_AT_MS"] = str(
+                    meeting["processing_expires_at_ms"]
+                )
     elif meeting and meeting.get("native_id"):
         # Chat GROUNDED in a live meeting (cookbook #1): no numeric meeting_id, but the meeting-scoped
         # tool needs the native id + platform to target meetings' published /transcripts. (The
@@ -329,7 +351,10 @@ def build_unit_env(settings: Settings, invocation: dict, *, unit_id: str, token:
 # DIFFERENT tenant on the same link) can never clobber/read another meeting's data. ``native_id`` is
 # the human-readable Meet code carried for DISPLAY only (the kg doc name / title); the routing
 # ``meeting_id`` is the row id. Both are agent-api internal — the sealed MeetingRef forbids them.
-_INTERNAL_MEETING_HINTS = frozenset({"transcript_start_id", "numeric_meeting_id", "native_id"})
+_INTERNAL_MEETING_HINTS = frozenset({
+    "transcript_start_id", "numeric_meeting_id", "native_id", "processing_token",
+    "processing_expires_at_ms",
+})
 
 
 def _without_chat_session(invocation: dict) -> dict:
@@ -451,6 +476,15 @@ class Dispatcher:
             acked, invocation["trigger"], identity["subject"], identity["launcher"], delivery is not None,
         )
         return acked
+
+    def stop_workload(self, workload_id: str) -> str:
+        """Authoritatively stop an active unit through runtime.v1.
+
+        Processing OFF calls this only after revoking the Redis generation, so even a stop failure is
+        fail-closed for new model/output work and can be surfaced as an unconfirmed teardown.
+        """
+
+        return self._runtime.stop(workload_id)
 
     # ── warm delivery (message triggers) ─────────────────────────────────────
 

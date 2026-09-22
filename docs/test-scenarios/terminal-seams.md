@@ -117,23 +117,21 @@ deferred to an L4 eval with a frozen transcript fixture.
 
 # ── Tier 2 — deterministic, security & fault (Rig A + B) ──────────────────────
 - id: terminal-p20-complete-mediation
-  status: in-flight
+  status: green
   seam: "user key -> gateway X-User-Id inject -> agent-api subject derive -> canAccess(transcript|proc|workspace)"
   module_probe: core/identity/tests/test_access.py            # canAccess deny
-  seam_probe: core/gateway/services/gateway/tests/test_proxy.py   # X-User-Id injection / anti-spoof + test_meeting_stream_denies_a_meeting_the_user_does_not_own (xfail executable-spec: flips RED when the SSE authz lands)
+  seam_probe: core/agent/tests/test_api.py                        # exact owner authority + cross-tenant/noncanonical/native-carrier denial
   expected:
     client_supplied_subject: ignored               # subject derived from header, never body (P20) — GREEN
     sessions_cross_user: deny                       # GREEN (test_chat_subject_is_server_derived_from_header_not_client_body)
     no_key: 401
     wrong_scope: 403
-    meeting_sse_cross_user: deny                    # GAP (FINDING): /api/meeting/stream has NO per-meeting authz
+    meeting_sse_cross_user: deny                    # GREEN: owner-scoped canonical row only
   note: >
-    Subject-derivation + session cross-user denial are GREEN (test_api.py: server-derived subject, the
-    spoofed body owns nothing). OPEN GAP / SECURITY FINDING: the live-transcript SSE
-    gateway `/api/meeting/stream` only resolves the key→user (X-User-Id inject) but does NOT authorize
-    that the requested meeting belongs to the user — any authenticated user can stream any meeting's
-    transcript by passing its native id. Needs the same authorize_subscribe ownership check the WS uses.
-    Row stays in-flight until that authz lands (writing the deny-test now would assert unimplemented code).
+    Subject derivation, session isolation, and live-stream mediation are GREEN. Agent API authenticates
+    first, accepts only a canonical positive meeting row, validates the owner authority's exact row and
+    subject, and requires session_uid to equal that row. Foreign rows, malformed authority responses,
+    noncanonical decimals, and reusable native meeting ids are refused before Redis opens.
 
 - id: terminal-fault-surfacing-never-silent
   status: in-flight

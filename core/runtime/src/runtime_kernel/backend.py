@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Optional, Protocol
 
+from .models import Resources
 from .profiles import Runnable
 
 
@@ -19,7 +20,14 @@ class WorkloadHandle:
 class Backend(Protocol):
     name: str
 
-    def start(self, workload_id: str, runnable: Runnable, env: dict[str, str]) -> WorkloadHandle: ...
+    def start(
+        self,
+        workload_id: str,
+        runnable: Runnable,
+        env: dict[str, str],
+        *,
+        resources: Optional[Resources] = None,
+    ) -> WorkloadHandle: ...
     def exit_code(self, h: WorkloadHandle) -> Optional[int]:
         """None while running; the exit code once exited."""
         ...

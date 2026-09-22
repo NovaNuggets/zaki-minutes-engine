@@ -6,16 +6,18 @@
  *  and abort the upstream fetch when the client disconnects. */
 import type { NextRequest } from "next/server";
 import { resolveApiKey } from "../proxyAuth";
+import { credentialedFetch } from "../credentialedFetch";
+import { readBoundedText } from "../boundedBody";
+import { MAX_CHAT_REQUEST_BYTES } from "../proxyLimits";
 import { meetingsOnly } from "../../mode";
 
 export const dynamic = "force-dynamic";
 
 // One authenticated edge: chat streams through the gateway (which injects X-User-Id), not agent-api directly.
 const GATEWAY_URL = (process.env.GATEWAY_URL || "http://127.0.0.1:18056").replace(/\/$/, "");
-
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
+  "Cache-Control": "no-store",
   "X-Accel-Buffering": "no",
 } as const;
 
@@ -50,21 +52,31 @@ function proxyStream(upstreamBody: ReadableStream<Uint8Array>, abort: AbortContr
 export async function POST(req: NextRequest) {
   // Meetings-only mode: chat is an agent surface — refused at the edge like the catch-all's agent branch.
   if (meetingsOnly()) {
-    return new Response(JSON.stringify({ error: "not_found", detail: "agent endpoints are disabled in meetings mode" }), { status: 404, headers: { "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ error: "not_found", detail: "agent endpoints are disabled in meetings mode" }), { status: 404, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
+  }
+  const apiKey = await resolveApiKey();
+  if (!apiKey) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
   }
   const abort = new AbortController();
   const onClientGone = () => abort.abort();
   req.signal.addEventListener("abort", onClientGone);
 
   try {
-    const body = await req.text();
-    const apiKey = await resolveApiKey();
+    const body = await readBoundedText(req, MAX_CHAT_REQUEST_BYTES);
+    if (body === null) {
+      req.signal.removeEventListener("abort", onClientGone);
+      return sseError("Chat request is too large", 413);
+    }
     // Forward Last-Event-ID so a reconnect RESUMES the chat turn from the client's last-seen cursor
     // (gapless), instead of re-dispatching or missing everything the worker emitted during the gap —
     // the same resume contract as /api/meeting/stream. On resume agent-api re-attaches to the warm
     // unit and reads from the cursor; it does NOT start a second turn.
     const lastEventId = req.headers.get("last-event-id");
-    const upstream = await fetch(`${GATEWAY_URL}/agent/chat`, {
+    const upstream = await credentialedFetch(`${GATEWAY_URL}/agent/chat`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -75,19 +87,20 @@ export async function POST(req: NextRequest) {
       signal: abort.signal,
     });
     if (!upstream.ok) {
-      const detail = (await upstream.text().catch(() => "")).trim().replace(/\s+/g, " ");
+      // Never consume or reflect an upstream error body: it may contain prompt text, credentials,
+      // or internal transport details, and a slow chunked error must not pin this proxy.
+      await upstream.body?.cancel("untrusted upstream error").catch(() => undefined);
       req.signal.removeEventListener("abort", onClientGone);
-      return sseError(detail || `agent-api chat returned ${upstream.status}`, upstream.status);
+      return sseError("Agent request failed", upstream.status);
     }
     if (!upstream.body) {
       req.signal.removeEventListener("abort", onClientGone);
       return sseError("agent-api chat returned no body", 502);
     }
     return new Response(proxyStream(upstream.body, abort), { status: upstream.status, headers: SSE_HEADERS });
-  } catch (err) {
+  } catch {
     req.signal.removeEventListener("abort", onClientGone);
-    console.error("[terminal-api] chat proxy failed", err);
-    const message = err instanceof Error && err.message ? err.message : "upstream unavailable";
-    return sseError(message, 502);
+    console.error("[terminal-api] chat proxy failed");
+    return sseError("Agent service unavailable", 502);
   }
 }

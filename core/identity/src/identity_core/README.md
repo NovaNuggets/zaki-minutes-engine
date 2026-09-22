@@ -2,8 +2,8 @@
 
 The identity CORE. Public surface is `__init__.py` (the lane's `index`):
 
-- **`tokens.py`** — `ScopedToken` value object + `mint_token` / `validate_token`. Scopes are
-  `{bot, tx, browser}` (admin-models `VALID_SCOPES`). Validation rejects expired (`token-expired`)
+- **`tokens.py`** — `ScopedToken` value object + `mint_token` / `validate_token`. v1 scopes are
+  `{bot, tx, browser}`; explicitly selected v2 adds `{agent}`. Validation rejects expired (`token-expired`)
   and out-of-scope (`missing-scope`) tokens — derived from admin-api `/internal/validate`.
 - **`access.py`** — `can_access(subject, resource, action)`: the `AccessPolicy` Protocol (port) +
   `OwnerOnlyPolicy`, a **default-deny** owner-only adapter (P20). Guards the three read paths
@@ -12,6 +12,7 @@ The identity CORE. Public surface is `__init__.py` (the lane's `index`):
   audited `BrokeredSecret` whose value is reachable only via `.reveal()` and is never logged. Real
   vault adapter deferred to P16 — only the seam is wired here.
 
-All emitted shapes conform to `../../contracts/identity.v1`. Tested in `../../tests/`.
+v1 output remains unchanged; callers explicitly select `identity.v2` for Agent scope. Tested in
+`../../tests/`.
 
 _Governed by `docs/docs/governance/architecture.mdx` (P1–P12). This folder owns one concern; its public surface is its `index`/contract; it may depend only on what the dependency-rules allow._

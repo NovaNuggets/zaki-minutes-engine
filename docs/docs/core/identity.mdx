@@ -74,17 +74,15 @@ security model has to cover (nothing more):
 |---|---|---|---|
 | **Front door** | `GET /health`, `GET /auth/me`, `WS /ws` | n/a / "who am I" / per-meeting subscribe | — |
 | **Meetings** (you must own the meeting) | `GET·POST /bots`, `…/bots/{platform}/{native}` (delete · config · speak), `GET /transcripts/{platform}/{native}`, `GET /recordings…`, `GET /meetings…` | owner = `meetings.user_id` | `bot` · `browser` · `tx` |
-| **Your agent space** (yours by construction) | `POST /agent/chat`, `GET /agent/meeting/stream`, and `/agent/*` → `chat`, `workspace/{tree,file,init,swap,git,upload}`, `sessions`, `routines`, `models`, `meeting/{start,process,stream}` | owner = you, **by partition** (you can only name your own workspace/session) | none today |
+| **Your agent space** | `POST /agent/chat`, and `/agent/*` → `chat`, `workspace/{tree,file,init,swap,git,upload}`, `sessions`, `routines`, `models` | owner = you, **by partition** (you can only name your own workspace/session) | none today |
+| **Agent meeting views/controls** | `GET /agent/meeting/stream`, `POST /agent/meeting/process` | exact canonical meeting row is revalidated against the authenticated owner before any Redis read/write; native links are never carrier keys | none today |
 
 Two safety shapes result:
 
-- **Agent space** is safe by partition — a workspace, session, or routine is addressed by your id, so no
-  explicit check is needed.
+- **Agent space** is safe by partition — a workspace, session, or routine is addressed by your id.
 - **Meetings** are owned in the meetings domain, so the owner-checked path runs there (`GET /transcripts`,
-  `/ws` subscribe authorization).
-
-The leak is where the agent domain reads a meeting directly instead of via the meetings domain — see
-[adoption gaps](#where-we-are).
+  `/ws` subscribe authorization); the agent meeting stream/process paths consult that authority before
+  touching their row-keyed carriers. Native-only `/agent/meeting/start` is retired (`410`).
 
 ---
 
@@ -139,15 +137,15 @@ CI red can be crossed.
 | Gateway: key → user, `X-User-Id`, route scopes, `/ws` | ✅ **built** |
 | Agent-api derives `subject` from `X-User-Id`, ignores the client body | ✅ **built** (P20) |
 | Client identity is real (terminal sends the logged-in user's key via OAuth) | ✅ **fixed** — the old hardcoded `u_live` is gone from the client |
-| `can_access` / `OwnerOnlyPolicy` **adopted on every meeting path** | ⚠️ **partial** — meeting-api owner-checks its own way; the agent domain's `chat` / `meeting/stream` / `meeting/start` / `meeting/process` do **not** call it yet |
-| Server-side live-meeting **owner attribution** | ⚠️ **pre-M2** — the live-meeting watcher is started with the default `subject = "u_live"` (`control_plane/api.py:880` → `transcription_watcher.py:203`); live-meeting dispatch (M2) is not yet delivered, so this default must be replaced with the real owner before it ships |
+| `can_access` / `OwnerOnlyPolicy` **adopted on every meeting path** | ⚠️ **partial** — meeting stream/process now bind an exact row to its owner through meeting-api; the common `can_access` policy is not yet the single implementation on every path |
+| Server-side live-meeting **owner attribution** | ✅ **built** — meeting-api exposes only `{meeting_id,user_id}` on a secret-protected internal edge; the watcher validates the exact numeric row and canonical integer owner before live registration, consent reads, or dispatch, with no `u_live` fallback |
 | **Auth spine** end-to-end (opaque token → user → scoped access, everywhere) | ⬜ **planned** (Stage 2) |
 | Workload identity in production (SPIRE), Keycloak, RFC 8693, MCP Gateway | ⬜ **planned** (Stage 2) |
 | SSO (Okta/Entra) + SCIM | ⬜ **planned** (Stage 5) |
 
-The front door is real; a few agent-domain endpoints read a meeting's data directly instead of via the
-meetings domain, skipping the owner check that already exists in the library. Closing it is wiring, not
-design: route those reads through the owning domain and decide with `OwnerOnlyPolicy`.
+The front door and meeting-row mediation are real. The remaining cleanup is consolidation: today some
+paths enforce the same owner-only rule directly through owner-scoped SQL/internal authority rather than
+calling the common `OwnerOnlyPolicy` implementation.
 
 ---
 
@@ -172,12 +170,12 @@ that makes it real (P9: an ungated rule is aspirational). Foundations:
 
 | Principle | Today (in code) | Next step | Lands as |
 |---|---|---|---|
-| **P20 — complete mediation**: authorize every access, default-deny `canAccess` on API · WS · agent | deny test on the library only (`core/identity/tests/test_access.py`, `gate:access`); meeting-api owner-checks **implicitly per query**; agent meeting paths unchecked (`can_access` count = 0 in `control_plane/api.py`) | wire `can_access(subject, resource, action)` onto every meeting path (`chat` · `meeting/stream` · `meeting/start` · `meeting/process`); extend `gate:access` to the wired paths | ADR-0012 · `gate:access` |
+| **P20 — complete mediation**: authorize every access, default-deny `canAccess` on API · WS · agent | meeting-api queries, WS subscribe, agent meeting context/stream/process, and watcher attribution all fail closed on exact owner authority; the shared `can_access` function is not yet their single implementation | consolidate the proven owner checks behind `can_access` without weakening the existing route-level denial tests | ADR-0012 · `gate:access` |
 | **Identity is a chain of custody** | `x-user-id` is plaintext, trusted by network position (`gateway/app.py:192`); the per-dispatch token is minted (`control_plane/dispatch.py:36`) but not yet verified at a boundary | a **signed** user-assertion verified at each hop; verify the dispatch token at the workspace/tool boundaries | Stage 2 — SPIRE · Keycloak · RFC 8693 · MCP Gateway |
 | **Scoped agent domain** | `/api/*` carries **no** scope — any valid key reaches any agent route (`gateway/app.py:153-156`) | per-route scopes for the agent domain | Stage 3 |
 | **P15 — secrets behind a port** | broker pattern **wired** for the per-user git token (`agent/shared/adapters.py:135-162`); the store is the stand-in `PassthroughSecretsBroker` | real vault — lease · rotation · BYOK — behind `SecretsPort` | P16 · ADR-0003 |
 | **P15 — data encrypted at rest** | buckets bind-mounted; transcripts and tokens in cleartext | the three at-rest stores → see [Data at rest](#data-at-rest-encryption) | Stage 0 contract · planned |
-| **Multi-tenant attribution** | the live-meeting watcher is started with the default `subject = "u_live"` (`control_plane/api.py:880` → `transcription_watcher.py:203,339`); live-meeting dispatch (M2) is not yet delivered | arm the copilot as the real meeting owner before M2 ships | Auth spine · M2 |
+| **Multi-tenant attribution** | exact numeric meeting rows are resolved to their canonical database owner over the internal meeting-api edge; missing/unreachable/malformed authority creates no live row or worker | keep the owner edge covered by the deployment and cross-tenant gates | Auth spine · M2 |
 | **P9 / P6 — one front door** | `_resolve_user_id` is duplicated across four meeting-api routers (`collector` · `bot_spawn` · `lifecycle` · `recordings`) | fold identity resolution into the shared `identity` front door | cleanup |
 
 <Note>`subject_of` (`control_plane/api.py`) has a `VEXA_AGENT_DEFAULT_SUBJECT` fallback for a gateway-less

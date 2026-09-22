@@ -59,6 +59,10 @@ class RuntimePort(Protocol):
         """Block until the workload reaches a terminal ``runtime.v1`` state; return that state."""
         ...
 
+    def stop(self, workload_id: str) -> str:
+        """Stop a workload authoritatively; an already-absent workload is a successful no-op."""
+        ...
+
 
 @runtime_checkable
 class IdentityPort(Protocol):

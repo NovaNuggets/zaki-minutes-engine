@@ -1,0 +1,5 @@
+{
+  "subject": 42,
+  "scopes": ["agent"],
+  "expires_at": null
+}

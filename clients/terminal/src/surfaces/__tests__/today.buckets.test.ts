@@ -20,7 +20,7 @@ describe("meetingPhase", () => {
   it("maps the raw lifecycle onto prep/live/post", () => {
     expect(meetingPhase(m({ live_status: "idle" }))).toBe("prep");
     expect(meetingPhase(m({ live_status: "scheduled" }))).toBe("prep");
-    for (const s of ["requested", "joining", "awaiting_admission", "active", "needs_help", "stopping"])
+    for (const s of ["requested", "joining", "awaiting_admission", "active", "needs_human_help", "stopping"])
       expect(meetingPhase(m({ live_status: s, status: "live" }))).toBe("live");
     for (const s of ["completed", "failed", "stopped"])
       expect(meetingPhase(m({ live_status: s }))).toBe("post");

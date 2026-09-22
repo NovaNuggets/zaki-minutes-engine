@@ -26,12 +26,19 @@ def default_owner(spec: WorkloadSpec) -> str:
 
 
 class WorkloadRecord:
-    """One persisted workload: its spec, its last-known status, and its resolved owner."""
+    """One persisted workload: its non-secret spec, status, and resolved owner.
+
+    A launch environment is execution-only.  Meeting-bot env values include meeting URLs,
+    passcodes, access tokens, and funded provider credentials, so copying them into the durable
+    runtime record would create a second, unbounded PII/secret store.  Keep the fields required
+    for lifecycle callbacks and operator inspection, but discard ``env`` at this persistence
+    boundary.  Backends still receive the caller's original spec directly from ``Runtime.create``.
+    """
 
     __slots__ = ("spec", "status", "owner")
 
     def __init__(self, spec: WorkloadSpec, status: WorkloadStatus, owner: str) -> None:
-        self.spec = spec
+        self.spec = spec.model_copy(update={"env": {}})
         self.status = status
         self.owner = owner
 
@@ -123,7 +130,12 @@ class RedisStore:
         raw = self._r.get(self._key(workload_id))
         if raw is None:
             return None
-        return WorkloadRecord.from_json(self._s(raw))
+        record = WorkloadRecord.from_json(self._s(raw))
+        # Opportunistically migrate records written before launch-env redaction.  Rewriting on
+        # read is intentional: merely parsing an old record must not leave its secret-bearing raw
+        # JSON resident in Redis until the next lifecycle transition.
+        self.set(record)
+        return record
 
     def list(self) -> list[WorkloadRecord]:
         records: list[WorkloadRecord] = []
@@ -131,7 +143,9 @@ class RedisStore:
             raw = self._r.get(key)
             if raw is None:
                 continue
-            records.append(WorkloadRecord.from_json(self._s(raw)))
+            record = WorkloadRecord.from_json(self._s(raw))
+            self.set(record)
+            records.append(record)
         return records
 
     def delete(self, workload_id: str) -> None:

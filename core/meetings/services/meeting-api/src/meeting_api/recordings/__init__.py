@@ -35,6 +35,8 @@ from .router import build_router
 from .service import (
     InvalidRecordingMetadata,
     RecordingChunkConflict,
+    RecordingLimitExceeded,
+    RecordingNotReady,
     SessionNotFound,
     finalize_master,
     upload_chunk,
@@ -53,4 +55,6 @@ __all__ = [
     "SessionNotFound",
     "InvalidRecordingMetadata",
     "RecordingChunkConflict",
+    "RecordingLimitExceeded",
+    "RecordingNotReady",
 ]

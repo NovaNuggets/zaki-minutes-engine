@@ -3,11 +3,13 @@
  *  Next's route-type check. NextAuth owns ONLY the OAuth dance; the terminal's auth contract is the
  *  httpOnly `vexa-token` + `vexa-user-info` cookies (read by server.mjs's WS proxy, api/proxyAuth.ts,
  *  and api/auth/me). So `signIn` ends by setting those exact cookies, via the SAME find-or-create+mint
- *  path the direct email login uses (findOrCreateUserToken in ../adminApi.ts). Mirrors the production
+ *  provisioning path used by the local direct-login route (findOrCreateUserToken in ../adminApi.ts),
+ *  while only OAuth remains eligible for first-administrator bootstrap. Mirrors the production
  *  webapp route, trimmed and reusing our admin client.
  *
  *  Providers self-gate on env presence, so a deploy with no OAuth creds simply exposes no providers
- *  (the email debug login still works). Credentials come from vexa-secrets (see .env.local).
+ *  unless an operator explicitly enables the loopback-only direct-login policy. Credentials come
+ *  from vexa-secrets (see .env.local).
  */
 import { type AuthOptions } from "next-auth";
 import GoogleProvider from "next-auth/providers/google";
@@ -70,7 +72,7 @@ export const authOptions: AuthOptions = {
       const result = await findOrCreateUserToken(user.email.toLowerCase());
       if (!result.ok) {
         // eslint-disable-next-line no-console
-        console.error(`[terminal-auth] ${provider} sign-in failed for ${user.email}: ${result.error}`);
+        console.error("[terminal-auth] OAuth sign-in provisioning failed");
         return false;
       }
 

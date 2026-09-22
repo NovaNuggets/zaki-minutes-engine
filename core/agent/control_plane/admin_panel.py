@@ -19,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 
+from shared.http import open_no_redirect, read_json_bounded
+
 # Meeting bots are spawned as ``mtg-{meeting_row_id}-{connection_id[:8]}`` (bot_spawn/service.py);
 # agent workers as ``agent-…`` (units.dispatch_id). The workload id is the correlation key — the
 # runtime.v1 WorkloadStatus carries no labels/env.
@@ -49,12 +51,28 @@ def classify_workload(status: dict) -> dict:
     return out
 
 
-def fetch_workloads(runtime_api_url: str, *, timeout: float = 5.0) -> list[dict]:
+def fetch_workloads(
+    runtime_api_url: str,
+    *,
+    timeout: float = 5.0,
+    control_secret: str = "",
+) -> list[dict]:
     """``GET {runtime}/workloads`` — every managed container (agent workers + meeting bots) with
     state/ports/exit info. Raises on transport errors; the route types them into the response."""
-    req = urllib.request.Request(f"{runtime_api_url.rstrip('/')}/workloads", method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — internal service URL from Settings
-        rows = json.loads(r.read())
+    headers = (
+        {"X-Runtime-Control-Secret": control_secret}
+        if control_secret
+        else {}
+    )
+    req = urllib.request.Request(
+        f"{runtime_api_url.rstrip('/')}/workloads",
+        headers=headers,
+        method="GET",
+    )
+    with open_no_redirect(req, timeout=timeout) as r:
+        rows = read_json_bounded(r)
+    if not isinstance(rows, list) or len(rows) > 10_000:
+        raise ValueError("invalid runtime workloads response")
     return [classify_workload(s) for s in rows if isinstance(s, dict)]
 
 
@@ -184,9 +202,11 @@ def _http_health(url: str, *, timeout: float = 5.0) -> tuple[int, dict]:
     """GET a service /health → (latency_ms, parsed body). Raises on transport/HTTP errors."""
     t0 = time.monotonic()
     req = urllib.request.Request(url, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 — internal service URLs
-        body = json.loads(r.read() or b"{}")
-    return int((time.monotonic() - t0) * 1000), body if isinstance(body, dict) else {}
+    with open_no_redirect(req, timeout=timeout) as r:
+        body = read_json_bounded(r)
+    if not isinstance(body, dict):
+        raise ValueError("invalid health response")
+    return int((time.monotonic() - t0) * 1000), body
 
 
 def _stage(sid: str, label: str, status: str, latency_ms: int | None = None, detail: str | None = None) -> dict:

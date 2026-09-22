@@ -20,7 +20,7 @@ export class RecordingService {
   private startTime: number = 0;
 
   constructor(
-    private meetingId: number,
+    private meetingId: number | string,
     private sessionUid: string,
     sampleRate: number = 16000,
     channels: number = 1
@@ -226,6 +226,7 @@ export class RecordingService {
     chunkSeq: number,
     isFinal: boolean,
     format: string = 'webm',
+    signal?: AbortSignal,
   ): Promise<void> {
     const uploadTimeoutMs = 30_000;
     const durationSeconds = this.startTime > 0 ? (Date.now() - this.startTime) / 1000 : undefined;
@@ -258,7 +259,8 @@ export class RecordingService {
     const maxRetries = 2;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        await this._sendUpload(callbackUrl, token, boundary, body, uploadTimeoutMs);
+        if (signal?.aborted) throw new Error('Recording chunk upload aborted');
+        await this._sendUpload(callbackUrl, token, boundary, body, uploadTimeoutMs, signal);
         logJSON({
           level: "info",
           msg: "[Recording] Chunk uploaded",
@@ -270,6 +272,9 @@ export class RecordingService {
         });
         return;
       } catch (err: any) {
+        // Retention revoke is a permanent local fence, not a transient transport failure. Never
+        // retry an aborted body after the caller has removed content-write authority.
+        if (signal?.aborted) throw err;
         if (attempt === maxRetries) {
           // v0.10.5 Pack G.1 — chunk-loss diagnostic. Whether is_final
           // or not is load-bearing here: a lost final chunk leaves the
@@ -308,10 +313,39 @@ export class RecordingService {
     }
   }
 
-  private _sendUpload(callbackUrl: string, token: string, boundary: string, body: Buffer, timeoutMs: number): Promise<void> {
+  private _sendUpload(
+    callbackUrl: string,
+    token: string,
+    boundary: string,
+    body: Buffer,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error('Recording upload aborted'));
+        return;
+      }
       const url = new URL(callbackUrl);
+      if (
+        !['http:', 'https:'].includes(url.protocol)
+        || !url.hostname
+        || url.username
+        || url.password
+        || url.search
+        || url.hash
+      ) {
+        reject(new Error('Recording upload URL is unsafe'));
+        return;
+      }
       const transport = url.protocol === 'https:' ? https : http;
+      let settled = false;
+      const settle = (fn: () => void): void => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', onAbort);
+        fn();
+      };
       const req = transport.request(
         {
           hostname: url.hostname,
@@ -326,8 +360,9 @@ export class RecordingService {
           },
         },
         (res) => {
-          let responseData = '';
-          res.on('data', (chunk) => { responseData += chunk; });
+          // The receiver body is never part of this protocol. Drain it without buffering so an
+          // upstream cannot force unbounded memory or reflect the bearer into logs/errors.
+          res.resume();
           res.on('end', () => {
             if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
               logJSON({
@@ -337,7 +372,7 @@ export class RecordingService {
                 recording_meeting_id: this.meetingId,
                 recording_session_uid: this.sessionUid,
               });
-              resolve();
+              settle(resolve);
             } else {
               // v0.10.5 Pack G.1 — capture status code distinct from
               // message body so operators can route 4xx (caller bug)
@@ -346,24 +381,25 @@ export class RecordingService {
                 level: "warn",
                 msg: "[Recording] Upload returned non-2xx",
                 http_status: res.statusCode,
-                response_body_preview: typeof responseData === "string"
-                  ? responseData.slice(0, 500)
-                  : "",
                 recording_meeting_id: this.meetingId,
                 recording_session_uid: this.sessionUid,
               });
-              reject(new Error(`Upload failed with status ${res.statusCode}: ${responseData}`));
+              settle(() => reject(new Error(`Upload failed with status ${res.statusCode}`)));
             }
           });
         }
       );
+      const onAbort = (): void => {
+        req.destroy(new Error('Recording upload aborted'));
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
       req.on('timeout', () => {
         req.destroy();
-        reject(new Error(`Upload timed out after ${timeoutMs}ms`));
+        settle(() => reject(new Error(`Upload timed out after ${timeoutMs}ms`)));
       });
       req.on('error', (err) => {
         log(`[Recording] Upload error: ${err.message}`);
-        reject(err);
+        settle(() => reject(err));
       });
       req.write(body);
       req.end();

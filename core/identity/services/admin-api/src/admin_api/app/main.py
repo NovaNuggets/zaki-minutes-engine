@@ -12,22 +12,29 @@ exercises:
   email, plus webhook_url/secret/events from user.data; rejects expired tokens; bumps
   last_used_at; FAILS CLOSED when INTERNAL_API_SECRET is unset (503) and on a bad secret (403).
 
-  Token mint: scoped {bot,tx,browser}, optional multi-scope `?scopes=bot,tx`, optional expiry
+  Token mint: scoped {bot,tx,browser,agent}, optional multi-scope `?scopes=bot,tx`, optional expiry
   `?expires_in=<sec>`; an invalid scope → 422.
 """
 import hmac
+import ipaddress
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, Security, status
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..schema.models import APIToken, PlatformSetting, User
-from ..token_scope import VALID_SCOPES, generate_prefixed_token
+from ..token_scope import (
+    CONTRACT_SCOPES,
+    IDENTITY_V1,
+    IDENTITY_V2,
+    VALID_SCOPES,
+    generate_prefixed_token,
+)
 from .db import get_db
 
 ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-API-Key", auto_error=False)
@@ -42,8 +49,30 @@ def _internal_secret() -> str:
     return os.environ.get("INTERNAL_API_SECRET", "")
 
 
+def _validate_auth_domain_separation() -> None:
+    """Refuse aliasing the external admin key with internal service authority."""
+
+    admin = _admin_token()
+    internal = _internal_secret()
+    if admin and internal and hmac.compare_digest(admin, internal):
+        raise RuntimeError(
+            "ADMIN_API_TOKEN must be distinct from INTERNAL_API_SECRET"
+        )
+
+
 def _dev_mode() -> bool:
     return os.getenv("DEV_MODE", "false").lower() == "true"
+
+
+def _is_explicit_loopback_host(hostname: str) -> bool:
+    """Allow cleartext ICS only for a lexically explicit loopback development host."""
+    host = (hostname or "").strip().lower().rstrip(".")
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 async def verify_admin_token(admin_api_key: str = Security(ADMIN_KEY_HEADER)):
@@ -55,20 +84,47 @@ async def verify_admin_token(admin_api_key: str = Security(ADMIN_KEY_HEADER)):
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid or missing admin token.")
 
 
-async def get_current_user(api_key: str = Security(USER_KEY_HEADER),
-                           db: AsyncSession = Depends(get_db)) -> User:
+async def _authenticate_user(
+    api_key: str,
+    db: AsyncSession,
+    *,
+    required_scope: Optional[str] = None,
+) -> User:
     if not api_key:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Missing API Key")
     row = (await db.execute(select(APIToken).where(APIToken.token == api_key))).scalars().first()
     if not row:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
+    if row.expires_at is not None:
+        now = datetime.now(timezone.utc)
+        expiry = row.expires_at
+        if expiry.tzinfo is None:
+            now = now.replace(tzinfo=None)
+        if expiry <= now:
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Token expired")
     token_scopes = set(row.scopes) if row.scopes else set()
     if not token_scopes & VALID_SCOPES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Token scope not authorized for this endpoint")
+    if required_scope is not None and required_scope not in token_scopes:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail=f"Token scope not authorized for this endpoint; {required_scope} required",
+        )
     user = (await db.execute(select(User).where(User.id == row.user_id))).scalars().first()
     if not user:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Invalid API Key")
     return user
+
+
+async def get_current_user(api_key: str = Security(USER_KEY_HEADER),
+                           db: AsyncSession = Depends(get_db)) -> User:
+    return await _authenticate_user(api_key, db)
+
+
+async def get_current_browser_user(api_key: str = Security(USER_KEY_HEADER),
+                                   db: AsyncSession = Depends(get_db)) -> User:
+    """Resolve an interactive user; machine credentials cannot mutate human consent."""
+    return await _authenticate_user(api_key, db, required_scope="browser")
 
 
 # --- request/response models ---
@@ -116,10 +172,118 @@ class WebhookUpdate(BaseModel):
 
 
 class CalendarUpdate(BaseModel):
-    """The user's calendar-sync self-serve config: a secret ICS feed URL (``null`` disconnects)
-    + the GLOBAL auto-join default stamped onto every imported meeting."""
+    """The user's secret ICS feed URL (``null`` disconnects). ``auto_join`` remains a
+    compatibility input; launch v1 accepts false and rejects true."""
     ics_url: Optional[str] = None
     auto_join: Optional[bool] = None
+
+
+class MinutesUpdate(BaseModel):
+    """User-owned Minutes choices only; deployment policy and attestations are server-owned."""
+
+    capture_enabled: Optional[StrictBool] = None
+    agent_read_enabled: Optional[StrictBool] = None
+    retention_days: Optional[Dict[str, object]] = None
+
+
+_MINUTES_RETENTION_DEFAULTS = {"audio": 7, "transcript": 30, "summary": 30}
+_MINUTES_RETENTION_KEYS = frozenset(_MINUTES_RETENTION_DEFAULTS)
+_MINUTES_POLICY_VERSION = "minutes-capture.v1"
+
+
+def _minutes_operator_flag(name: str) -> bool:
+    """Fail closed at the policy boundary; deployment preflight reports malformed values."""
+    return os.getenv(name, "false").strip().lower() == "true"
+
+
+def _validated_minutes_retention(value: object) -> Dict[str, int]:
+    if not isinstance(value, dict) or set(value) != _MINUTES_RETENTION_KEYS:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="retention_days must contain exactly audio, transcript, and summary",
+        )
+    if any(type(days) is not int or days < 1 or days > 3650 for days in value.values()):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="retention_days values must be integers between 1 and 3650",
+        )
+    normalized = {name: int(value[name]) for name in _MINUTES_RETENTION_DEFAULTS}
+    if normalized["audio"] > normalized["transcript"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="audio retention cannot exceed transcript retention",
+        )
+    if normalized["summary"] > normalized["transcript"]:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="summary retention cannot exceed transcript retention",
+        )
+    return normalized
+
+
+def _minutes_view(user: User) -> dict:
+    data = user.data if isinstance(user.data, dict) else {}
+    stored = data.get("minutes_prefs")
+    prefs = stored if isinstance(stored, dict) else {}
+    retention_valid = True
+    if "retention_days" not in prefs:
+        retention = dict(_MINUTES_RETENTION_DEFAULTS)
+    else:
+        try:
+            retention = _validated_minutes_retention(prefs.get("retention_days"))
+        except HTTPException:
+            # Keep the response shape stable for repair UI, but never turn corrupt policy into
+            # a silent retention extension for capture authority.
+            retention = dict(_MINUTES_RETENTION_DEFAULTS)
+            retention_valid = False
+
+    attested_at = prefs.get("attested_at")
+    try:
+        parsed_attestation = datetime.fromisoformat(
+            attested_at.replace("Z", "+00:00")
+        ) if isinstance(attested_at, str) else None
+    except ValueError:
+        parsed_attestation = None
+    attestation_valid = (
+        parsed_attestation is not None
+        and parsed_attestation.tzinfo is not None
+        and parsed_attestation.utcoffset() is not None
+        and parsed_attestation <= datetime.now(timezone.utc)
+    )
+
+    operator_enabled = _minutes_operator_flag("ZAKI_MINUTES_CAPTURE_ENABLED")
+    read_operator_enabled = _minutes_operator_flag("ZAKI_MINUTES_READ_ENABLED")
+    capture_requested = prefs.get("capture_enabled") is True
+    agent_read_requested = prefs.get("agent_read_enabled") is True
+    capture_enabled = (
+        operator_enabled
+        and retention_valid
+        and attestation_valid
+        and capture_requested
+        and prefs.get("policy_version") == _MINUTES_POLICY_VERSION
+    )
+    agent_read_enabled = read_operator_enabled and agent_read_requested
+    attested_at = attested_at if capture_enabled else None
+    capture_repair = None
+    if operator_enabled and capture_requested and not capture_enabled:
+        capture_repair = (
+            "retention_repair_required"
+            if not retention_valid
+            else "reconsent_required"
+        )
+    return {
+        "operator_enabled": operator_enabled,
+        "read_operator_enabled": read_operator_enabled,
+        "capture_enabled": capture_enabled,
+        "agent_read_enabled": agent_read_enabled,
+        "capture_requested": capture_requested,
+        "agent_read_requested": agent_read_requested,
+        "retention_days": retention,
+        "policy_version": _MINUTES_POLICY_VERSION,
+        "attested_at": attested_at,
+        # Bounded UI state only: never expose corrupt persisted values or parse diagnostics.
+        "capture_repair": capture_repair,
+    }
 
 
 # ── model + transcription config (per-user prefs and the platform-wide defaults) ──
@@ -129,9 +293,10 @@ class CalendarUpdate(BaseModel):
 # Anthropic-/OpenAI-compatible endpoint + key, e.g. a LiteLLM/OpenRouter gateway in front of an
 # open-source model). A TRANSCRIPTION config is {url, token} — the STT service the bot invocation
 # rides. Per-user copies live in users.data["model_prefs"] / ["transcription_prefs"]; the
-# platform defaults live in platform_settings rows "models" / "transcription". Effective config
-# resolves FIELD-BY-FIELD user > platform; the process env stays the bottom fallback downstream
-# (dispatch/bot_spawn only override what is set here).
+# platform defaults live in platform_settings rows "models" / "transcription". Model config
+# resolves field-by-field. A transcription backend is an atomic URL+credential boundary: selecting
+# a user URL selects only that user's backend fields, never a platform credential. The process env
+# stays the bottom fallback downstream (dispatch/bot_spawn only override what is set here).
 MODEL_MODES = ("subscription", "custom")
 _MODELS_FIELDS = ("mode", "model", "meeting_model", "base_url", "api_key")
 _TRANSCRIPTION_FIELDS = ("url", "token")
@@ -155,6 +320,132 @@ class ModelPrefsUpdate(BaseModel):
 class TranscriptionPrefsUpdate(BaseModel):
     url: Optional[str] = None
     token: Optional[str] = None
+
+
+_BLOCKED_USER_ENDPOINT_HOSTS = frozenset({
+    "metadata.google.internal",
+    "metadata.amazonaws.com",
+})
+
+
+def _browser_ipv4(host: str) -> Optional[ipaddress.IPv4Address]:
+    """Parse legacy numeric IPv4 forms normalized by WHATWG-compatible HTTP clients."""
+    pieces = host.split(".")
+    if pieces[-1] == "":
+        pieces.pop()
+    if not pieces or len(pieces) > 4:
+        return None
+    numbers: list[int] = []
+    for piece in pieces:
+        if not piece:
+            return None
+        base, digits = 10, piece
+        if piece.lower().startswith("0x"):
+            base, digits = 16, piece[2:]
+        elif len(piece) > 1 and piece.startswith("0"):
+            base, digits = 8, piece[1:]
+        if not digits:
+            digits = "0"
+        try:
+            numbers.append(int(digits, base))
+        except ValueError:
+            return None
+    if any(number < 0 for number in numbers):
+        return None
+    if any(number > 255 for number in numbers[:-1]):
+        return None
+    remaining_bytes = 5 - len(numbers)
+    if numbers[-1] >= 256**remaining_bytes:
+        return None
+    value = numbers[-1]
+    for index, number in enumerate(numbers[:-1]):
+        value += number * 256 ** (3 - index)
+    return ipaddress.IPv4Address(value)
+
+
+def _validate_user_endpoint_url(
+    value: str,
+    *,
+    allowed_hosts_env: str,
+    endpoint: str,
+) -> None:
+    """Validate one user-owned inference origin against a dedicated operator allowlist."""
+    from urllib.parse import urlparse
+
+    if "\\" in value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url contains an unsafe delimiter")
+    try:
+        parsed = urlparse(value)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url is malformed") from None
+    if parsed.scheme != "https" or not host:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url must be an https URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url cannot contain credentials")
+    if port not in (None, 443):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url must use the approved https origin")
+    if parsed.query or parsed.fragment:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url must be a query-free base URL")
+    canonical_host = host.lower().rstrip(".")
+    if any(
+        not label or label.startswith("-") or label.endswith("-")
+        for label in canonical_host.split(".")
+    ):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url hostname is malformed")
+    if "%" in canonical_host:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url hostname cannot use percent encoding")
+    if (
+        canonical_host in _BLOCKED_USER_ENDPOINT_HOSTS
+        or canonical_host == "localhost"
+        or canonical_host.endswith((".localhost", ".local", ".internal"))
+    ):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url cannot target an internal host")
+    browser_ip = _browser_ipv4(canonical_host)
+    try:
+        address = browser_ip or ipaddress.ip_address(canonical_host)
+    except ValueError:
+        address = None
+    if address is not None and not address.is_global:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url cannot target a private network")
+    if address is None and "." not in canonical_host:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url cannot target a single-label host")
+    allowed_hosts = {
+        configured.strip().lower().rstrip(".")
+        for configured in os.getenv(allowed_hosts_env, "").split(",")
+        if configured.strip()
+    }
+    if canonical_host not in allowed_hosts:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"user {endpoint} url hostname is not operator-approved")
+
+
+def _validate_user_transcription_url(value: str) -> None:
+    _validate_user_endpoint_url(
+        value,
+        allowed_hosts_env="VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS",
+        endpoint="transcription",
+    )
+
+
+def _validate_user_model_url(value: str) -> None:
+    _validate_user_endpoint_url(
+        value,
+        allowed_hosts_env="VEXA_USER_MODEL_ALLOWED_HOSTS",
+        endpoint="model",
+    )
 
 
 def _mask_secret(secret: Optional[str]) -> Optional[str]:
@@ -183,10 +474,20 @@ def _validate_config_fields(update: dict, *, kind: str) -> dict:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                                 detail=f"mode must be one of {sorted(MODEL_MODES)}")
         if field in ("base_url", "url"):
-            parsed = urlparse(value)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            try:
+                parsed = urlparse(value)
+                hostname = parsed.hostname
+                parsed.port
+            except ValueError:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    detail=f"{field} must be a valid http(s) URL") from None
+            if parsed.scheme not in ("http", "https") or not hostname:
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                                     detail=f"{field} must be an http(s) URL")
+            if field == "url" and kind == "transcription_prefs":
+                _validate_user_transcription_url(value)
+            if field == "base_url" and kind == "model_prefs":
+                _validate_user_model_url(value)
         cleaned[field] = value
     return cleaned
 
@@ -202,17 +503,101 @@ def _apply_config_update(stored: dict, cleaned: dict) -> dict:
     return out
 
 
-def _resolve_effective(user_cfg: dict, platform_cfg: dict, fields: tuple) -> dict:
-    """FIELD-BY-FIELD user > platform. Only set fields appear — env fallback stays downstream."""
-    out: dict = {}
-    for field in fields:
+def _resolve_model_backend(user_cfg: dict, platform_cfg: dict) -> dict:
+    """Resolve model names flexibly while keeping every endpoint/key pair on one owner tier."""
+    user_mode = (user_cfg.get("mode") or "").strip()
+    user_url = (user_cfg.get("base_url") or "").strip()
+
+    # Managed subscription is an explicit user choice: model names may inherit, endpoint/key may
+    # not. Stale custom fields are intentionally ignored.
+    if user_mode == "subscription":
+        out = {"mode": "subscription"}
+        for field in ("model", "meeting_model"):
+            value = user_cfg.get(field) or platform_cfg.get(field)
+            if value:
+                out[field] = value
+        return out
+
+    # Custom mode is an atomic user tier. A missing URL/key stays missing (fail loud downstream)
+    # instead of being filled with a platform credential. Revalidate on every read so an operator
+    # allowlist revocation takes effect for already-stored preferences.
+    if user_mode == "custom":
+        names = {
+            field: user_cfg.get(field) or platform_cfg.get(field)
+            for field in ("model", "meeting_model")
+        }
+        if not user_url:
+            return {
+                "mode": "custom",
+                **names,
+                "blocked": True,
+                "config_status": "incomplete",
+                "validation_error": "Personal model endpoint is incomplete; set an approved Base URL.",
+            }
+        try:
+            _validate_user_model_url(user_url)
+        except HTTPException:
+            return {
+                "mode": "custom",
+                **names,
+                "blocked": True,
+                "config_status": "blocked",
+                "validation_error": "Personal model endpoint is no longer operator-approved.",
+            }
+        return {
+            field: user_cfg[field]
+            for field in _MODELS_FIELDS
+            if user_cfg.get(field)
+        }
+
+    # No user provider selected: platform owns the provider bundle; users may still choose model
+    # names without changing the credential origin.
+    platform_mode = (platform_cfg.get("mode") or "").strip()
+    if platform_mode == "custom":
+        out = {
+            field: platform_cfg[field]
+            for field in ("mode", "base_url", "api_key")
+            if platform_cfg.get(field)
+        }
+    elif platform_mode == "subscription":
+        out = {"mode": "subscription"}
+    else:
+        # An unset provider delegates to deployment defaults. Ignore any legacy custom origin/key
+        # still present from older writers so hidden credentials cannot become active again.
+        out = {}
+    for field in ("model", "meeting_model"):
         value = user_cfg.get(field) or platform_cfg.get(field)
         if value:
             out[field] = value
     return out
 
 
+def _resolve_transcription_backend(user_cfg: dict, platform_cfg: dict) -> dict:
+    """Choose one complete STT backend tier without crossing its credential boundary."""
+    if user_cfg.get("url"):
+        try:
+            _validate_user_transcription_url(user_cfg["url"])
+        except HTTPException:
+            return {
+                "blocked": True,
+                "config_status": "blocked",
+                "validation_error": "Personal transcription endpoint is no longer operator-approved.",
+            }
+        else:
+            return {
+                field: user_cfg[field]
+                for field in _TRANSCRIPTION_FIELDS
+                if user_cfg.get(field)
+            }
+    return {
+        field: platform_cfg[field]
+        for field in _TRANSCRIPTION_FIELDS
+        if platform_cfg.get(field)
+    }
+
+
 def create_app() -> FastAPI:
+    _validate_auth_domain_separation()
     app = FastAPI(title="Vexa Admin API (v0.12)")
 
     # --- liveness probe (gate:health): process-up, no DB dependency. Readiness (DB reachable)
@@ -223,6 +608,22 @@ def create_app() -> FastAPI:
         return {"status": "ok", "service": "admin-api"}
 
     # --- admin tier: user + token CRUD ---
+    @app.get("/admin/capabilities", dependencies=[Depends(verify_admin_token)])
+    async def admin_capabilities():
+        """Content-free version negotiation for admin clients.
+
+        Old admin-api deployments do not have this route (404), which is the explicit v1 signal.
+        A client may use the Agent scope only after this exact response advertises identity.v2.
+        """
+        return {
+            "contracts": {
+                "identity": {
+                    "versions": [IDENTITY_V1, IDENTITY_V2],
+                    "preferred": IDENTITY_V2,
+                }
+            }
+        }
+
     @app.post("/admin/users", response_model=UserResponse,
               dependencies=[Depends(verify_admin_token)])
     async def create_user(user_in: UserCreate, response: Response,
@@ -255,6 +656,7 @@ def create_app() -> FastAPI:
               status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_admin_token)])
     async def create_token_for_user(user_id: int, scope: str = "bot",
                                     scopes: Optional[str] = None,
+                                    contract_version: str = IDENTITY_V1,
                                     name: Optional[str] = None,
                                     expires_in: Optional[int] = None,
                                     db: AsyncSession = Depends(get_db)):
@@ -263,10 +665,20 @@ def create_app() -> FastAPI:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="User not found")
         scope_list = ([s.strip() for s in scopes.split(",") if s.strip()]
                       if scopes is not None else [scope])
-        invalid = [s for s in scope_list if s not in VALID_SCOPES]
+        allowed_scopes = CONTRACT_SCOPES.get(contract_version)
+        if allowed_scopes is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Unknown identity contract {contract_version!r}. "
+                    f"Valid: {sorted(CONTRACT_SCOPES)}"
+                ),
+            )
+        invalid = [s for s in scope_list if s not in allowed_scopes]
         if invalid:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-                                detail=f"Invalid scope(s): {invalid}. Valid: {sorted(VALID_SCOPES)}")
+                                detail=(f"Invalid scope(s) for {contract_version}: {invalid}. "
+                                        f"Valid: {sorted(allowed_scopes)}"))
         token_value = generate_prefixed_token(scope_list[0])
         expires_at = None
         if expires_in is not None and expires_in > 0:
@@ -338,17 +750,89 @@ def create_app() -> FastAPI:
             "webhook_events": data.get("webhook_events"),
         }
 
+    # --- user tier: Minutes consent, per-carrier retention, and Agent-read opt-in ---
+    @app.get("/user/minutes")
+    async def get_user_minutes(response: Response, user: User = Depends(get_current_browser_user)):
+        response.headers["Cache-Control"] = "no-store"
+        return _minutes_view(user)
+
+    @app.put("/user/minutes")
+    async def set_user_minutes(minutes_update: MinutesUpdate, response: Response,
+                               user: User = Depends(get_current_browser_user),
+                               db: AsyncSession = Depends(get_db)):
+        from sqlalchemy.orm import attributes
+
+        fields = minutes_update.model_fields_set
+        if ("capture_enabled" in fields and minutes_update.capture_enabled is True
+                and not _minutes_operator_flag("ZAKI_MINUTES_CAPTURE_ENABLED")):
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                detail="Minutes capture is disabled by the operator")
+        if ("agent_read_enabled" in fields and minutes_update.agent_read_enabled is True
+                and not _minutes_operator_flag("ZAKI_MINUTES_READ_ENABLED")):
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                detail="Minutes Agent read is disabled by the operator")
+
+        # Serialize preference updates for this user. Without a row lock, concurrent requests that
+        # toggle capture and Agent reads can each copy stale JSONB and the later commit can silently
+        # resurrect a withdrawn consent or discard a retention change. ``populate_existing`` is
+        # required because the auth dependency already loaded this identity in the same session.
+        locked_user = (await db.execute(
+            select(User)
+            .where(User.id == user.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one()
+        data = dict(locked_user.data or {})
+        current = data.get("minutes_prefs")
+        prefs = dict(current) if isinstance(current, dict) else {}
+        if "retention_days" in fields:
+            if minutes_update.retention_days is None:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    detail="retention_days cannot be null")
+            prefs["retention_days"] = _validated_minutes_retention(
+                minutes_update.retention_days
+            )
+            # Changing the lifetime of sensitive content is itself a consent decision. Refresh
+            # an existing current-policy attestation; never use this to accept a newer policy.
+            if (
+                prefs.get("capture_enabled") is True
+                and prefs.get("policy_version") == _MINUTES_POLICY_VERSION
+            ):
+                prefs["attested_at"] = datetime.now(timezone.utc).isoformat()
+        if "capture_enabled" in fields:
+            enabled = minutes_update.capture_enabled is True
+            prefs["capture_enabled"] = enabled
+            prefs["attested_at"] = (
+                datetime.now(timezone.utc).isoformat() if enabled else None
+            )
+            prefs["policy_version"] = _MINUTES_POLICY_VERSION if enabled else None
+        if "agent_read_enabled" in fields:
+            prefs["agent_read_enabled"] = minutes_update.agent_read_enabled is True
+
+        data["minutes_prefs"] = prefs
+        locked_user.data = data
+        attributes.flag_modified(locked_user, "data")
+        db.add(locked_user)
+        await db.commit()
+        response.headers["Cache-Control"] = "no-store"
+        return _minutes_view(locked_user)
+
     # --- user tier: calendar-sync self-serve (writes to user.data JSONB, like webhook) ---
     @app.put("/user/calendar")
     async def set_user_calendar(calendar_update: CalendarUpdate,
                                 user: User = Depends(get_current_user),
                                 db: AsyncSession = Depends(get_db)):
-        """Set/clear the caller's secret ICS feed URL (+ the global auto-join default for
-        imported meetings). ``ics_url: null`` disconnects the calendar. The URL is a SECRET
+        """Set/clear the caller's secret ICS feed URL. ``ics_url: null`` disconnects the calendar.
+        Automatic capture is unavailable in launch v1. The URL is a SECRET
         (Google/Outlook secret-address feeds) — it is stored, never echoed in the clear."""
         from urllib.parse import urlparse
 
         from sqlalchemy.orm import attributes
+        if calendar_update.auto_join is True:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="Calendar auto-join is unavailable in launch v1",
+            )
         data = dict(user.data or {})
         if "ics_url" in calendar_update.model_fields_set:
             url = (calendar_update.ics_url or "").strip()
@@ -356,10 +840,23 @@ def create_app() -> FastAPI:
                 if len(url) > 2048:
                     raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                                         detail="ics_url too long")
-                parsed = urlparse(url)
-                if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                try:
+                    parsed = urlparse(url)
+                    hostname = parsed.hostname
+                    parsed.port
+                except ValueError:
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="ics_url must be a valid http(s) URL",
+                    ) from None
+                if parsed.scheme not in ("http", "https") or not hostname:
                     raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
                                         detail="ics_url must be an http(s) URL")
+                if parsed.scheme == "http" and not _is_explicit_loopback_host(hostname):
+                    raise HTTPException(
+                        status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="hosted ics_url feeds must use https",
+                    )
                 # Catch the #1 paste mistake up front: Google Calendar's EMBED page (HTML, not a
                 # feed). The real feed is Settings -> Integrate calendar -> 'Secret address in
                 # iCal format' (ends in .ics). Content-level checks happen at fetch time.
@@ -395,7 +892,8 @@ def create_app() -> FastAPI:
         return {
             "ics_url_set": bool(url),
             "ics_url_masked": masked,
-            "auto_join": data.get("calendar_auto_join", True),
+            "auto_join_available": False,
+            "auto_join": False,
         }
 
     # --- user tier: model + transcription self-serve prefs (users.data JSONB, like webhook) ---
@@ -404,7 +902,31 @@ def create_app() -> FastAPI:
         from sqlalchemy.orm import attributes
         cleaned = _validate_config_fields(update_fields, kind=data_key)
         data = dict(user.data or {})
-        data[data_key] = _apply_config_update(data.get(data_key) or {}, cleaned)
+        stored = data.get(data_key) or {}
+        if (
+            data_key == "transcription_prefs"
+            and "url" in cleaned
+            and cleaned["url"] != stored.get("url", "")
+            and "token" not in cleaned
+        ):
+            cleaned["token"] = ""
+        if (
+            data_key == "model_prefs"
+            and "base_url" in cleaned
+            and cleaned["base_url"] != stored.get("base_url", "")
+            and "api_key" not in cleaned
+        ):
+            cleaned["api_key"] = ""
+        if (
+            data_key == "model_prefs"
+            and "mode" in cleaned
+            and cleaned["mode"] != "custom"
+        ):
+            # Provider transitions are atomic. Deployment default/subscription cannot retain a
+            # hidden custom origin or credential, even if supplied in the same partial update.
+            cleaned["base_url"] = ""
+            cleaned["api_key"] = ""
+        data[data_key] = _apply_config_update(stored, cleaned)
         if not data[data_key]:
             data.pop(data_key, None)  # fully cleared → back to platform/env defaults
         user.data = data
@@ -426,6 +948,18 @@ def create_app() -> FastAPI:
     async def get_user_models(user: User = Depends(get_current_user)):
         data = user.data if isinstance(user.data, dict) else {}
         prefs = data.get("model_prefs") or {}
+        config_status = "valid"
+        validation_error = None
+        if prefs.get("mode") == "custom":
+            if not prefs.get("base_url"):
+                config_status = "incomplete"
+                validation_error = "Personal model endpoint is incomplete; set an approved Base URL."
+            else:
+                try:
+                    _validate_user_model_url(prefs["base_url"])
+                except HTTPException:
+                    config_status = "blocked"
+                    validation_error = "Personal model endpoint is no longer operator-approved."
         return {
             "mode": prefs.get("mode"),
             "model": prefs.get("model"),
@@ -433,13 +967,15 @@ def create_app() -> FastAPI:
             "base_url": prefs.get("base_url"),
             "api_key_set": bool(prefs.get("api_key")),
             "api_key": _mask_secret(prefs.get("api_key")),
+            "config_status": config_status,
+            "validation_error": validation_error,
         }
 
     @app.put("/user/transcription")
     async def set_user_transcription(update: TranscriptionPrefsUpdate,
                                      user: User = Depends(get_current_user),
                                      db: AsyncSession = Depends(get_db)):
-        """Set the caller's transcription backend override. ``token`` is a SECRET — masked on read."""
+        """Set an operator-allowlisted HTTPS STT override. ``token`` is masked on read."""
         await _put_user_prefs(update.model_dump(exclude_unset=True), "transcription_prefs", user, db)
         return await get_user_transcription(user)
 
@@ -447,10 +983,20 @@ def create_app() -> FastAPI:
     async def get_user_transcription(user: User = Depends(get_current_user)):
         data = user.data if isinstance(user.data, dict) else {}
         prefs = data.get("transcription_prefs") or {}
+        config_status = "valid"
+        validation_error = None
+        if prefs.get("url"):
+            try:
+                _validate_user_transcription_url(prefs["url"])
+            except HTTPException:
+                config_status = "blocked"
+                validation_error = "Personal transcription endpoint is no longer operator-approved."
         return {
             "url": prefs.get("url"),
             "token_set": bool(prefs.get("token")),
             "token": _mask_secret(prefs.get("token")),
+            "config_status": config_status,
+            "validation_error": validation_error,
         }
 
     # --- internal tier: the gateway's authz oracle (FAIL-CLOSED) ---
@@ -532,6 +1078,15 @@ def create_app() -> FastAPI:
         if user is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Unknown user")
         return user
+
+    @app.get("/internal/users/{user_id}/minutes", include_in_schema=False)
+    async def internal_user_minutes(user_id: str, request: Request, response: Response,
+                                    db: AsyncSession = Depends(get_db)):
+        """Identity's fail-closed authority view consumed by Minutes and Agent services."""
+        _check_internal(request)
+        user = await _load_user(user_id, db)
+        response.headers["Cache-Control"] = "no-store"
+        return _minutes_view(user)
 
     # --- internal tier: instance identity — admin existence + the first-sign-in admin claim.
     #     A fresh install has NO admin; the login surface (via the terminal, which fronts this
@@ -635,11 +1190,11 @@ def create_app() -> FastAPI:
                 configs.append({
                     "user_id": u.id,
                     "ics_url": url,
-                    "auto_join": data.get("calendar_auto_join", True),
+                    "auto_join": False,
                 })
         return {"configs": configs}
 
-    # --- internal tier: per-user spawn context — the auto-join sweep's stand-in for the headers
+    # --- internal tier: per-user spawn context — the managed launch path's stand-in for the headers
     #     the gateway injects on POST /bots (X-User-Limits + webhook config from /internal/validate).
     #     Same shape /internal/validate returns for those fields, keyed by user id. ---
     async def _platform_setting(key: str, db: AsyncSession) -> dict:
@@ -658,13 +1213,18 @@ def create_app() -> FastAPI:
                 resp["webhook_secret"] = data["webhook_secret"]
             if data.get("webhook_events"):
                 resp["webhook_events"] = data["webhook_events"]
-        # The effective transcription backend (user pref > platform setting) — bot_spawn overrides
-        # its env-derived TRANSCRIPTION_SERVICE_URL/TOKEN with this when present. The token crosses
-        # ONLY this internal hop.
-        transcription = _resolve_effective(
+        # The effective transcription backend (one complete user tier or one complete platform
+        # tier) — bot_spawn overrides its env-derived backend with this when present. The token
+        # crosses ONLY this internal hop and never crosses backend ownership tiers.
+        transcription = _resolve_transcription_backend(
             data.get("transcription_prefs") or {},
             await _platform_setting("transcription", db),
-            _TRANSCRIPTION_FIELDS,
+        )
+        # Provenance is metadata on the internal envelope, never part of the bot's credential
+        # bundle. Agent's user-facing Test button may spend only a personal endpoint credential;
+        # inherited platform/deployment tiers are reported generically without a live probe.
+        resp["transcription_credential_owner"] = (
+            "user" if (data.get("transcription_prefs") or {}).get("url") else "operator"
         )
         if transcription:
             resp["transcription"] = transcription
@@ -692,7 +1252,28 @@ def create_app() -> FastAPI:
         update = {f: payload.get(f) for f in fields if f in payload}
         cleaned = _validate_config_fields(update, kind=key)
         row = await db.get(PlatformSetting, key)
-        merged = _apply_config_update(dict(row.value) if row is not None else {}, cleaned)
+        stored = dict(row.value) if row is not None else {}
+        # A token is authority for one STT origin. Rotating the URL without supplying the new
+        # origin's token must not silently carry the old credential across that boundary. An
+        # unchanged URL remains a normal partial update; an explicit token="" remains a clear.
+        if (
+            key == "transcription"
+            and "url" in cleaned
+            and cleaned["url"] != stored.get("url", "")
+            and "token" not in cleaned
+        ):
+            cleaned["token"] = ""
+        if (
+            key == "models"
+            and "base_url" in cleaned
+            and cleaned["base_url"] != stored.get("base_url", "")
+            and "api_key" not in cleaned
+        ):
+            cleaned["api_key"] = ""
+        if key == "models" and "mode" in cleaned and cleaned["mode"] != "custom":
+            cleaned["base_url"] = ""
+            cleaned["api_key"] = ""
+        merged = _apply_config_update(stored, cleaned)
         if row is None:
             row = PlatformSetting(key=key, value=merged)
         else:
@@ -709,11 +1290,11 @@ def create_app() -> FastAPI:
         _check_internal(request)
         user = await _load_user(user_id, db)
         data = user.data if isinstance(user.data, dict) else {}
-        return {"models": _resolve_effective(
-            data.get("model_prefs") or {},
+        prefs = data.get("model_prefs") or {}
+        return {"models": _resolve_model_backend(
+            prefs,
             await _platform_setting("models", db),
-            _MODELS_FIELDS,
-        )}
+        ), "credential_owner": "user" if prefs.get("mode") == "custom" else "operator"}
 
     @app.get("/")
     async def root():

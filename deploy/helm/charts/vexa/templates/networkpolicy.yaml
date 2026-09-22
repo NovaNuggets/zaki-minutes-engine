@@ -1,0 +1,140 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $workloadNamespace := include "vexa.workloadNamespace" . -}}
+{{- $isolatedWorkloadNamespace := ne $workloadNamespace .Release.Namespace -}}
+{{- $releaseLabels := include "vexa.selectorLabels" . | fromYaml -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vexa.componentName" (list . "platform-default-deny") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vexa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vexa.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vexa.componentName" (list . "platform-explicit-flows") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vexa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "vexa.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The release is one platform trust domain. Component-level authentication still gates every
+    # HTTP hop; unrelated same-namespace Pods do not match the release selector.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "vexa.selectorLabels" . | nindent 14 }}
+    # Spawned bots can publish lifecycle/transcript data only back to this release.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $workloadNamespace }}
+          podSelector:
+            matchLabels:
+              runtime.managed: "true"
+    # API-server/ingress-controller traffic in the conventional system namespace. Operators with
+    # a different ingress namespace add a narrowly selected rule below.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+    {{- with .Values.networkPolicy.platformAdditionalIngress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "vexa.selectorLabels" . | nindent 14 }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Provider APIs and managed public endpoints. Private cluster destinations remain denied unless
+    # declared through platformAdditionalEgress.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16]
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- with .Values.networkPolicy.platformAdditionalEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vexa.componentName" (list . "workload-default-deny") }}
+  namespace: {{ $workloadNamespace }}
+  labels:
+    {{- include "vexa.labels" . | nindent 4 }}
+spec:
+  {{- if $isolatedWorkloadNamespace }}
+  # A distinct workload namespace is dedicated. Deny every Pod, including an unlabeled Pod created
+  # by a compromised runtime; only runtime.managed Pods receive the allow policy below.
+  podSelector: {}
+  {{- else }}
+  # Local compatibility may share the release namespace. Do not impose namespace-wide policy on
+  # unrelated Pods there; hosted/managed renders already require a distinct namespace.
+  podSelector:
+    matchLabels:
+      runtime.managed: "true"
+  {{- end }}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "vexa.componentName" (list . "workload-explicit-flows") }}
+  namespace: {{ $workloadNamespace }}
+  labels:
+    {{- include "vexa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      runtime.managed: "true"
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "vexa.selectorLabels" . | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.meetingApi.service.port }} }
+        - { protocol: TCP, port: {{ .Values.redis.service.port }} }
+        - { protocol: TCP, port: {{ .Values.minio.service.port }} }
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16]
+      ports:
+        {{- toYaml .Values.networkPolicy.externalEgress | nindent 8 }}
+    {{- with .Values.networkPolicy.workloadAdditionalEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

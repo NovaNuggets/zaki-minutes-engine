@@ -323,10 +323,11 @@ export async function startCaptureBridge(
 export async function startRecording(page: Page, inv: Invocation, recording: BotRecordingSink): Promise<() => Promise<void>> {
   const key = `${inv.platform}/${inv.nativeMeetingId ?? inv.connectionId ?? 'session'}`;
   // Node-side: decode one base64 recording.v1 chunk → the assembler. mimeType→master format.
-  await page.exposeFunction('__vexaRecordingChunk', (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): void => {
+  await page.exposeFunction('__vexaRecordingChunk', async (base64: string, chunkSeq: number, isFinal: boolean, mimeType: string): Promise<boolean> => {
     const bytes = base64 ? new Uint8Array(Buffer.from(base64, 'base64')) : new Uint8Array(0);
     const format: RecordingMasterFormat = /wav/i.test(mimeType) ? 'wav' : 'webm';
-    recording.chunk(key, chunkSeq, isFinal, format, bytes);
+    await recording.chunk(key, chunkSeq, isFinal, format, bytes);
+    return true;
   }).catch((e: Error) => { if (!String(e.message).includes('already registered')) throw e; });
 
   // Page-side: start the generic recording tap (finds + combines the page audio elements).

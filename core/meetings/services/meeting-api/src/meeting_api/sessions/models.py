@@ -25,12 +25,12 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Column,
     DateTime,
     Float,
     ForeignKey,
     Index,
-    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -45,8 +45,8 @@ Base = declarative_base()
 class Meeting(Base):
     __tablename__ = "meetings"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    user_id = Column(BigInteger, nullable=False, index=True)
     platform = Column(String(100), nullable=False)
     platform_specific_id = Column(String(255), index=True, nullable=True)
     status = Column(String(50), nullable=False, default="requested", index=True)
@@ -88,11 +88,25 @@ class Meeting(Base):
     )
 
 
+class MinutesErasureReceipt(Base):
+    """Mirror of the content-free durable Minutes erasure receipt table."""
+
+    __tablename__ = "minutes_erasure_receipts"
+
+    user_id = Column(BigInteger, primary_key=True)
+    meeting_id = Column(BigInteger, primary_key=True)
+    erased_at = Column(DateTime(timezone=True), nullable=False)
+    policy_version = Column(String(80), nullable=False)
+    receipt = Column(JSONB, nullable=False)
+
+    __table_args__ = (Index("ix_minutes_erasure_receipts_user", "user_id"),)
+
+
 class Transcription(Base):
     __tablename__ = "transcriptions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    meeting_id = Column(BigInteger, ForeignKey("meetings.id"), nullable=False, index=True)
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
     text = Column(Text, nullable=False)
@@ -119,14 +133,14 @@ class MeetingSession(Base):
     """N sessions per meeting, keyed by ``session_uid`` (one per bot connection/reconnect).
 
     ``bot_spawn`` eager-creates a row on spawn (``session_uid`` == the ``connectionId`` minted into
-    the bot's invocation); ``recordings`` looks the row up by ``session_uid`` when the bot uploads
-    a chunk, so the upload finds its meeting even before the bot reports ``active``.
+    the bot's invocation); ``recordings`` looks the row up by ``(meeting_id, session_uid)`` when the
+    bot uploads a chunk, so the upload finds the exact tenant row before the bot reports ``active``.
     """
 
     __tablename__ = "meeting_sessions"
 
-    id = Column(Integer, primary_key=True, index=True)
-    meeting_id = Column(Integer, ForeignKey("meetings.id"), nullable=False, index=True)
+    id = Column(BigInteger, primary_key=True, index=True)
+    meeting_id = Column(BigInteger, ForeignKey("meetings.id"), nullable=False, index=True)
     session_uid = Column(String, nullable=False, index=True)
     session_start_time = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

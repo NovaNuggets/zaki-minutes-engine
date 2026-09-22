@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/minutes-api.v1",
+  "title": "minutes-api.v1",
+  "description": "Exact user-facing managed Minutes capture, status, withdrawal, erasure, and error shapes.",
+  "$defs": {
+    "PositiveRowId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "description": "Canonical PostgreSQL signed-bigint row id encoded as decimal text."
+    },
+    "Platform": {
+      "enum": ["google_meet", "teams", "zoom", "jitsi"]
+    },
+    "ProductStatus": {
+      "enum": ["requested", "joining", "awaiting_admission", "active", "needs_human_help", "stopping", "completed", "failed"]
+    },
+    "CompletionReason": {
+      "enum": ["stopped", "left_alone", "startup_alone", "evicted", "awaiting_admission_timeout", "awaiting_admission_rejected", "join_failure", "validation_error", "max_bot_time_exceeded"]
+    },
+    "FailureStage": {
+      "enum": ["requested", "joining", "awaiting_admission", "active"]
+    },
+    "CaptureRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "native_meeting_id"],
+      "properties": {
+        "platform": { "$ref": "#/$defs/Platform" },
+        "native_meeting_id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@~-]{0,255}$" },
+        "meeting_url": { "type": "string", "format": "uri", "maxLength": 4096 },
+        "passcode": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "language": { "type": "string", "minLength": 1, "maxLength": 35 },
+        "task": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "CaptureResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "$ref": "#/$defs/PositiveRowId" },
+        "status": { "$ref": "#/$defs/ProductStatus" }
+      }
+    },
+    "WithdrawalResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "state", "changed", "withdrawn_at"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "state": { "const": "withdrawn" },
+        "changed": { "type": "boolean" },
+        "withdrawn_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "NonterminalStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "status"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "status": {
+          "enum": ["requested", "joining", "awaiting_admission", "active", "needs_human_help", "stopping"]
+        }
+      }
+    },
+    "CompletedStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "status", "completion_reason"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "status": { "const": "completed" },
+        "completion_reason": { "$ref": "#/$defs/CompletionReason" }
+      }
+    },
+    "FailedStatusResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "status", "failure_stage"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "status": { "const": "failed" },
+        "failure_stage": { "$ref": "#/$defs/FailureStage" }
+      }
+    },
+    "StatusResponse": {
+      "oneOf": [
+        { "$ref": "#/$defs/NonterminalStatusResponse" },
+        { "$ref": "#/$defs/CompletedStatusResponse" },
+        { "$ref": "#/$defs/FailedStatusResponse" }
+      ]
+    },
+    "ErrorCode": {
+      "enum": [
+        "quota_exhausted",
+        "request_too_large",
+        "capture_authority_unavailable",
+        "capture_disabled",
+        "capture_policy_invalid",
+        "meeting_url_invalid",
+        "capture_already_active",
+        "transcription_unavailable",
+        "capture_start_failed",
+        "capture_not_found",
+        "capture_withdrawal_pending",
+        "meeting_not_found",
+        "erasure_pending",
+        "account_erasure_pending"
+      ]
+    },
+    "CodedErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code"],
+          "properties": { "code": { "$ref": "#/$defs/ErrorCode" } }
+        }
+      }
+    },
+    "DetailErrorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["detail"],
+      "properties": {
+        "detail": { "type": "string", "minLength": 1, "maxLength": 1024 }
+      }
+    },
+    "ErrorResponse": {
+      "oneOf": [
+        { "$ref": "#/$defs/CodedErrorResponse" },
+        { "$ref": "#/$defs/DetailErrorResponse" }
+      ]
+    },
+    "ErasureResponse": {
+      "$ref": "https://vexa.ai/schemas/erasure.v1#/$defs/MinutesReceipt"
+    }
+  }
+}

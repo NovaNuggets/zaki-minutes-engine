@@ -2,6 +2,7 @@
 flowchart LR
   subgraph tenant["tenant boundary"]
     agent_api["agent-api"]
+    nullalis_agent["Canonical Nullalis Agent"]
     conformance["conformance"]
     gateway["gateway"]
     admin_api["admin-api"]
@@ -21,3 +22,5 @@ flowchart LR
   end
   transcription["transcription"]
   bot ==>|"audio -> tenant-hosted"| transcription
+  hub_api["Minutes Hub BFF"]
+  meeting_api ==>|"content-free meeting metadata -> ZAKI Hub BFF"| hub_api

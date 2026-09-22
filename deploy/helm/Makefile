@@ -5,6 +5,8 @@ CHART        ?= charts/vexa
 RELEASE      ?= vexa
 NAMESPACE    ?= vexa
 VALUES       ?= $(CHART)/values-test.yaml
+WORKLOAD_NAMESPACE ?=
+KUBE_CONTEXT ?=
 # k3s writes a root-only kubeconfig; smoke targets read it via sudo. Override for other clusters.
 KUBECONFIG   ?= /etc/rancher/k3s/k3s.yaml
 COMPOSE      ?= ../compose/docker-compose.yml
@@ -24,6 +26,12 @@ template:
 test:
 	bash tests/test_helm_lint.sh
 	bash tests/test_template.sh
+	bash tests/test_launch_hardening.sh
+	bash tests/test_workload_namespace_preflight.sh
+
+## verify-workload-namespace — hosted preflight: restricted PSA + no Secrets (chart never owns Namespace)
+verify-workload-namespace:
+	KUBE_CONTEXT="$(KUBE_CONTEXT)" bash bin/verify-workload-namespace.sh "$(WORKLOAD_NAMESPACE)"
 
 ## build — build the 5 control-plane images (:dev) via the compose build
 build:
@@ -53,4 +61,4 @@ down:
 	-sudo KUBECONFIG=$(KUBECONFIG) helm uninstall $(RELEASE) -n $(NAMESPACE)
 	-sudo KUBECONFIG=$(KUBECONFIG) kubectl delete namespace $(NAMESPACE) --wait=false
 
-.PHONY: lint template test build k3s-import install status smoke down
+.PHONY: lint template test verify-workload-namespace build k3s-import install status smoke down

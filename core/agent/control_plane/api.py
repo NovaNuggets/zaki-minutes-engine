@@ -17,29 +17,45 @@ honestly. Built lazily (PEP 562) so ``uvicorn control_plane.api:app`` wires the 
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
+from collections.abc import Mapping
 import hashlib
 import hmac
 import json
 import logging
 import re
+import secrets
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+from urllib.parse import unquote, urlsplit
 
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from jsonschema.exceptions import ValidationError
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from control_plane import meeting_steering
+from control_plane.minutes_erasure import ErasureNotFound, ErasurePending
+from control_plane.minutes_ingest import MinutesIngestDisabled, MinutesIngestError
+from control_plane.gateway_identity import (
+    GatewayReplayUnavailable,
+    GatewayIdentityVerifier,
+    InMemoryGatewayReplayStore,
+    RedisGatewayReplayStore,
+)
 from control_plane import schedule_digest as schedule_digest_mod
 from control_plane import routines as routines_mod
 from control_plane.config_preflight import NOT_CONFIGURED, capability_state, missing_capability_keys
 from shared import units
 from control_plane import workspace_routines as workspace_routines_mod
 from shared.agent_config import default_meeting_model, load_meeting_config
+from shared.meeting_retention import activate_processing_if_writable, bind_processing_deadline
+from shared.http import open_no_redirect, read_json_bounded
 from shared.seeding import resolve_seed_dir, seed_workspace, validate_seed
 from control_plane.workspace_attach import (
     CloneError,
@@ -73,8 +89,16 @@ from control_plane.workspace_reader import WorkspaceReader
 
 logger = logging.getLogger("agent_api.api")
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024
+MAX_UPLOAD_FILES = 100
+UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 MEETING_STREAM_TRANSCRIPT_REPLAY = 80
 MEETING_STREAM_OUTPUT_REPLAY = 160
+MAX_MINUTES_ERASURE_REQUEST_BYTES = 1024
+MAX_GATEWAY_SIGNED_BODY_BYTES = 32 * 1024 * 1024
+GATEWAY_SIGNED_BODY_READ_TIMEOUT_SECONDS = 10.0
+_TRUE_OPERATOR_FLAGS = frozenset({"1", "true", "yes", "on"})
+_FALSE_OPERATOR_FLAGS = frozenset({"", "0", "false", "no", "off"})
 # How long the SSE keeps draining after session_end when the copilot HAS written notes but its
 # view_end marker hasn't arrived (the final beat is ~10s of LLM; a dead worker never marks) —
 # the bounded cap that replaces the old one-empty-poll guess (ADR 0027).
@@ -241,6 +265,450 @@ LIVE_SILENCE_TTL_SEC = 60.0
 PROC_FLAG_BACKSTOP_TTL_SEC = 4 * 3600
 
 
+_AGENT_API_DIRECT_CREDENTIAL_ENV_NAMES = (
+    # Agent-owned runtime, identity, dispatch, bot, STT, and cross-spoke boundaries.
+    "VEXA_RUNTIME_CONTROL_SECRET",
+    "RUNTIME_CONTROL_SECRET",
+    "VEXA_AGENT_IDENTITY_TOKEN",
+    "VEXA_DISPATCH_SIGNING_KEY",
+    "VEXA_BOT_API_KEY",
+    "TRANSCRIPTION_SERVICE_TOKEN",
+    "ZAKI_READ_TOKEN_MINUTES",
+    "GATEWAY_IDENTITY_SECRET",
+    "GATEWAY_IDENTITY_PREVIOUS_SECRET",
+    "VEXA_INTERNAL_API_SECRET",
+    "INTERNAL_API_SECRET",
+    # Model-provider credentials brokered through agent-api into isolated workers.
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "VEXA_LLM_API_KEY",
+    # Raw Git credentials are not part of the supported brokered PAT path, but reject aliasing if
+    # an operator has nevertheless made one ambient to agent-api.
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "GL_TOKEN",
+    "BITBUCKET_TOKEN",
+    "GIT_TOKEN",
+    "VEXA_GIT_TOKEN",
+    # These credentials are normally absent/explicitly cleared on agent-api.  Inventorying them
+    # closes direct-start and extra-environment projection mistakes without granting their use.
+    "ADMIN_TOKEN",
+    "ADMIN_API_TOKEN",
+    "RUNTIME_CALLBACK_SECRET",
+    "MEETING_TOKEN_SECRET",
+    "REDIS_PASSWORD",
+    "VEXA_REDIS_PASSWORD",
+    "NEXTAUTH_SECRET",
+    "DB_PASSWORD",
+    "MINIO_ROOT_USER",
+    "MINIO_ROOT_PASSWORD",
+    "MINIO_ACCESS_KEY",
+    "MINIO_SECRET_KEY",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "GOOGLE_CLIENT_SECRET",
+    "MICROSOFT_CLIENT_SECRET",
+    "VEXA_API_KEY",
+    "ZAKI_MINUTES_HUB_TOKEN",
+    "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET",
+    "ZAKI_MINUTES_ERASURE_SIGNING_SECRET",
+    "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+    "ZAKI_MINUTES_FINALIZED_SECRET",
+)
+_AGENT_API_CREDENTIAL_URL_ENV_NAMES = (
+    "VEXA_REDIS_URL",
+    "REDIS_URL",
+    "DATABASE_URL",
+    "ANTHROPIC_BASE_URL",
+    "VEXA_LLM_BASE_URL",
+    "TRANSCRIPTION_SERVICE_URL",
+    "ZAKI_MINUTES_READ_BASE_URL",
+    "VEXA_RUNTIME_API_URL",
+    "VEXA_GATEWAY_URL",
+    "VEXA_ADMIN_API_URL",
+    "VEXA_MEETING_API_URL",
+)
+
+
+def _agent_api_credential_values(
+    environment: Mapping[str, object] | None,
+    *,
+    excluded_names: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    """Return credential material visible to agent-api without retaining names in failures."""
+
+    if environment is None:
+        return ()
+    if not isinstance(environment, Mapping):
+        raise RuntimeError("Agent erasure credential inventory is invalid")
+    values = [
+        value
+        for name in _AGENT_API_DIRECT_CREDENTIAL_ENV_NAMES
+        if name not in excluded_names
+        if isinstance((value := environment.get(name)), str) and value
+    ]
+    for name in _AGENT_API_CREDENTIAL_URL_ENV_NAMES:
+        if name in excluded_names:
+            continue
+        raw = environment.get(name)
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            parsed = urlsplit(raw)
+            embedded = (parsed.username, parsed.password)
+        except ValueError:
+            continue
+        values.extend(unquote(value) for value in embedded if value)
+    return tuple(values)
+
+
+def _valid_agent_erasure_secret(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 32 <= len(value) <= 512
+        and value == value.strip()
+        and all(0x20 <= ord(character) <= 0x7E for character in value)
+    )
+
+
+def _agent_erasure_secret_matches(left: str, right: object) -> bool:
+    return (
+        isinstance(right, str)
+        and right.isascii()
+        and hmac.compare_digest(left, right)
+    )
+
+
+def _validate_gateway_identity_config(
+    *,
+    required: bool,
+    secret: object,
+    previous_secret: object = "",
+    internal_secret: object = "",
+    credential_environment: "Mapping[str, object] | None" = None,
+) -> None:
+    """Validate the dedicated Gateway→Agent proof without exposing its material.
+
+    A cluster-wide internal credential cannot prove Gateway origin because every holder could mint
+    a request signature. The dedicated HMAC key is therefore required for hardened ingress/Minutes
+    routes and must be both strong and distinct from every other credential visible to agent-api.
+    """
+
+    if secret in (None, ""):
+        if previous_secret not in (None, ""):
+            raise RuntimeError(
+                "GATEWAY_IDENTITY_PREVIOUS_SECRET requires GATEWAY_IDENTITY_SECRET"
+            )
+        if required:
+            raise RuntimeError(
+                "GATEWAY_IDENTITY_SECRET is required when gateway identity is enforced"
+            )
+        return
+    if not _valid_agent_erasure_secret(secret):
+        raise RuntimeError(
+            "GATEWAY_IDENTITY_SECRET must be unpadded printable ASCII between "
+            "32 and 512 characters"
+        )
+    assert isinstance(secret, str)
+    if previous_secret not in (None, ""):
+        if not _valid_agent_erasure_secret(previous_secret):
+            raise RuntimeError(
+                "GATEWAY_IDENTITY_PREVIOUS_SECRET must be unpadded printable ASCII between "
+                "32 and 512 characters"
+            )
+        assert isinstance(previous_secret, str)
+        if _agent_erasure_secret_matches(secret, previous_secret):
+            raise RuntimeError("Gateway identity rotation secrets must be distinct")
+    other_credentials = (
+        ((internal_secret,) if internal_secret else ())
+        + _agent_api_credential_values(
+            credential_environment,
+            excluded_names=frozenset({
+                "GATEWAY_IDENTITY_SECRET",
+                "GATEWAY_IDENTITY_PREVIOUS_SECRET",
+            }),
+        )
+    )
+    gateway_secrets = (secret,) + (
+        (previous_secret,) if isinstance(previous_secret, str) and previous_secret else ()
+    )
+    if any(
+        _agent_erasure_secret_matches(gateway_secret, credential)
+        for gateway_secret in gateway_secrets
+        for credential in other_credentials
+    ):
+        raise RuntimeError(
+            "GATEWAY_IDENTITY_SECRET must be distinct from every agent-api credential"
+        )
+
+
+def _security_redis_from_url(redis_url: str):
+    """Build the synchronous security-state client with finite failure latency."""
+    from redis import Redis
+
+    return Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=2.0,
+        socket_timeout=2.0,
+        retry_on_timeout=False,
+        health_check_interval=30,
+    )
+
+
+def _validate_agent_erasure_signing_config(
+    *,
+    capture_enabled: "str | None",
+    key_id: "str | None",
+    secret: "str | None",
+    previous_key_id: "str | None" = None,
+    previous_secret: "str | None" = None,
+    internal_secret: "str | None" = None,
+    credential_environment: "Mapping[str, object] | None" = None,
+) -> None:
+    """Require the operator-owned receipt signer only when managed capture is active."""
+
+    raw = (capture_enabled or "").strip().lower()
+    if raw not in _TRUE_OPERATOR_FLAGS:
+        if raw not in _FALSE_OPERATOR_FLAGS:
+            raise RuntimeError("ZAKI_MINUTES_CAPTURE_ENABLED must be a boolean operator flag")
+        previous_configured = any(
+            value is not None and value != ""
+            for value in (previous_key_id, previous_secret)
+        )
+        if previous_configured:
+            raise RuntimeError(
+                "Agent erasure previous verification key requires "
+                "ZAKI_MINUTES_CAPTURE_ENABLED=true"
+            )
+        return
+    if not isinstance(key_id, str) or not _ERASURE_KEY_ID.fullmatch(key_id):
+        raise RuntimeError(
+            "ZAKI_MINUTES_CAPTURE_ENABLED requires ZAKI_AGENT_ERASURE_SIGNING_KEY_ID"
+        )
+    if not isinstance(secret, str) or not secret:
+        raise RuntimeError(
+            "ZAKI_MINUTES_CAPTURE_ENABLED requires ZAKI_AGENT_ERASURE_SIGNING_SECRET"
+        )
+    if not _valid_agent_erasure_secret(secret):
+        raise RuntimeError(
+            "ZAKI_AGENT_ERASURE_SIGNING_SECRET must be unpadded printable ASCII "
+            "between 32 and 512 characters"
+        )
+    has_previous_id = previous_key_id is not None and previous_key_id != ""
+    has_previous_secret = previous_secret is not None and previous_secret != ""
+    if has_previous_id != has_previous_secret:
+        raise RuntimeError(
+            "Agent erasure previous verification key id and secret must be configured together"
+    )
+    if has_previous_id and (
+        not isinstance(previous_key_id, str)
+        or not _ERASURE_KEY_ID.fullmatch(previous_key_id)
+        or previous_key_id == key_id
+        or not _valid_agent_erasure_secret(previous_secret)
+        or _agent_erasure_secret_matches(secret, previous_secret)
+    ):
+        raise RuntimeError("Agent erasure previous verification key is invalid")
+    erasure_secrets = (secret,) + ((previous_secret,) if has_previous_secret else ())
+    other_credentials = (
+        ((internal_secret,) if internal_secret else ())
+        + _agent_api_credential_values(credential_environment)
+    )
+    if any(
+        _agent_erasure_secret_matches(erasure_secret, credential)
+        for erasure_secret in erasure_secrets
+        for credential in other_credentials
+    ):
+        raise RuntimeError(
+            "Agent erasure secrets must be distinct from every agent-api credential"
+        )
+
+
+def _require_minutes_erasure_backend(
+    *, capture_enabled: "str | None", eraser: "object | None",
+) -> "object | None":
+    """Fail boot when Minutes capture is mounted without its Agent-owned erasure stores.
+
+    A route that merely returns 503 is not an erasure implementation: capture could create Agent
+    derivatives while production had no Brain provenance purge. Keep activation impossible until a
+    production composition supplies the real transactional eraser.
+    """
+
+    raw = (capture_enabled or "").strip().lower()
+    if raw in _TRUE_OPERATOR_FLAGS:
+        if eraser is None:
+            raise RuntimeError(
+                "ZAKI_MINUTES_CAPTURE_ENABLED requires an Agent Brain provenance eraser"
+            )
+        return eraser
+    if raw in _FALSE_OPERATOR_FLAGS:
+        return eraser
+    raise RuntimeError("ZAKI_MINUTES_CAPTURE_ENABLED must be a boolean operator flag")
+
+
+def _wrap_signed_minutes_eraser(
+    eraser: "object | None",
+    *,
+    redis_client: object | None,
+    key_id: str,
+    secret: str,
+    previous_key_id: str | None = None,
+    previous_secret: str | None = None,
+    internal_secret: str = "",
+    credential_environment: "Mapping[str, object] | None" = None,
+    clock: "Callable[[], datetime] | None" = None,
+    nonce: "Callable[[], str] | None" = None,
+) -> "object | None":
+    """Compose the canonical persisted ``erasure.v1`` proof around a real raw eraser.
+
+    ``None`` is deliberately inert so a default-off production boot does not construct Redis or
+    signer dependencies.  A present raw eraser is never exposed directly: missing/colliding signer
+    material fails composition before the HTTP route can mount it.
+    """
+
+    _validate_agent_erasure_signing_config(
+        capture_enabled="true" if eraser is not None else "false",
+        key_id=key_id,
+        secret=secret,
+        previous_key_id=previous_key_id,
+        previous_secret=previous_secret,
+        internal_secret=internal_secret,
+        credential_environment=credential_environment,
+    )
+    if eraser is None:
+        return None
+    if redis_client is None:
+        raise RuntimeError("Agent Minutes erasure requires its durable receipt store")
+    from control_plane.agent_erasure_receipts import (
+        AgentErasureV1Signer,
+        RedisAgentErasureReceiptStore,
+        SignedAgentMinutesErasure,
+    )
+
+    signer = AgentErasureV1Signer(
+        key_id=key_id,
+        secret=secret,
+        previous_key_id=previous_key_id,
+        previous_secret=previous_secret,
+        clock=clock or (lambda: datetime.now(timezone.utc)),
+        nonce=nonce or (lambda: secrets.token_urlsafe(24)),
+    )
+    return SignedAgentMinutesErasure(
+        eraser=eraser,
+        receipts=RedisAgentErasureReceiptStore(redis_client, signer=signer),
+    )
+
+
+_AGENT_ERASURE_RECEIPT_FIELDS = frozenset({
+    "version", "owner", "scope", "subject", "counts", "issued_at",
+    "key_id", "nonce", "digest", "signature",
+})
+_AGENT_ERASURE_COUNT_FIELDS = frozenset({
+    "agent_unit_streams", "agent_workspace_documents", "agent_brain_records",
+})
+_ERASURE_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_ERASURE_NONCE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+_ERASURE_SHA256 = re.compile(r"^sha256=[0-9a-f]{64}$")
+
+
+def _is_exact_agent_meeting_erasure_receipt(
+    receipt: object, *, user_id: int, meeting_id: str,
+) -> bool:
+    """Shape/context guard for the already-signed in-process erasure result.
+
+    Cryptographic verification belongs to the persistent wrapper/store.  This final mediation gate
+    prevents a raw or legacy eraser from being accidentally mounted and returned over the wire.
+    """
+
+    if not isinstance(receipt, dict) or set(receipt) != _AGENT_ERASURE_RECEIPT_FIELDS:
+        return False
+    if (
+        receipt.get("version") != "erasure.v1"
+        or receipt.get("owner") != "agent"
+        or receipt.get("scope") != "meeting"
+        or receipt.get("subject") != {
+            "user_id": str(user_id), "meeting_id": meeting_id,
+        }
+    ):
+        return False
+    counts = receipt.get("counts")
+    if not isinstance(counts, dict) or set(counts) != _AGENT_ERASURE_COUNT_FIELDS:
+        return False
+    if any(
+        type(counts.get(field)) is not int or not 0 <= counts[field] <= 2_147_483_647
+        for field in _AGENT_ERASURE_COUNT_FIELDS
+    ):
+        return False
+    if (
+        not isinstance(receipt.get("issued_at"), str)
+        or not isinstance(receipt.get("key_id"), str)
+        or not _ERASURE_KEY_ID.fullmatch(receipt["key_id"])
+        or not isinstance(receipt.get("nonce"), str)
+        or not _ERASURE_NONCE.fullmatch(receipt["nonce"])
+        or not isinstance(receipt.get("digest"), str)
+        or not _ERASURE_SHA256.fullmatch(receipt["digest"])
+        or not isinstance(receipt.get("signature"), str)
+        or not _ERASURE_SHA256.fullmatch(receipt["signature"])
+    ):
+        return False
+    try:
+        issued = datetime.fromisoformat(receipt["issued_at"].replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (
+        issued.tzinfo is not None
+        and issued.utcoffset() is not None
+        and issued.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        == receipt["issued_at"]
+    )
+
+
+def _owned_processing_deadline_ms(owned: dict) -> int | None:
+    """Resolve the immutable processed-content cutoff from one already owner-checked row.
+
+    Ordinary upstream meetings carry neither ZAKI authority object and keep their legacy unbounded
+    processing semantics. Any partial/malformed managed authority fails closed.
+    """
+    data = owned.get("data")
+    if not isinstance(data, dict):
+        return None
+    capture = data.get("zaki_capture")
+    retention = data.get("zaki_retention")
+    if capture is None and retention is None:
+        return None
+    if (
+        not isinstance(capture, dict)
+        or capture.get("state") != "authorized"
+        or not isinstance(retention, dict)
+        or retention.get("state") != "open"
+    ):
+        raise ValueError("managed meeting processing authority is unavailable")
+    expired = retention.get("expired_scopes", [])
+    if (
+        not isinstance(expired, list)
+        or any(scope in expired for scope in ("transcript", "summary"))
+    ):
+        raise ValueError("managed meeting processing authority is unavailable")
+    expiries = retention.get("scope_expiries")
+    if not isinstance(expiries, dict):
+        raise ValueError("managed meeting processing authority is unavailable")
+    parsed: list[datetime] = []
+    for scope in ("transcript", "summary"):
+        value = expiries.get(scope)
+        if not isinstance(value, str):
+            raise ValueError("managed meeting processing authority is unavailable")
+        try:
+            expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("managed meeting processing authority is unavailable") from None
+        if expiry.tzinfo is None or expiry.utcoffset() != timedelta(0):
+            raise ValueError("managed meeting processing authority is unavailable")
+        parsed.append(expiry)
+    return int(min(parsed).timestamp() * 1000)
+
+
 class _LiveMeetings:
     """In-memory registry of meeting copilots — the terminal's 'meetings' feed. Keyed by session_uid (the
     native Meet code). A stopped/ended meeting is KEPT (``status='stopped'``) so the terminal can offer to
@@ -265,6 +733,10 @@ class _LiveMeetings:
     def drop(self, session_uid: str) -> None:
         # the meeting ended — keep the row (stopped) so 'send the bot back' stays available
         self.stop(session_uid)
+
+    def erase(self, session_uid: str) -> None:
+        """Forget an erased row entirely; unlike an ordinary end, it must not remain discoverable."""
+        self._by_uid.pop(session_uid, None)
 
     def list(self) -> list[dict]:
         now = time.monotonic()
@@ -482,10 +954,9 @@ class MeetingProcess(BaseModel):
     native_id: str
     platform: str = "google_meet"
     on: bool
-    # P0 (cross-tenant leak fix): the meetings-domain ROW id (unique per meeting run). When the terminal
-    # knows it (POST /bots returns it), the copilot's opt-in flag + cursor + processed stream key on it —
-    # so a re-sent bot on the same native link, or a DIFFERENT tenant on the same link, can never
-    # arm/clobber/read another meeting's processing. Falls back to native only when absent (legacy).
+    # P0: the meetings-domain ROW id (unique per owner/run). The handler requires a positive numeric
+    # value, owner-scopes it, and binds `native_id` to that row; there is intentionally no native-id
+    # fallback because native links collide across tenants and have no permanent retention fence.
     meeting_id: Optional[str] = None
     subject: Optional[str] = None  # DERIVED from X-User-Id (P20); ignored if sent.
 
@@ -550,7 +1021,22 @@ def _model_creds_error_message() -> str:
     )
 
 
+def _model_blocked_error_message() -> str:
+    return (
+        "Your personal model configuration is blocked by operator policy, so the agent cannot run. "
+        "Choose an approved endpoint under Settings → Models or ask an operator to approve the current one."
+    )
+
+
 MEETING_CHAT_TRANSCRIPT_SEGMENTS = 400  # bound the live transcript folded into a meeting-chat prompt
+# A transcript entry may refine prior segment ids, so read a small bounded multiple of the desired
+# unique lines. This is a hard Redis fanout cap: chat grounding never XRANGEs an entire long meeting.
+MEETING_CHAT_STREAM_ENTRY_MULTIPLIER = 4
+MEETING_CHAT_STREAM_MAX_ENTRIES = 1600
+
+
+def _meeting_chat_entry_budget(limit: int) -> int:
+    return min(MEETING_CHAT_STREAM_MAX_ENTRIES, max(1, limit * MEETING_CHAT_STREAM_ENTRY_MULTIPLIER))
 
 
 def _fold_meeting_transcript(redis_url: "str | None", stream_key: str, *, limit: int) -> str:
@@ -566,17 +1052,31 @@ def _fold_meeting_transcript(redis_url: "str | None", stream_key: str, *, limit:
         import redis
 
         r = redis.from_url(redis_url, decode_responses=True)
-        rows = r.xrange(f"tc:meeting:{stream_key}")
+        # XREVRANGE applies COUNT server-side. Reverse the bounded tail locally so refinement/order
+        # semantics remain chronological without materializing the complete meeting.
+        rows = list(reversed(r.xrevrange(
+            f"tc:meeting:{stream_key}", count=_meeting_chat_entry_budget(limit)
+        )))
     except Exception as exc:  # noqa: BLE001 — grounding is best-effort; never fail the chat turn
         logger.warning("could not read transcript for %s: %s", stream_key, exc)
         return ""
     order: list[str] = []
     seg_by_id: dict[str, dict] = {}
     for entry_id, fields in rows:
-        payload = json.loads(fields.get("payload", "{}"))
+        try:
+            payload = json.loads(fields.get("payload", "{}"))
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
         if payload.get("type") == "session_end":
             continue
-        for i, seg in enumerate(payload.get("segments", [])):
+        segments = payload.get("segments", [])
+        if not isinstance(segments, list):
+            continue
+        for i, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
             sid = str(seg.get("segment_id") or f"{entry_id}:{i}")
             if sid not in seg_by_id:
                 order.append(sid)
@@ -584,10 +1084,10 @@ def _fold_meeting_transcript(redis_url: "str | None", stream_key: str, *, limit:
     lines: list[str] = []
     for sid in order[-limit:]:
         seg = seg_by_id[sid]
-        text = (seg.get("text") or "").strip()
+        text = str(seg.get("text") or "").strip()
         if not text:
             continue
-        speaker = (seg.get("speaker") or "Speaker").strip()
+        speaker = str(seg.get("speaker") or "Speaker").strip()
         lines.append(f"{speaker}: {text}")
     return "\n".join(lines)
 
@@ -604,7 +1104,9 @@ def _fold_meeting_processed(redis_url: "str | None", stream_key: str, *, limit: 
         import redis
 
         r = redis.from_url(redis_url, decode_responses=True)
-        rows = r.xrange(f"proc:meeting:{stream_key}")
+        rows = list(reversed(r.xrevrange(
+            f"proc:meeting:{stream_key}", count=_meeting_chat_entry_budget(limit)
+        )))
     except Exception as exc:  # noqa: BLE001 — grounding is best-effort; never fail the chat turn
         logger.warning("could not read processed notes for %s: %s", stream_key, exc)
         return ""
@@ -620,6 +1122,8 @@ def _fold_meeting_processed(redis_url: "str | None", stream_key: str, *, limit: 
             note = json.loads(raw)
         except (TypeError, ValueError):
             continue
+        if not isinstance(note, dict):
+            continue
         nid = str(note.get("id") or entry_id)
         if nid not in note_by_id:
             order.append(nid)
@@ -627,10 +1131,10 @@ def _fold_meeting_processed(redis_url: "str | None", stream_key: str, *, limit: 
     lines: list[str] = []
     for nid in order[-limit:]:
         note = note_by_id[nid]
-        text = (note.get("text") or "").strip()
+        text = str(note.get("text") or "").strip()
         if not text:
             continue
-        speaker = (note.get("speaker") or "Speaker").strip()
+        speaker = str(note.get("speaker") or "Speaker").strip()
         lines.append(f"{speaker}: {text}")
     return "\n".join(lines)
 
@@ -644,31 +1148,27 @@ def _meeting_grounding(
 
       prep (idle/scheduled)          — no transcript fold (none exists); steer toward preparation,
                                        naming the bound prep workspace when the client sent one.
-      live (default; absent status)  — fold ``tc:meeting:{row}`` fresh on every turn — a legacy
-                                       client that sends no status keeps exactly this behavior.
-      post (completed/failed/stopped)— fold the PROCESSED notes ``proc:meeting:{row}``; fall back to
-                                       the raw transcript; if neither exists say so plainly (fail loud,
-                                       never fabricate).
+      live/post                     — never copy raw/processed meeting content into the generic-chat
+                                      prompt. Require the dedicated bounded Minutes read path and fail
+                                      honestly while it is disabled or unavailable.
 
-    The transcript reaches the agent the SAME way the live copilot gets it: the meeting's redis Stream
-    (the meetings⊥agent seam) — NOT a file, NOT a cross-domain HTTP call, NO token. Returns the plain
-    (none-context, no tools, prompt) when the active tab isn't a meeting."""
+    Generic chat prompts are durable carriers (Redis warm delivery plus harness continuity), so they
+    are not an acceptable transport for transcript PII. Returns the plain (none-context, no tools,
+    prompt) when the active tab isn't a meeting."""
     a = active or {}
     if a.get("kind") != "meeting":
         return ({"kind": "none", "session": session}, [], prompt)
     m = a.get("meeting") or a  # tolerate {kind, meeting:{…}} or a flat {kind, platform, native_id}
-    native = m.get("native_id") or m.get("ref")
+    row_id = str(m.get("meeting_id") or "").strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", row_id):
+        return ({"kind": "none", "session": session}, [], prompt)
+    native = m.get("native_id") or m.get("ref") or row_id
     if not native:
         return ({"kind": "none", "session": session}, [], prompt)
     platform = m.get("platform") or "google_meet"
     # A chat turn (trigger "message"), not a live-meeting serve — the transcript travels in the prompt,
     # so the dispatch context stays plain (no meeting env / serve path is engaged for a chat).
     ctx = {"kind": "none", "session": session}
-    # P0 (cross-tenant leak fix): read the streams by the meetings-domain ROW id (``meeting_id``),
-    # which the terminal passes on the active meeting — the carriers key on it, never the native id
-    # (which would fold a DIFFERENT tenant's / an older row's transcript into this user's chat).
-    # Fall back to native only when the client didn't send a row id (legacy), documented as best-effort.
-    stream_key = str(m.get("meeting_id") or native)
     status = str(m.get("status") or "").strip().lower()
     phase = meeting_steering.phase_for(status)
     fields = {
@@ -693,26 +1193,11 @@ def _meeting_grounding(
         )
         return (ctx, [], meeting_steering.render("prep", fields) + prompt)
 
-    if phase == "post":
-        fields["failed"] = " — the bot FAILED during this meeting" if status == "failed" else ""
-        folded = _fold_meeting_processed(redis_url, stream_key, limit=MEETING_CHAT_TRANSCRIPT_SEGMENTS)
-        if folded:
-            fields["source"] = "processed notes (cleaned transcript)"
-        else:
-            folded = _fold_meeting_transcript(redis_url, stream_key, limit=MEETING_CHAT_TRANSCRIPT_SEGMENTS)
-            fields["source"] = "raw transcript"
-        if not folded:
-            return (ctx, [], meeting_steering.NO_RECORD_POST.format(**fields) + prompt)
-        fields["transcript"] = folded
-        return (ctx, [], meeting_steering.render("post", fields) + prompt)
-
-    transcript = _fold_meeting_transcript(redis_url, stream_key, limit=MEETING_CHAT_TRANSCRIPT_SEGMENTS)
-    if transcript:
-        fields["transcript"] = transcript
-        preamble = meeting_steering.render("live", fields)
-    else:
-        preamble = meeting_steering.NO_TRANSCRIPT_LIVE.format(platform=platform, native=native)
-    return (ctx, [], preamble + prompt)
+    # The legacy path folded tc:/proc: Redis content into `prompt`. Dispatcher then XADDed that full
+    # prompt to a durable generic-chat input stream and the harness linked it into durable continuity
+    # state. A row-scoped Minutes eraser cannot prove those secondary copies gone. Never inspect the
+    # carriers here: the bounded, non-persistent Minutes path is the sole allowed meeting-content read.
+    return (ctx, [], meeting_steering.MINUTES_READ_REQUIRED + prompt)
 
 
 # The grounding/user-message boundary marker. Every server-folded context block (kg-links + mounts,
@@ -783,10 +1268,12 @@ def _fold_workspace_grounding(mounts: "list", slug: str) -> str:
     return meeting_steering.render("workspace_focus", fields)
 
 
-def _enriched_meeting_focus(focus: dict, rows: "list[dict]") -> dict:
+def _enriched_meeting_focus(focus: dict, rows: "list[dict]") -> "dict | None":
     """Overlay the SERVER row's truth onto the client-sent meeting focus — status/title/
     scheduled_at/workspace_id come from the meetings domain when the row is found; the client's
-    values remain only as the fallback (legacy clients / row not fetched)."""
+    values remain only as display fallbacks after an owned server row is found. ``None`` means the
+    caller-supplied identity was not present in the authenticated user's meeting list and must not be
+    used to address Redis carriers."""
     nid = focus.get("native_id") or focus.get("ref")
     row = schedule_digest_mod.find_row(
         rows, meeting_id=focus.get("meeting_id"), platform=focus.get("platform"), native_id=nid)
@@ -795,7 +1282,7 @@ def _enriched_meeting_focus(focus: dict, rows: "list[dict]") -> dict:
         # NULL there) — it rides in native_id, so retry it as the row id before giving up.
         row = schedule_digest_mod.find_row(rows, meeting_id=nid)
     if row is None:
-        return focus
+        return None
     data = row.get("data") or {}
     merged = dict(focus)
     merged["meeting_id"] = row.get("id", focus.get("meeting_id"))
@@ -847,7 +1334,12 @@ def _context_grounding(
             preamble = digest + meeting_steering.render("schedule", {})
 
     if kind == "meeting":
-        enriched = _enriched_meeting_focus(dict(focus), rows) if rows else dict(focus)
+        enriched = _enriched_meeting_focus(dict(focus), rows) if rows else None
+        if enriched is None:
+            # Meeting context is an active data read, not harmless presentation metadata. If the
+            # owner-scoped schedule source is empty/down or does not contain this row, never fold a
+            # client-supplied Redis id/native link into the model prompt.
+            return (ctx, [], preamble + prompt)
         _c, _t, folded_prompt = _meeting_grounding(enriched, session, prompt, redis_url)
         return (_c, _t, preamble + folded_prompt if preamble else folded_prompt)
 
@@ -874,9 +1366,10 @@ def _context_grounding(
 # agent-api has no meetings DB; it asks meeting-api `GET /meetings/{meeting_id}` forwarding the
 # gateway-injected `X-User-Id` (meeting-api's `_resolve_user_id` trusts it exactly as its by-id path does)
 # — a row owned by another user (or absent) returns 404 there → we treat it as NOT-OWNED. The returned
-# record's `native_meeting_id` also lets us confirm the requested `session_uid` belongs to the SAME owned
-# meeting, so B can't pair its own row with A's native to sniff A's copilot out-stream. Returns the owned
-# meeting record (dict) on success, else None. Injectable so the L2 suite drives it over a fake.
+# record is revalidated here rather than trusted as an untyped transport response. The canonical row is
+# the ONLY transcript/copilot carrier address: native meeting links can be reused across tenants, so they
+# must never select a Redis stream. Returns the owned meeting record (dict) on success, else None.
+# Injectable so the L2 suite drives it over a fake.
 def _http_meeting_owner_lookup(meeting_api_url: str):
     """Build the default owner-lookup: GET {meeting_api_url}/meetings/{id} with the caller's X-User-Id.
     Returns a callable ``(user_id: str, meeting_id: str) -> dict | None`` (the owned meeting record, or
@@ -892,10 +1385,11 @@ def _http_meeting_owner_lookup(meeting_api_url: str):
         try:
             req = urllib.request.Request(
                 f"{base}/meetings/{int(meeting_id)}", headers={"X-User-Id": str(user_id)})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with open_no_redirect(req, timeout=5) as resp:
                 if resp.status != 200:
                     return None
-                return json.loads(resp.read().decode() or "null")
+                record = read_json_bounded(resp)
+                return record if isinstance(record, dict) else None
         except urllib.error.HTTPError:
             return None   # 404 (not owned / absent) or any other status → refuse
         except Exception:  # noqa: BLE001 — meeting-api unreachable → fail CLOSED, never open the stream
@@ -916,6 +1410,9 @@ def create_app(
     membership_index: Optional[MembershipIndex] = None,
     meeting_owner_lookup: "Optional[object]" = None,
     schedule_source: "Optional[Callable[[str], list]]" = None,
+    minutes_eraser: "Optional[object]" = None,
+    minutes_ingestor: "Optional[object]" = None,
+    gateway_replay_store: "Optional[object]" = None,
 ) -> FastAPI:
     if sessions is not None:
         sess = sessions
@@ -926,6 +1423,9 @@ def create_app(
     else:
         sess = _Sessions()
     live = _LiveMeetings()
+    bind_live = getattr(minutes_eraser, "bind_live_registry", None)
+    if callable(bind_live):
+        bind_live(live)
     wsr = reader or WorkspaceReader("/workspaces")
     mindex: MembershipIndex = membership_index if membership_index is not None else InMemoryMembershipIndex()
     app = FastAPI(title="vexa-agent-api", version="0.12.0")
@@ -948,11 +1448,132 @@ def create_app(
     # current dev/direct topology the terminal and host-local clients reach agent-api WITHOUT the gateway
     # hop (compose loopback + VEXA_AGENT_DEFAULT_SUBJECT fallback), so those headers are spoofable and
     # restricted-mode invites MUST NOT be relied on as a security boundary here. A hardened deploy sets
-    # VEXA_REQUIRE_GATEWAY_IDENTITY=1: agent-api then rejects any request lacking the gateway's signed
-    # identity marker (X-Gateway-Verified), so identity headers are only honored when the gateway put
-    # them there. OFF by default so the dev/direct topology keeps working. Full fix = route the terminal
-    # through the gateway (Stage 4) and make the gateway the only thing that can reach agent-api.
-    _require_gateway_identity = os.environ.get("VEXA_REQUIRE_GATEWAY_IDENTITY", "").strip().lower() in ("1", "true", "yes")
+    # VEXA_REQUIRE_GATEWAY_IDENTITY=1: agent-api then rejects any request lacking a fresh Gateway HMAC
+    # bound to the exact method/path/user. The signing key never crosses the network and every nonce is
+    # claimed once. OFF by default so the dev/direct topology keeps working. Full fix = route the
+    # terminal through the gateway (Stage 4) and make the gateway the only ingress to agent-api.
+    _require_gateway_identity = (
+        settings.require_gateway_identity if settings is not None else False
+    )
+    _gateway_identity_secret = (
+        settings.gateway_identity_secret.get_secret_value()
+        if settings is not None else ""
+    )
+    _gateway_identity_previous_secret = (
+        settings.gateway_identity_previous_secret.get_secret_value()
+        if settings is not None else ""
+    )
+    _internal_api_secret = (
+        settings.internal_api_secret.get_secret_value()
+        if settings is not None else ""
+    )
+    _validate_gateway_identity_config(
+        required=_require_gateway_identity or minutes_ingestor is not None,
+        secret=_gateway_identity_secret,
+        previous_secret=_gateway_identity_previous_secret,
+        internal_secret=_internal_api_secret,
+    )
+    _gateway_identity_verifier = None
+    if _require_gateway_identity or minutes_ingestor is not None:
+        replay_store = gateway_replay_store or InMemoryGatewayReplayStore()
+        _gateway_identity_verifier = GatewayIdentityVerifier(
+            _gateway_identity_secret,
+            previous_secret=_gateway_identity_previous_secret,
+            replay_store=replay_store,
+        )
+
+    def _gateway_error(
+        status_code: int, detail: str, *, headers: "Mapping[str, str] | None" = None,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {"detail": detail},
+            status_code=status_code,
+            headers={"Cache-Control": "no-store", **dict(headers or {})},
+        )
+
+    def _requires_gateway_proof(request: Request) -> bool:
+        path = request.url.path
+        if minutes_ingestor is not None and path == "/api/minutes/summarize-last":
+            return True
+        return (
+            _require_gateway_identity
+            and path.startswith("/api/")
+            and not path.startswith("/api/admin/")
+        )
+
+    @app.middleware("http")
+    async def _verify_gateway_request(request: Request, call_next):
+        """Authenticate metadata first, then bounded body bytes, then claim the nonce.
+
+        Gateway already drains and caps the public body before signing, so the internal body should
+        arrive promptly. Repeating both the byte and time bounds here prevents a direct/slow caller
+        from turning proof verification into unbounded buffering or event-loop blocking.
+        """
+        if not _requires_gateway_proof(request):
+            return await call_next(request)
+        subject = request.headers.get("x-user-id", "")
+        try:
+            query = request.scope.get("query_string", b"").decode("ascii")
+        except (AttributeError, UnicodeDecodeError):
+            return _gateway_error(401, "verified gateway identity required")
+        if _gateway_identity_verifier is None or not subject:
+            return _gateway_error(401, "verified gateway identity required")
+        proof = _gateway_identity_verifier.authenticate_metadata(
+            method=request.method,
+            path=request.url.path,
+            user_id=subject,
+            query=query,
+            headers=request.headers,
+        )
+        if proof is None:
+            return _gateway_error(401, "verified gateway identity required")
+
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_bytes = int(declared)
+            except ValueError:
+                return _gateway_error(400, "invalid request body length")
+            if declared_bytes < 0 or declared_bytes > MAX_GATEWAY_SIGNED_BODY_BYTES:
+                return _gateway_error(413, "request body too large")
+        chunks: list[bytes] = []
+        received = 0
+        try:
+            async with asyncio.timeout(GATEWAY_SIGNED_BODY_READ_TIMEOUT_SECONDS):
+                async for chunk in request.stream():
+                    received += len(chunk)
+                    if received > MAX_GATEWAY_SIGNED_BODY_BYTES:
+                        return _gateway_error(413, "request body too large")
+                    chunks.append(chunk)
+        except TimeoutError:
+            return _gateway_error(408, "request body timed out")
+        except Exception:
+            return _gateway_error(400, "request body is invalid")
+        body = b"".join(chunks)
+        request._body = body  # Starlette's wrapped receive replays this cache to FastAPI parsers.
+        try:
+            verified = await run_in_threadpool(
+                _gateway_identity_verifier.verify_body_and_claim,
+                proof,
+                body,
+            )
+        except GatewayReplayUnavailable:
+            return _gateway_error(
+                503,
+                "gateway identity boundary is unavailable",
+                headers={"Retry-After": "1"},
+            )
+        if not verified:
+            return _gateway_error(401, "verified gateway identity required")
+        request.state.gateway_identity_scope = (request.method, request.url.path, subject)
+        return await call_next(request)
+
+    def _gateway_subject(request: Request, *, detail: str) -> str:
+        subject = request.headers.get("x-user-id", "")
+        proof_scope = (request.method, request.url.path, subject)
+        if getattr(request.state, "gateway_identity_scope", None) == proof_scope:
+            return subject
+        raise HTTPException(status_code=401, detail=detail)
 
     def subject_of(request: Request) -> str:
         """The authenticated subject (P20). The gateway resolves the api-key → user_id and injects
@@ -960,13 +1581,13 @@ def create_app(
         client body/query. Fail-closed (401) when the header is absent, unless a single-user fallback
         (``VEXA_AGENT_DEFAULT_SUBJECT``) is configured for a direct/self-host deploy with no gateway in front.
 
-        When ``VEXA_REQUIRE_GATEWAY_IDENTITY`` is set, the request must additionally carry the gateway's
-        signed identity marker (``X-Gateway-Verified``) — a hardened deploy enforces that identity headers
-        were injected by the gateway, not forged by a direct/host-local caller (see the TOPOLOGY BOUNDARY
-        note above). This does NOT change the default dev/direct topology."""
-        if _require_gateway_identity and not request.headers.get("x-gateway-verified"):
-            raise HTTPException(status_code=401,
-                                detail="gateway-signed identity required (VEXA_REQUIRE_GATEWAY_IDENTITY)")
+        When ``VEXA_REQUIRE_GATEWAY_IDENTITY`` is set, the request must additionally carry a fresh,
+        request-bound Gateway signature. This does not change the default dev/direct topology."""
+        if _require_gateway_identity:
+            return _gateway_subject(
+                request,
+                detail="verified gateway identity required (VEXA_REQUIRE_GATEWAY_IDENTITY)",
+            )
         uid = request.headers.get("x-user-id")
         if uid:
             return uid
@@ -974,6 +1595,49 @@ def create_app(
         if fallback:
             return fallback
         raise HTTPException(status_code=401, detail="missing X-User-Id (agent-api is fronted by the gateway)")
+
+    if minutes_ingestor is not None:
+        _validate_gateway_identity_config(
+            required=True,
+            secret=_gateway_identity_secret,
+            previous_secret=_gateway_identity_previous_secret,
+            internal_secret=_internal_api_secret,
+        )
+
+        def minutes_subject_of(request: Request) -> str:
+            """Return only a gateway-attested subject for the sensitive Minutes route.
+
+            The optional compatibility posture used by ordinary Agent routes is deliberately not
+            inherited here: once the bundled reference route is composed, a direct caller cannot
+            turn a spoofed ``X-User-Id`` into a transcript read.
+            """
+            return _gateway_subject(
+                request,
+                detail="verified gateway identity required for Minutes",
+            )
+
+        @app.post("/api/minutes/summarize-last")
+        def summarize_last_minutes(request: Request):
+            """Invoke the server-owned, non-chat Minutes pipeline for this authenticated subject.
+
+            No request body participates in addressing or model context. Only the validated derived
+            answer and non-sensitive execution counts leave the isolated ingestion stage.
+            """
+            subject = minutes_subject_of(request)
+            try:
+                result = minutes_ingestor.summarize_last_meeting(subject)
+            except MinutesIngestDisabled:
+                raise HTTPException(status_code=403, detail="Minutes read is disabled") from None
+            except MinutesIngestError:
+                raise HTTPException(status_code=503, detail="Minutes read is unavailable") from None
+            return JSONResponse(
+                {
+                    "answer": result.answer,
+                    "candidates_quarantined": result.candidates_quarantined,
+                    "summary_fallback": result.summary_fallback,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
 
     @app.get("/health")
     def health():
@@ -989,6 +1653,98 @@ def create_app(
              "capabilities": capability_health()},
             status_code=200 if ok else 503,
         )
+
+    @app.post("/internal/minutes/meetings/{meeting_id}/erase")
+    async def internal_minutes_meeting_erase(meeting_id: str, request: Request):
+        """Agent-owned, internal half of a Minutes meeting erasure receipt."""
+        secret = settings.internal_api_secret.get_secret_value() if settings is not None else ""
+        provided = request.headers.get("x-internal-secret", "")
+        if not secret or not hmac.compare_digest(provided, secret):
+            return JSONResponse(
+                {"error": {"code": "forbidden"}}, status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        if (
+            not re.fullmatch(r"[1-9][0-9]{0,18}", meeting_id)
+            or int(meeting_id) > 9_223_372_036_854_775_807
+        ):
+            return JSONResponse(
+                {"error": {"code": "not_found"}}, status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        declared_length = request.headers.get("content-length")
+        if declared_length:
+            try:
+                if int(declared_length) > MAX_MINUTES_ERASURE_REQUEST_BYTES:
+                    raise OverflowError
+            except (ValueError, OverflowError):
+                return JSONResponse(
+                    {"error": {"code": "request_too_large"}}, status_code=413,
+                    headers={"Cache-Control": "no-store"},
+                )
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_MINUTES_ERASURE_REQUEST_BYTES:
+                return JSONResponse(
+                    {"error": {"code": "request_too_large"}}, status_code=413,
+                    headers={"Cache-Control": "no-store"},
+                )
+            chunks.append(chunk)
+        try:
+            body = json.loads(b"".join(chunks))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            body = None
+        if (
+            not isinstance(body, dict)
+            or set(body) != {"user_id"}
+            or not isinstance(body.get("user_id"), str)
+            or not re.fullmatch(r"[1-9][0-9]{0,18}", body["user_id"])
+            or int(body["user_id"]) > 9_223_372_036_854_775_807
+        ):
+            return JSONResponse(
+                {"error": {"code": "invalid_request"}}, status_code=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        user_id = int(body["user_id"])
+        if minutes_eraser is None:
+            return JSONResponse(
+                {"error": {"code": "erasure_pending"}}, status_code=503,
+                headers={"Cache-Control": "no-store", "Retry-After": "5"},
+            )
+        try:
+            receipt = minutes_eraser.erase(user_id=user_id, meeting_id=meeting_id)
+        except ErasureNotFound:
+            return JSONResponse(
+                {"error": {"code": "not_found"}}, status_code=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        except ErasurePending:
+            return JSONResponse(
+                {"error": {"code": "erasure_pending"}}, status_code=503,
+                headers={"Cache-Control": "no-store", "Retry-After": "5"},
+            )
+        except Exception as error:  # noqa: BLE001 - never expose private store/transport details
+            logger.error(
+                "Agent Minutes erasure failed row=%s user=%s kind=%s",
+                meeting_id, user_id, type(error).__name__,
+            )
+            return JSONResponse(
+                {"error": {"code": "erasure_pending"}}, status_code=503,
+                headers={"Cache-Control": "no-store", "Retry-After": "5"},
+            )
+        if not _is_exact_agent_meeting_erasure_receipt(
+            receipt, user_id=user_id, meeting_id=meeting_id,
+        ):
+            return JSONResponse(
+                {"error": {"code": "erasure_pending"}}, status_code=503,
+                headers={"Cache-Control": "no-store", "Retry-After": "5"},
+            )
+        # Return the wrapper's signed proof byte-for-structure.  The route must never re-sign or
+        # project counts: retries replay the exact persisted receipt (same nonce/signature).
+        return JSONResponse(receipt, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/models")
     def models(request: Request):
@@ -1021,35 +1777,25 @@ def create_app(
 
     @app.post("/api/meeting/start", status_code=202)
     def meeting_start(body: MeetingStart, request: Request):
-        """Launch (or touch) a live-meeting copilot for a real meeting — built through the ONE
-        ``make_dispatch`` like every other trigger. ``meeting_id == session_uid == native_id`` so the
-        transcript wire (``tc:meeting:{id}``), the dispatch (``agent-meet-{id}``), and the terminal all
-        key on the same id. The bridge feeds ``tc:meeting:{native_id}``; the worker tails it."""
-        meeting_ctx = {
-            "meeting_id": body.native_id, "session_uid": body.native_id, "platform": body.platform,
-        }
-        transcript_start_id = _stream_tail_id(redis_url, f"tc:meeting:{body.native_id}")
-        if transcript_start_id:
-            meeting_ctx["transcript_start_id"] = transcript_start_id
-        inv = units.make_dispatch(
-            subject=subject_of(request), trigger="transcription",
-            start=units.entrypoint(inline=_MEETING_BRIEF),
-            context={"kind": "meeting", "meeting": meeting_ctx},
+        """Retired native-only launcher.
+
+        A native meeting id is neither tenant-unique nor connected to the numeric retention fence, so
+        this legacy bridge could bypass owner-scoped consent and launch an unfenced copilot.  Managed
+        capture now discovers the numeric row through the watcher and users opt in through the
+        owner-bound ``/api/meeting/process`` desired-state endpoint.
+        """
+        subject_of(request)  # authenticate consistently even though the retired route never mutates
+        raise HTTPException(
+            status_code=410,
+            detail="native-only meeting start is no longer supported",
         )
-        unit_id = dispatcher.dispatch(inv)
-        meeting = {
-            "meeting_id": body.native_id, "session_uid": body.native_id, "native_id": body.native_id,
-            "platform": body.platform, "title": body.title or f"{body.platform} · {body.native_id}",
-            "unit_id": unit_id,
-        }
-        live.add(meeting)
-        return meeting
 
     @app.get("/api/meeting/relay-health")
     def meeting_relay_health(request: Request):
         """P18 (ADR 0010) — the transcript relay's observable health: is the numeric→native resolve OK,
         and are segments arriving? A stale `VEXA_BOT_API_KEY` (401 on `/meetings`) shows here as a typed
         `native_resolve: {ok:false, kind:'unauthorized', detail:…}` instead of silent dead air."""
+        subject_of(request)
         from control_plane import transcription_watcher as _txw
         return _txw.relay_health()
 
@@ -1072,7 +1818,10 @@ def create_app(
 
         overview: dict = {"workloads": [], "meetings": []}
         try:
-            overview["workloads"] = admin_panel.fetch_workloads(settings.runtime_api_url)
+            overview["workloads"] = admin_panel.fetch_workloads(
+                settings.runtime_api_url,
+                control_secret=settings.runtime_control_secret.get_secret_value(),
+            )
         except Exception as e:  # noqa: BLE001 — typed partial failure (P18): the panel shows the section error
             overview["workloads_error"] = f"{type(e).__name__}: {e}"
         if redis_url:
@@ -1111,7 +1860,10 @@ def create_app(
         # Workloads cross-check the in-memory live registry (a stale "live" entry must not turn
         # relay quiet into a false FAIL). Unknown (kernel unreachable) → None = trust the registry.
         try:
-            workloads = admin_panel.fetch_workloads(settings.runtime_api_url)
+            workloads = admin_panel.fetch_workloads(
+                settings.runtime_api_url,
+                control_secret=settings.runtime_control_secret.get_secret_value(),
+            )
         except Exception:  # noqa: BLE001
             workloads = None
         return admin_panel.run_probe(settings, r, live.list(), relay_health=_txw.relay_health(),
@@ -1119,36 +1871,40 @@ def create_app(
 
     @app.post("/api/meeting/process", status_code=202)
     def meeting_process(body: MeetingProcess, request: Request):
-        """User-controlled copilot PROCESSING for a meeting — DESIRED STATE ONLY (ADR 0027). This
-        endpoint writes the opt-in flag; it never dispatches. The transcription watcher is the ONE
-        dispatch arbiter: it arms (and keeps alive) the copilot while ``proc:meeting:{row}:on`` is
-        set, always resuming from the per-meeting CURSOR (``proc:meeting:{row}:cursor`` = the last
-        raw transcript stream-id already cleaned; absent ⇒ ``'0-0'`` = full history). Two writers
-        used to dispatch here (this handler from the cursor, the watcher from the stream tail) and
-        race — whichever landed second was a touch, so a tail-armed win silently skipped the
-        backfill. OFF just clears the flag — the cursor is FROZEN at the last processed entry so a
-        later re-enable gap-fills from exactly where we left off."""
+        """Owner-controlled copilot PROCESSING for one numeric meeting row (ADR 0027).
+
+        ON atomically retention-checks and writes an opaque desired-state generation; the watcher is
+        the one dispatch arbiter and resumes from the frozen per-row cursor. OFF first revokes that
+        generation, then authoritatively stops the active runtime workload. Workers prove the exact
+        generation before transcript/model/derivative operations, so a race-spawned or pre-reenable
+        worker is inert. The cursor remains frozen for a later, newly consented gap-fill.
+        """
+        # Authentication and BOLA protection precede Redis construction/mutation for BOTH ON and OFF.
+        # Numeric meeting rows are the only managed identity: native ids collide across tenants and do
+        # not map to the permanent retention fence, so the legacy native fallback is deliberately gone.
+        subject = subject_of(request)
+        row_id = str(body.meeting_id or "").strip()
+        # Canonical signed-64-bit decimal only.  Accepting "041" would owner-check row 41 over HTTP
+        # but key Redis/fences on 041, silently escaping the row's retention authority.
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", row_id):
+            raise HTTPException(status_code=404, detail="meeting not found")
+        owned = _meeting_owner_lookup(subject, row_id)
+        if not isinstance(owned, dict):
+            # Unknown and foreign rows are intentionally indistinguishable.
+            raise HTTPException(status_code=404, detail="meeting not found")
+        if str(owned.get("id") or "") != row_id or str(owned.get("user_id") or "") != subject:
+            # A malformed or mis-scoped authority response cannot bless a Redis key.
+            raise HTTPException(status_code=404, detail="meeting not found")
+        owned_native = str(owned.get("native_meeting_id") or "").strip()
+        if not body.native_id or len(body.native_id) > 512 or (
+            owned_native and body.native_id != owned_native
+        ):
+            raise HTTPException(status_code=404, detail="meeting not found")
+
         import redis as _redis
 
         r = _redis.from_url(redis_url, decode_responses=True)
-        # P0 (cross-tenant leak fix): the copilot's opt-in flag / cursor / processed stream ALL key on
-        # the meetings-domain ROW id — the native id is NOT unique (it collides across tenants + a user's
-        # re-sends), so keying processing state by it armed / clobbered / resumed the wrong meeting. Prefer
-        # the row id the terminal passes (POST /bots returns it); else resolve it off the live registry
-        # (the watcher learns it from the segments' numeric meeting_id and stamps native_id on the entry).
-        # Fall back to native only when neither is available (legacy client + not-yet-live) — documented as
-        # a bootstrap-only path that arms once the row id is known.
-        live_entry = next(
-            (m for m in live.list()
-             if m.get("native_id") == body.native_id or m.get("session_uid") == body.native_id),
-            None,
-        )
-        row_id = (
-            body.meeting_id
-            or (str(live_entry["numeric_meeting_id"])
-                if live_entry and live_entry.get("numeric_meeting_id") else None)
-        )
-        key = row_id or body.native_id
+        key = row_id
         # The opt-in flag has its OWN key suffix — it must NOT collide with the processed-notes STREAM
         # ``proc:meeting:{key}`` the worker XADDs (worker.py), else a GET on the flag hits a stream →
         # WRONGTYPE (crashes the watcher's arm loop). ``:cursor`` is likewise a distinct sibling key.
@@ -1157,26 +1913,80 @@ def create_app(
         if not body.on:
             try:
                 r.delete(flag)  # cursor is intentionally LEFT in place (frozen) for the next re-enable
-            except Exception:  # noqa: BLE001 — best-effort; the watcher reaps the copilot on TTL anyway
-                pass
-            return {"native_id": body.native_id, "meeting_id": row_id, "processing": False}
-        subject_of(request)  # identity gate (P20) — kept even though nothing dispatches from here
-        cursor: str | None = None
+            except Exception as error:  # noqa: BLE001 — never report OFF without revocation authority
+                logger.error(
+                    "meeting processing revocation authority unavailable for %s (%s)",
+                    key,
+                    type(error).__name__,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="meeting processing authority is unavailable",
+                ) from None
+            try:
+                # Desired-state deletion prevents new work; runtime stop cancels the already-running
+                # worker.  A race-spawned worker carries the deleted generation and self-rejects before
+                # reading transcript content, while a later ON receives a different generation.
+                dispatcher.stop_workload(f"agent-meet-{key}")
+            except Exception as error:  # noqa: BLE001 — stop must be positively acknowledged
+                logger.error(
+                    "meeting processing runtime stop unconfirmed for %s (%s)",
+                    key,
+                    type(error).__name__,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="meeting processing stop could not be confirmed",
+                ) from None
+            return {
+                "native_id": owned_native or body.native_id,
+                "meeting_id": row_id,
+                "processing": False,
+            }
         try:
             # TTL'd desired state (P21/P22 — verified on the eyeball: NO session_end frame ever
             # crosses the wire on the stop path, so the watcher's reap there is belt-only and the
             # flag used to persist forever). This backstop bounds a flag that never sees a segment;
             # the watcher REFRESHES a rolling TTL while segments actually flow, so the flag outlives
             # any real meeting and self-cleans within ~an hour of the flow stopping.
-            r.set(flag, "1", ex=PROC_FLAG_BACKSTOP_TTL_SEC)
-            cursor = r.get(cursor_key)
-        except Exception:  # noqa: BLE001
-            cursor = None
+            expires_at_ms = _owned_processing_deadline_ms(owned)
+            generation = secrets.token_urlsafe(24)
+            if expires_at_ms is not None:
+                generation = bind_processing_deadline(generation, expires_at_ms)
+            allowed, cursor = activate_processing_if_writable(
+                r,
+                key,
+                flag_key=flag,
+                cursor_key=cursor_key,
+                ttl_seconds=PROC_FLAG_BACKSTOP_TTL_SEC,
+                token=generation,
+                expires_at_ms=expires_at_ms,
+            )
+        except Exception as error:  # noqa: BLE001 — authority loss must never report processing on
+            logger.error(
+                "meeting processing activation authority unavailable for %s (%s)",
+                key,
+                type(error).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="meeting processing authority is unavailable",
+            ) from None
+        if not allowed:
+            raise HTTPException(
+                status_code=410,
+                detail="meeting processing is no longer available",
+            )
         # `resumed_from` reports where the watcher's arm WILL resume (the frozen cursor, else the
         # start of the transcript) — informational for the client; the dispatch itself happens on
         # the watcher's next segment (≤ one batch), keyed and started from the same cursor.
         start_id = cursor or "0-0"
-        return {"native_id": body.native_id, "meeting_id": row_id, "processing": True, "resumed_from": start_id}
+        return {
+            "native_id": owned_native or body.native_id,
+            "meeting_id": row_id,
+            "processing": True,
+            "resumed_from": start_id,
+        }
 
     @app.post("/api/chat")
     def chat(body: ChatBody, request: Request):
@@ -1194,10 +2004,8 @@ def create_app(
         # A reconnect carries Last-Event-ID (the last Stream cursor the client rendered). On resume we
         # DON'T re-dispatch — we re-attach to the existing warm unit and read from the cursor onward.
         resume = request.headers.get("last-event-id") or None
-        # Ground the chat in the terminal's ACTIVE meeting (if any): agent-api folds the live transcript
-        # from the meeting's redis Stream (tc:meeting:{native} — the SAME stream the copilot tails) into
-        # the prompt, fresh on every turn. The transcript stays inside the trusted control plane and
-        # rides the prompt to the worker — no file, no cross-domain HTTP, no user key in the worker (P15).
+        # Ground meeting metadata/prep context when safe. Raw/processed meeting content is never folded
+        # into this durable generic-chat prompt; it requires the dedicated bounded Minutes read path.
         ctx, tools, prompt = _context_grounding(
             body, session, redis_url,
             schedule_rows=lambda: _schedule_source(subject),
@@ -1239,14 +2047,22 @@ def create_app(
                 # Refuse HERE with an actionable frame instead: no worker spawn, no ghost session
                 # entry. A FAILED config lookup (None) fails OPEN — a down identity service must
                 # never block a turn; the worker-side auth taxonomy still catches it cleanly.
+                cfg = dispatcher.resolve_model_config(subject)
+                if cfg is not None and cfg.get("blocked"):
+                    return StreamingResponse(
+                        _sse([{"type": "error", "message": _model_blocked_error_message()},
+                              {"type": "turn-complete"}]),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
+                                 "X-Unit-Id": unit_id, "X-Chat-Session": session},
+                    )
                 if capability_state("model_inference") == NOT_CONFIGURED:
-                    cfg = dispatcher.resolve_model_config(subject)
                     if cfg is not None and not _has_custom_model_endpoint(cfg):
                         return StreamingResponse(
                             _sse([{"type": "error", "message": _model_creds_error_message()},
                                   {"type": "turn-complete"}]),
                             media_type="text/event-stream",
-                            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                                      "X-Unit-Id": unit_id, "X-Chat-Session": session},
                         )
                 # Snapshot the out-Stream tail BEFORE dispatching and attach the reader from
@@ -1267,7 +2083,7 @@ def create_app(
         return StreamingResponse(
             _sse(stream_reader.read(unit_id, resume=resume)),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                      "X-Unit-Id": unit_id, "X-Chat-Session": session},
         )
 
@@ -1427,11 +2243,12 @@ def create_app(
                 return Path(m.path)
         raise HTTPException(status_code=403, detail="not authorized for this workspace")
 
-    def _manage_dir(subject: str, slug: Optional[str]) -> Path:
+    def _manage_dir(subject: str, slug: Optional[str], *, write: bool = False) -> Path:
         """Resolve a workspace dir for a MANAGEMENT op (git sync, purpose) — unlike ``_read_target`` this
         also reaches the caller's PARKED slots (a workspace need not be mounted to manage it). Own slots
         first (active or parked); a slug that isn't one of them but IS a shared workspace the caller belongs
-        to resolves to the shared dir. Neither path can ever reach another user's private workspace."""
+        to resolves to the shared dir. Shared mutations require contributor-or-owner; viewers retain the
+        status/purpose reads. Neither path can ever reach another user's private workspace."""
         try:
             return workspace_dir_for(wsr.root, subject, slug)
         except ValueError:
@@ -1440,6 +2257,11 @@ def create_app(
             pass
         target = (slug or "").strip()
         if target and membership_mod.is_member(wsr.root, target, subject) is not None:
+            if write:
+                try:
+                    membership_mod.require_role(wsr.root, target, subject, "contributor")
+                except MembershipError as exc:
+                    raise HTTPException(status_code=exc.status, detail=str(exc)) from None
             return membership_mod._ws_dir(wsr.root, target)
         raise HTTPException(status_code=404, detail="workspace not found")
 
@@ -1454,32 +2276,95 @@ def create_app(
     async def ws_upload(request: Request, files: list[UploadFile] = File(...)):
         if not files:
             raise HTTPException(status_code=400, detail="no files uploaded")
+        if len(files) > MAX_UPLOAD_FILES:
+            raise HTTPException(status_code=413, detail="too many upload files")
         subject = subject_of(request)
         try:
             ws = wsr.workspace_dir(subject)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid subject")
         uploads = ws / "uploads"
-        uploads.mkdir(parents=True, exist_ok=True)
-        pending: list[tuple[Path, bytes, str, str]] = []
-        for file in files:
-            try:
-                content = await file.read()
-            finally:
-                await file.close()
-            if len(content) > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail=f"{file.filename or 'upload'} exceeds 25MB")
-            safe_name = _upload_filename(file.filename)
-            digest = hashlib.sha256(content).hexdigest()
-            stored_name = f"{digest[:16]}-{safe_name}"
-            target = (uploads / stored_name).resolve()
-            if uploads.resolve() not in target.parents:
-                raise HTTPException(status_code=400, detail="invalid filename")
-            pending.append((target, content, stored_name, f"uploads/{stored_name}"))
+        pending: list[tuple[bytes, str, str]] = []
+        aggregate_bytes = 0
+        try:
+            for file in files:
+                chunks: list[bytes] = []
+                file_bytes = 0
+                try:
+                    while True:
+                        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        file_bytes += len(chunk)
+                        if file_bytes > MAX_UPLOAD_BYTES:
+                            raise HTTPException(status_code=413, detail="upload exceeds 25MB")
+                        if aggregate_bytes + file_bytes > MAX_UPLOAD_TOTAL_BYTES:
+                            raise HTTPException(status_code=413, detail="upload batch exceeds 25MB")
+                        chunks.append(chunk)
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(status_code=400, detail="could not read upload") from None
+
+                content = b"".join(chunks)
+                aggregate_bytes += file_bytes
+                safe_name = _upload_filename(file.filename)
+                digest = hashlib.sha256(content).hexdigest()
+                stored_name = f"{digest[:16]}-{safe_name}"
+                pending.append((content, stored_name, f"uploads/{stored_name}"))
+        finally:
+            for file in files:
+                try:
+                    await file.close()
+                except Exception:  # noqa: BLE001 — close is best-effort; never replace the route outcome
+                    logger.warning("closing an uploaded file failed")
+
+        # All request-controlled validation completes before the first filesystem mutation. Keeping
+        # the aggregate equal to the per-file ceiling bounds both this pending list and the write phase.
+        # A worker may write symlinks inside its own workspace. Never resolve/follow an `uploads`
+        # symlink from agent-api's all-workspaces mount: that could redirect a later authenticated
+        # upload into another tenant. O_NOFOLLOW closes the check/open race; all file writes are
+        # relative to the verified directory fd and atomically replace the directory entry itself.
         uploaded: list[dict[str, str]] = []
-        for target, content, stored_name, path in pending:
-            target.write_bytes(content)
-            uploaded.append({"name": stored_name, "path": path})
+        directory_fd: int | None = None
+        try:
+            if uploads.is_symlink():
+                raise HTTPException(status_code=400, detail="invalid upload directory")
+            uploads.mkdir(parents=True, exist_ok=True)
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory_fd = os.open(uploads, directory_flags)
+            for content, stored_name, path in pending:
+                temporary_name = f".{stored_name}.{secrets.token_hex(8)}.tmp"
+                file_fd: int | None = None
+                try:
+                    file_flags = (
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                    )
+                    file_fd = os.open(temporary_name, file_flags, 0o600, dir_fd=directory_fd)
+                    with os.fdopen(file_fd, "wb", closefd=True) as output:
+                        file_fd = None
+                        output.write(content)
+                    os.replace(
+                        temporary_name,
+                        stored_name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                finally:
+                    if file_fd is not None:
+                        os.close(file_fd)
+                    try:
+                        os.unlink(temporary_name, dir_fd=directory_fd)
+                    except FileNotFoundError:
+                        pass
+                uploaded.append({"name": stored_name, "path": path})
+        except HTTPException:
+            raise
+        except OSError:
+            raise HTTPException(status_code=507, detail="could not store upload") from None
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
         return {"files": uploaded}
 
     @app.get("/api/workspace/file")
@@ -1679,7 +2564,7 @@ def create_app(
                 org=body.org or None, remote_url=body.remote_url or None,
                 # slug → any workspace the caller can manage (own parked slot or shared membership,
                 # resolved + permission-checked by _manage_dir); omitted keeps the legacy seed target.
-                ws_dir=_manage_dir(subject, body.slug) if body.slug else None,
+                ws_dir=_manage_dir(subject, body.slug, write=True) if body.slug else None,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc) or "invalid subject")
@@ -1745,7 +2630,7 @@ def create_app(
         for published vexa-born), fast-forward only — NEVER a force push. The token authenticates the push
         and is never stored; a diverged remote fails loud (pull first). Every error is token-redacted (P15)."""
         subject = subject_of(request)
-        ws = _manage_dir(subject, body.slug)
+        ws = _manage_dir(subject, body.slug, write=True)
         token = (body.token or "").strip() or git_creds.read_github_token(wsr.root, subject)
         if not token:
             raise HTTPException(status_code=400, detail="a GitHub token is required — pass one or save a reusable token")
@@ -1763,7 +2648,7 @@ def create_app(
         lacks) is refused — no merge/rebase/force — so it is resolved deliberately. The token (optional for
         public repos) is used for the fetch only and never stored (P15)."""
         subject = subject_of(request)
-        ws = _manage_dir(subject, body.slug)
+        ws = _manage_dir(subject, body.slug, write=True)
         token = (body.token or "").strip() or git_creds.read_github_token(wsr.root, subject)  # None ⇒ public-repo fetch
         try:
             r = pull_origin(ws, token=token)
@@ -1787,7 +2672,7 @@ def create_app(
         """Set (or clear) a workspace's PURPOSE — stored in the workspace + committed so it travels when
         shared and feeds the mount preamble. Returns the normalized purpose actually stored."""
         subject = subject_of(request)
-        ws = _manage_dir(subject, body.slug)
+        ws = _manage_dir(subject, body.slug, write=True)
         return {"purpose": write_purpose(ws, body.purpose)}
 
     @app.get("/api/meeting/stream")
@@ -1802,9 +2687,6 @@ def create_app(
         disconnect (the 'Live stream disconnected — reconnecting' path) dropped every segment published in
         the gap beyond the bounded replay window from the LIVE view — the real-time transcript-loss bug
         (the durable store kept them, so they only reappeared post-time)."""
-        if not redis_url:
-            raise HTTPException(status_code=501, detail="redis not wired")
-
         # P0 (cross-tenant leak fix — SSE sibling of the by-id REST ownership check): OWNER-SCOPE the live
         # feed BEFORE opening any redis stream. `meeting_id` (row id) + `session_uid` arrive from the
         # caller's query params; row ids are sequential ints, so without this an authenticated user B could
@@ -1816,17 +2698,23 @@ def create_app(
         # OWNER-ONLY for now (matches the WS path today); a shared-workspace membership grant would extend
         # `_meeting_owner_lookup` — the clean seam — but is intentionally NOT honored here yet.
         subject = subject_of(request)  # 401 if no (gateway-injected) identity — fail closed
+        # Canonical positive decimal rows are the only carrier address. In particular, accepting "010"
+        # would owner-check row 10 but tail separately keyed Redis streams under 010.
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", meeting_id):
+            raise HTTPException(status_code=403, detail="not authorized for this meeting")
+        if not redis_url:
+            raise HTTPException(status_code=501, detail="redis not wired")
         owned = _meeting_owner_lookup(subject, meeting_id)
-        if owned is None:
+        if not isinstance(owned, dict):
             # Absent row, or a row owned by a DIFFERENT tenant → refuse (404-equivalent, no stream opened).
             raise HTTPException(status_code=403, detail="not authorized for this meeting")
-        # Defense-in-depth on the copilot out-stream: `session_uid` is ALSO caller-supplied and keys
-        # `unit:agent-meet-{session_uid}:out`. The terminal passes the ROW id as `session_uid` for live
-        # rows (liveMeetings.ts `session_uid = live ? id : undefined`); the meeting's own native id is
-        # accepted for the legacy /api/meeting/start shape (native==row==session). Bind it to the OWNED
-        # row so B can't pair its own row with A's key to sniff A's copilot cards.
-        owned_native = str(owned.get("native_meeting_id") or "")
-        if session_uid not in (owned_native, str(meeting_id)):
+        if str(owned.get("id") or "") != meeting_id or str(owned.get("user_id") or "") != subject:
+            # A malformed, stale, or mis-scoped authority response cannot bless a carrier key.
+            raise HTTPException(status_code=403, detail="not authorized for this meeting")
+        # `session_uid` is caller-supplied and selects `unit:agent-meet-{session_uid}:out`. Bind it to the
+        # owner-proven row only. Native meeting links are not tenant-unique and the retired legacy native
+        # fallback could expose an older tenant's out-stream after link reuse.
+        if session_uid != meeting_id:
             raise HTTPException(status_code=403, detail="session_uid does not match this meeting")
 
         resume_t, resume_o, resume_p = _decode_sse_cursor(request.headers.get("last-event-id"))
@@ -1941,7 +2829,7 @@ def create_app(
 
         return StreamingResponse(
             _sse(gen()), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
 
 
@@ -2227,8 +3115,8 @@ def create_app(
             return {"memberships": []}
 
     # ── Settings → Models "Test" buttons (on-demand credential tests, fail-loud surface) ────────
-    # Both test the caller's EFFECTIVE config — the same user > global > env resolution the
-    # dispatch overlay / bot_spawn apply — so what's tested is what a turn/bot actually gets.
+    # Both test the caller's EFFECTIVE config. STT selects one complete settings backend or the
+    # complete env backend, so a URL can never inherit credentials from another tier.
 
     @app.get("/api/models/test")
     def models_test(request: Request):
@@ -2242,10 +3130,13 @@ def create_app(
         if mc is not None:
             try:
                 cfg = mc.resolve(subject) or {}
-            except Exception as exc:  # resolver down → still test the env floor, but SAY so
-                out = _ct.run_models_test({})
-                out["summary"] += f" (settings resolver unavailable: {exc} — tested env defaults)"
-                return out
+            except Exception:
+                # Resolver failure must not turn a normal user's Test click into a deployment-key
+                # spend. Report only generic operator-managed status.
+                return _ct.managed_models_status({})
+        credential_owner = cfg.pop("credential_owner", "operator")
+        if credential_owner != "user":
+            return _ct.managed_models_status(cfg)
         return _ct.run_models_test(cfg)
 
     @app.get("/api/transcription/test")
@@ -2255,6 +3146,7 @@ def create_app(
         from control_plane import config_test as _ct
         subject = subject_of(request)
         url, token, source = "", "", "env"
+        credential_owner = "operator"
         settings = dispatcher.settings
         admin = (settings.admin_api_url or "").rstrip("/")
         if admin:  # same internal edge bot_spawn uses (bot-context carries the resolved override)
@@ -2263,19 +3155,32 @@ def create_app(
                 req = _ur.Request(f"{admin}/internal/users/{subject}/bot-context",
                                   headers={"X-Internal-Secret":
                                            settings.internal_api_secret.get_secret_value()})
-                with _ur.urlopen(req, timeout=5) as r:
-                    body = json.loads(r.read())
+                # The internal secret is an origin-bound credential. Refuse redirects instead of
+                # allowing urllib to replay it to an arbitrary Location target.
+                with _ct.open_no_redirect(req, timeout=5) as r:
+                    body = json.loads(_ct._read_bounded_response(r))
+                credential_owner = body.get("transcription_credential_owner", "operator")
                 t = body.get("transcription") or {}
-                if t.get("url") or t.get("token"):
+                if t.get("blocked"):
+                    return {
+                        "ok": False,
+                        "summary": (
+                            "Personal transcription configuration is blocked by operator policy; "
+                            "choose an approved endpoint or Deployment default."
+                        ),
+                        "source": "settings",
+                        "blocked": True,
+                    }
+                if t.get("url"):
                     url, token, source = t.get("url") or "", t.get("token") or "", "settings"
             except Exception:
-                pass  # fall through to env — the probe result still says what was tested
-        if not url:
+                credential_owner = "operator"
+        if credential_owner == "user" and url:
+            return _ct.run_transcription_test(url, token, source)
+        if not url or credential_owner != "user":
             url = os.environ.get("TRANSCRIPTION_SERVICE_URL", "")
-            token = token or os.environ.get("TRANSCRIPTION_SERVICE_TOKEN", "")
-        elif not token:
             token = os.environ.get("TRANSCRIPTION_SERVICE_TOKEN", "")
-        return _ct.run_transcription_test(url, token, source)
+        return _ct.managed_transcription_status(url, token)
     return app
 
 
@@ -2284,7 +3189,28 @@ def _build_production_app() -> FastAPI:
     from shared.adapters import AdminApiMembershipIndex, AdminApiModelConfig, LocalIdentityMinter, RedisStreamReader, RuntimeHttpClient, SchedulerHttpClient
     from shared.config import load_settings
     from control_plane.config_preflight import preflight
+    from control_plane.minutes_boot import build_minutes_ingestor
     from control_plane.workspace_routines import start_workspace_routine_reconciler
+
+    _validate_agent_erasure_signing_config(
+        capture_enabled=os.environ.get("ZAKI_MINUTES_CAPTURE_ENABLED"),
+        key_id=os.environ.get("ZAKI_AGENT_ERASURE_SIGNING_KEY_ID"),
+        secret=os.environ.get("ZAKI_AGENT_ERASURE_SIGNING_SECRET"),
+        previous_key_id=os.environ.get(
+            "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID"
+        ),
+        previous_secret=os.environ.get(
+            "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET"
+        ),
+        internal_secret=os.environ.get("VEXA_INTERNAL_API_SECRET"),
+        credential_environment=os.environ,
+    )
+
+    # There is deliberately no fake/partial production eraser. Until the Brain provenance adapter is
+    # composed, mounting capture on Agent must fail before any runtime/watchers start.
+    raw_minutes_eraser = _require_minutes_erasure_backend(
+        capture_enabled=os.environ.get("ZAKI_MINUTES_CAPTURE_ENABLED"), eraser=None,
+    )
 
     # config.v1 boot preflight (ADR-0026): agent-api has no required-explicit keys today, so this
     # logs the capability tri-states (bot_gateway · model_inference) — a deploy that cannot add bots
@@ -2293,8 +3219,52 @@ def _build_production_app() -> FastAPI:
     preflight()
 
     settings = load_settings()
-    runtime = RuntimeHttpClient(settings.runtime_api_url)
-    scheduler = SchedulerHttpClient(settings.runtime_api_url)
+    _validate_gateway_identity_config(
+        required=settings.require_gateway_identity or settings.minutes_read_enabled,
+        secret=settings.gateway_identity_secret.get_secret_value(),
+        previous_secret=settings.gateway_identity_previous_secret.get_secret_value(),
+        internal_secret=settings.internal_api_secret.get_secret_value(),
+        credential_environment=os.environ,
+    )
+    boundary_redis = None
+    if (
+        raw_minutes_eraser is not None
+        or settings.require_gateway_identity
+        or settings.minutes_read_enabled
+    ):
+        boundary_redis = _security_redis_from_url(settings.redis_url)
+    erasure_redis = boundary_redis if raw_minutes_eraser is not None else None
+    gateway_replay_store = (
+        RedisGatewayReplayStore(boundary_redis)
+        if settings.require_gateway_identity or settings.minutes_read_enabled
+        else None
+    )
+    minutes_eraser = _wrap_signed_minutes_eraser(
+        raw_minutes_eraser,
+        redis_client=erasure_redis,
+        key_id=settings.agent_erasure_signing_key_id,
+        secret=settings.agent_erasure_signing_secret.get_secret_value(),
+        previous_key_id=settings.agent_erasure_previous_verification_key_id or None,
+        previous_secret=(
+            settings.agent_erasure_previous_verification_secret.get_secret_value() or None
+        ),
+        internal_secret=settings.internal_api_secret.get_secret_value(),
+        credential_environment=os.environ,
+    )
+    # The read client, live Identity dual gate, and isolated completion stage are ready to compose,
+    # but this tree has no canonical Nullalis tombstone-aware answer authorizer. Flag-off returns
+    # None without touching those dependencies; flag-on fails at that exact content-free seam.
+    # Model-derived Minutes text remains ephemeral and never crosses into Brain here.
+    minutes_ingestor = build_minutes_ingestor(settings, authorizer=None)
+    runtime_control_secret = settings.runtime_control_secret.get_secret_value()
+    runtime = RuntimeHttpClient(
+        settings.runtime_api_url,
+        control_secret=runtime_control_secret,
+    )
+    scheduler = SchedulerHttpClient(
+        settings.runtime_api_url,
+        control_secret=runtime_control_secret,
+    )
     identity = LocalIdentityMinter(settings.dispatch_signing_key.get_secret_value())
     invocations_url = settings.agent_api_self_url.rstrip("/") + "/invocations"
     # Lane M: the membership index mirror (users.data.memberships[]) over the admin-api internal edge.
@@ -2323,6 +3293,9 @@ def _build_production_app() -> FastAPI:
         invocations_url=invocations_url,
         redis_url=settings.redis_url,
         membership_index=membership_index,
+        minutes_eraser=minutes_eraser,
+        minutes_ingestor=minutes_ingestor,
+        gateway_replay_store=gateway_replay_store,
     )
     app.state.workspace_routine_reconciler = start_workspace_routine_reconciler(
         scheduler=scheduler,
@@ -2338,11 +3311,20 @@ def _build_production_app() -> FastAPI:
             handle.stop()
 
     # The in-process meetings Integration (replaces the standalone bridge container): a daemon thread
-    # tails transcription_segments → fans tc:meeting:{uid} + arms the copilot dispatch on activity.
-    # NOTE: no `subject=` → the watcher uses its PRE-M2 `u_live` placeholder; live-meeting dispatch (M2)
-    # must pass the real meeting owner here (see transcription_watcher.start).
+    # tails transcription_segments and arms the copilot only after meeting-api binds the exact numeric
+    # row to its authoritative owner over the secret-protected internal edge. There is no production
+    # fallback subject: owner authority uncertainty leaves the row unregistered and undispatched.
     from control_plane import transcription_watcher
-    transcription_watcher.start(settings.redis_url, dispatcher, app.state.live_meetings)
+    owner_lookup = transcription_watcher._http_owner_lookup(
+        settings.meeting_api_url,
+        settings.internal_api_secret.get_secret_value(),
+    )
+    transcription_watcher.start(
+        settings.redis_url,
+        dispatcher,
+        app.state.live_meetings,
+        owner_lookup=owner_lookup,
+    )
     return app
 
 

@@ -24,12 +24,14 @@ import json
 from datetime import datetime, timezone
 from typing import Optional
 
+from .carriers import transcript_stream_key
 from .ports import RedisBus, TranscriptStore, TranscriptWriteRefused
 
 # Stream / consumer-group defaults (parent ``collector/config.py``).
 STREAM_NAME = "transcription_segments"
 CONSUMER_GROUP = "collector_group"
 CONSUMER_NAME = "collector-main"
+MAX_SEGMENTS_PER_LEASE = 100
 
 
 def _mutable_channel(meeting_id: int) -> str:
@@ -93,7 +95,7 @@ def _transcript_stream(meeting_id: int) -> str:
     leaked one user's transcript to another) AND across ONE user's repeated meeting rows. The row id is
     unique per (user, platform, native, run), so ``tc:meeting:{meeting_id}`` isolates every meeting. The
     native id still rides in the wire payload for display (``_to_native_wire``)."""
-    return f"tc:meeting:{meeting_id}"
+    return transcript_stream_key(meeting_id)
 
 
 def _to_native_wire(native: str, seg: dict) -> dict:
@@ -168,7 +170,18 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
         if meeting_id is not None:
             uid = data.get("native_meeting_id") or data.get("uid") or data.get("session_uid") or str(meeting_id)
             try:
-                await redis.xadd(_transcript_stream(meeting_id), {"type": "session_end", "uid": uid})
+                # The marker triggers the agent worker's final transcript-derived beat, so it is a
+                # transcript + summary write for consent/retention purposes. Keep it behind the same
+                # barrier as segments; a late bot cannot restart derivation after withdrawal/expiry.
+                async with store.transcript_write_lease(
+                    meeting_id, scopes=("transcript", "summary")
+                ):
+                    await redis.xadd(
+                        _transcript_stream(meeting_id),
+                        {"type": "session_end", "uid": uid},
+                    )
+            except TranscriptWriteRefused:
+                pass
             except Exception as e:  # noqa: BLE001 — best-effort; never abort the batch
                 _log_publish_failure(meeting_id, e)
         return 0
@@ -192,12 +205,10 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
             continue
         persisted.append(seg)
 
+    persisted_count = 0
     if persisted:
         # Publish a change-only mutable update (bot's live-path shape). ``confirmed`` carries the
         # completed segments, ``pending`` the drafts — the dashboard renders both.
-        confirmed = [s for s in persisted if s["completed"]]
-        pending = [s for s in persisted if not s["completed"]]
-        speaker = persisted[0].get("speaker") or ""
         # Stamp the NATIVE meeting id (and platform) so the agent-api live relay can re-key
         # numeric→native WITHOUT a user-scoped /meetings lookup (which fails for any meeting not owned
         # by the relay's bot key → segments never reach the terminal's native channel). The collector
@@ -210,48 +221,61 @@ async def ingest(store: TranscriptStore, redis: RedisBus, message: dict) -> int:
         if not native_id:
             pair = await _resolve_native(store, meeting_id)
             native_id, platform_native = pair if pair else (None, None)
-        try:
-            # One shared lease spans the complete message: the consent state is checked once, all
-            # segments land in one Redis transaction, and every resulting live write happens before
-            # withdrawal can acquire the exclusive barrier. A refused lease publishes nothing.
-            async with store.transcript_write_lease(meeting_id) as writer:
-                await writer.append_segments(persisted)
+        for offset in range(0, len(persisted), MAX_SEGMENTS_PER_LEASE):
+            batch = persisted[offset : offset + MAX_SEGMENTS_PER_LEASE]
+            confirmed = [s for s in batch if s["completed"]]
+            pending = [s for s in batch if not s["completed"]]
+            speaker = batch[0].get("speaker") or ""
+            try:
+                # The lock covers a bounded batch, not an attacker-sized message. Withdrawal may
+                # interleave only between batches; every batch that starts after it fails closed.
+                async with store.transcript_write_lease(meeting_id) as writer:
+                    await writer.append_segments(batch)
 
-                # FAULT-ISOLATED (P18): the segments are already persisted. A transient live-publish
-                # blip must not abort the source batch before it is acknowledged.
-                try:
-                    await redis.publish(
-                        _mutable_channel(meeting_id),
-                        json.dumps({
-                            "type": "transcript",
-                            "meeting": {
-                                "id": meeting_id,
-                                "native_id": native_id,
-                                "platform": platform_native,
-                            },
-                            "speaker": speaker,
-                            "confirmed": confirmed,
-                            "pending": pending,
-                            "ts": _now_iso(),
-                        }),
-                    )
-                except Exception as e:  # noqa: BLE001 — persistence already succeeded
-                    _log_publish_failure(meeting_id, e)
-
-                # P23/P0: the collector is the SINGLE writer of the numeric-row transcript feed.
-                stream = _transcript_stream(meeting_id)
-                wire_uid = native_id or str(meeting_id)
-                for seg in persisted:
-                    if not (seg.get("text") or "").strip():
-                        continue
+                    # FAULT-ISOLATED (P18): the segments are already persisted. A transient
+                    # live-publish blip must not abort the source batch before it is acknowledged.
                     try:
-                        await redis.xadd(stream, _to_native_wire(wire_uid, seg))
+                        await redis.publish(
+                            _mutable_channel(meeting_id),
+                            json.dumps({
+                                "type": "transcript",
+                                "meeting": {
+                                    "id": meeting_id,
+                                    "native_id": native_id,
+                                    "platform": platform_native,
+                                },
+                                "speaker": speaker,
+                                "confirmed": confirmed,
+                                "pending": pending,
+                                "ts": _now_iso(),
+                            }),
+                        )
+                    except TranscriptWriteRefused:
+                        raise
                     except Exception as e:  # noqa: BLE001 — persistence already succeeded
                         _log_publish_failure(meeting_id, e)
-        except TranscriptWriteRefused:
-            return 0
 
-    return len(persisted)
+                    # P23/P0: the collector is the SINGLE semantic writer of the numeric-row feed.
+                    # Queue every entry into one bounded, retention-fenced Redis transaction rather
+                    # than one independent append per segment.
+                    stream = _transcript_stream(meeting_id)
+                    wire_uid = native_id or str(meeting_id)
+                    entries = [
+                        _to_native_wire(wire_uid, seg)
+                        for seg in batch
+                        if (seg.get("text") or "").strip()
+                    ]
+                    try:
+                        await redis.xadd_many(stream, entries)
+                    except TranscriptWriteRefused:
+                        raise
+                    except Exception as e:  # noqa: BLE001 — persistence already succeeded
+                        _log_publish_failure(meeting_id, e)
+                persisted_count += len(batch)
+            except TranscriptWriteRefused:
+                break
+
+    return persisted_count
 
 
 async def consume_segments(

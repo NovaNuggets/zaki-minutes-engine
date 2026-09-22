@@ -4,8 +4,8 @@ Prompt = [ambient <schedule> digest (surface-gated)] + [focus fold] + user promp
 Covers: the ambient gate matrix (explicit toggle beats surface), meeting-focus SERVER-ROW
 enrichment (a cold client store must not ground a planned meeting as live — the regression this
 slice fixes), workspace focus (fail-closed on unknown slug), today focus (full-day digest
-replaces ambient), and back-compat (legacy ``active``-only bodies behave exactly as before;
-``context.focus: null`` suppresses grounding).
+replaces ambient), and the fail-closed legacy boundary (only a meeting found in the authenticated
+server rows can address a transcript carrier; ``context.focus: null`` suppresses grounding).
 """
 from __future__ import annotations
 
@@ -123,12 +123,21 @@ def test_client_status_loses_to_server_row():
     assert "PREPARE" in prompt
 
 
-def test_meeting_focus_without_rows_falls_back_to_client_fields():
+def test_meeting_focus_without_an_owned_server_row_fails_closed():
     focus = {"kind": "meeting", "native_id": "abc-defg-hij", "platform": "google_meet",
              "status": "scheduled", "title": "Client title"}
     body = _body(context={"focus": focus})
     _c, _t, prompt = _ground(body, rows=[])
-    assert "PREPARE" in prompt and "Client title" in prompt
+    assert prompt == "hi"
+
+
+def test_foreign_or_stale_meeting_focus_never_folds_caller_supplied_redis_identity():
+    focus = {"kind": "meeting", "meeting_id": "999", "native_id": "victim-link",
+             "platform": "google_meet", "status": "active", "title": "Victim"}
+    body = _body(context={"focus": focus})
+    _c, _t, prompt = _ground(body, rows=[_sched_row(rid=51)])
+    assert prompt == "hi"
+    assert "Victim" not in prompt and "live meeting" not in prompt
 
 
 # ── workspace focus ───────────────────────────────────────────────────────────────────
@@ -175,13 +184,13 @@ def test_today_focus_uses_full_day_digest_and_replaces_ambient():
 
 # ── back-compat ───────────────────────────────────────────────────────────────────────
 
-def test_legacy_active_only_body_unchanged():
+def test_legacy_active_only_body_without_owned_row_fails_closed():
     active = {"kind": "meeting", "native_id": "abc", "platform": "google_meet",
               "status": "scheduled", "title": "Legacy"}
     body = _body(active=active)               # no context at all
     _c, _t, prompt = _ground(body, rows=[])
-    assert "PREPARE" in prompt and "Legacy" in prompt
-    assert "<schedule" not in prompt          # legacy clients never get the digest
+    assert prompt == "hi"
+    assert "Legacy" not in prompt
 
 
 def test_context_focus_null_suppresses_legacy_active():

@@ -1,0 +1,16 @@
+{
+  "version": "erasure.v1",
+  "issued_at": "2026-07-15T12:30:00Z",
+  "key_id": "erasure-golden-2026-07",
+  "owner": "agent",
+  "scope": "account",
+  "subject": { "user_id": "7" },
+  "counts": {
+    "agent_unit_streams": 1,
+    "agent_workspace_documents": 2,
+    "agent_brain_records": 3
+  },
+  "nonce": "01J2M3N4P5Q6R7S8T9V0WXYZE3",
+  "digest": "sha256=6a635282db04cc93ce6c7d5fe7b395bc69a0816d892d6bf4504ea6bbcfa0807f",
+  "signature": "sha256=28324447b193d701f326bbe65a1375d992bbddaba9da5adfc948bc2b43ce1441"
+}

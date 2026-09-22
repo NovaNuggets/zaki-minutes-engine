@@ -21,6 +21,7 @@ from meeting_api.webhooks import (
 )
 
 SECRET = "whsec_demo_secret"
+NOW_TS = 1771401720
 
 
 # --- webhook.v1 schema (the seam) ------------------------------------------------------
@@ -49,7 +50,7 @@ def test_valid_signature_accepted():
     env = build_envelope("meeting.completed", {"meeting": {"id": 1}})
     body = json.dumps(env).encode()
     headers = build_headers(SECRET, body, timestamp="1771401720")
-    assert verify_signature(body, headers, SECRET)
+    assert verify_signature(body, headers, SECRET, now=lambda: NOW_TS)
 
 
 def test_tampered_body_rejected():
@@ -57,7 +58,7 @@ def test_tampered_body_rejected():
     body = json.dumps(env).encode()
     headers = build_headers(SECRET, body, timestamp="1771401720")
     tampered = body + b" "  # one byte different
-    assert not verify_signature(tampered, headers, SECRET)
+    assert not verify_signature(tampered, headers, SECRET, now=lambda: NOW_TS)
 
 
 def test_tampered_timestamp_rejected():
@@ -65,20 +66,49 @@ def test_tampered_timestamp_rejected():
     body = json.dumps(env).encode()
     headers = build_headers(SECRET, body, timestamp="1771401720")
     headers["X-Webhook-Timestamp"] = "1771401999"  # replay the sig under a new ts
-    assert not verify_signature(body, headers, SECRET)
+    assert not verify_signature(body, headers, SECRET, now=lambda: NOW_TS)
 
 
 def test_wrong_secret_rejected():
     env = build_envelope("bot.failed", {"meeting": {"id": 2}})
     body = json.dumps(env).encode()
     headers = build_headers(SECRET, body, timestamp="1771401720")
-    assert not verify_signature(body, headers, "the_wrong_secret")
+    assert not verify_signature(body, headers, "the_wrong_secret", now=lambda: NOW_TS)
 
 
 def test_missing_signature_header_rejected():
     body = b'{"x":1}'
-    assert not verify_signature(body, {"X-Webhook-Timestamp": "1"}, SECRET)
-    assert not verify_signature(body, {}, SECRET)
+    assert not verify_signature(
+        body, {"X-Webhook-Timestamp": "1"}, SECRET, now=lambda: NOW_TS
+    )
+    assert not verify_signature(body, {}, SECRET, now=lambda: NOW_TS)
+
+
+def test_old_correctly_signed_timestamp_is_rejected():
+    body = b'{"meeting_id":41}'
+    timestamp = str(NOW_TS - 301)
+    headers = build_headers(SECRET, body, timestamp=timestamp)
+
+    assert not verify_signature(body, headers, SECRET, now=lambda: NOW_TS)
+
+
+def test_future_correctly_signed_timestamp_is_rejected():
+    body = b'{"meeting_id":41}'
+    timestamp = str(NOW_TS + 31)
+    headers = build_headers(SECRET, body, timestamp=timestamp)
+
+    assert not verify_signature(body, headers, SECRET, now=lambda: NOW_TS)
+
+
+@pytest.mark.parametrize("timestamp", ["", "1.5", "-1", "+1", "nan", " 1", "1 "])
+def test_malformed_timestamp_is_rejected_without_raising(timestamp):
+    body = b"{}"
+    headers = {
+        "X-Webhook-Timestamp": timestamp,
+        "X-Webhook-Signature": sign_payload(body, SECRET, timestamp),
+    }
+
+    assert not verify_signature(body, headers, SECRET, now=lambda: NOW_TS)
 
 
 def test_signature_is_ts_dot_payload():

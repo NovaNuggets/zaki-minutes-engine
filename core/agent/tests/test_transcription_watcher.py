@@ -12,8 +12,10 @@ that no ``tc:meeting:*`` write ever originates here.
 from __future__ import annotations
 
 import json
+import logging
 
 import control_plane.transcription_watcher as w
+import pytest
 
 
 class _FakeRedis:
@@ -33,6 +35,14 @@ class _FakeRedis:
 
     def delete(self, key):
         self.kv.pop(key, None)
+
+    def claim_processing_if_writable(
+        self, *, flag_key, cursor_key, ttl_seconds, **_kwargs
+    ):
+        if not self.get(flag_key):
+            return False, None
+        self.expire(flag_key, ttl_seconds)
+        return True, self.get(cursor_key)
 
     def xadd(self, key, fields):
         self.streams.setdefault(key, []).append(fields)
@@ -74,7 +84,11 @@ def _payload(meeting_id):
 
 
 def _fresh_state():
-    return ({}, {}, {})  # last_arm, keymap, first_seen
+    return ({}, {}, {}, {})  # last_arm, keymap, first_seen, verified owner cache
+
+
+def _owner_lookup(user_id: int = 7):
+    return lambda mid: {"meeting_id": str(mid), "user_id": str(user_id)}
 
 
 def _reset_module_caches():
@@ -85,6 +99,127 @@ def _reset_module_caches():
 def _native_streams(r):
     """The transcript-carrier streams — these must NEVER be written by the agent (the collector owns them)."""
     return [k for k in r.streams if k.startswith("tc:meeting:")]
+
+
+# ── authoritative row-owner attribution ───────────────────────────────────────────────────────────
+
+def test_watcher_attributes_live_registration_and_dispatch_to_the_authoritative_row_owner(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "generation-1")
+    payload = {
+        **_payload("42"),
+        # Untrusted producer hints must never participate in owner attribution.
+        "user_id": 999,
+        "owner": "u_live",
+        "subject": "attacker-workspace",
+    }
+    owner_lookup = lambda mid: {"meeting_id": str(mid), "user_id": "7"}
+
+    w._handle(r, disp, live, owner_lookup, payload, {}, {}, {}, {})
+
+    assert "42" in live.by_uid
+    assert disp.dispatched[0]["identity"]["subject"] == "7"
+    assert disp.dispatched[0]["workspaces"] == [{"id": "7", "mode": "ro"}]
+
+
+def test_watcher_carries_the_generation_deadline_into_claim_and_worker_invocation(monkeypatch):
+    from shared.meeting_retention import bind_processing_deadline
+
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    cutoff_ms = 2_541_488_400_000
+    token = bind_processing_deadline("generation-1", cutoff_ms)
+
+    class _DeadlineRedis(_FakeRedis):
+        def claim_processing_if_writable(self, **kwargs):
+            self.claim = dict(kwargs)
+            return True, None
+
+    r, disp, live = _DeadlineRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", token)
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), {}, {}, {}, {})
+
+    assert r.claim["token"] == token
+    assert r.claim["expires_at_ms"] == cutoff_ms
+    meeting = disp.dispatched[0]["context"]["meeting"]
+    assert meeting["processing_token"] == token
+    assert meeting["processing_expires_at_ms"] == cutoff_ms
+
+
+def test_watcher_fails_closed_when_row_owner_authority_is_unavailable(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "generation-1")
+    keymap: dict[str, str] = {}
+
+    w._handle(r, disp, live, lambda _mid: None, _payload("42"), {}, keymap, {}, {})
+
+    assert live.by_uid == {}
+    assert disp.dispatched == []
+    assert keymap == {}
+
+
+def test_watcher_retries_unverified_owner_records_but_caches_an_exact_verified_record(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    responses = iter([
+        {"meeting_id": 42, "user_id": 7},  # malformed: JSON numbers lose bigint exactness
+        {"meeting_id": "42", "user_id": "7"},
+    ])
+    calls: list[str] = []
+
+    def lookup(mid):
+        calls.append(mid)
+        return next(responses)
+
+    state = _fresh_state()
+    w._handle(r, disp, live, lookup, _payload("42"), *state)
+    assert live.by_uid == {}
+    assert state[3] == {}
+
+    w._handle(r, disp, live, lookup, _payload("42"), *state)
+    w._handle(r, disp, live, lambda _mid: (_ for _ in ()).throw(RuntimeError()), _payload("42"), *state)
+
+    assert calls == ["42", "42"]
+    assert state[3] == {"42": "7"}
+    assert "42" in live.by_uid
+
+
+def test_watcher_keeps_distinct_rows_bound_to_distinct_owners(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: (f"native-{mid}", "google_meet"))
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "generation-a")
+    r.set("proc:meeting:43:on", "generation-b")
+    owners = {"42": "7", "43": "8"}
+    state = _fresh_state()
+
+    for mid in ("42", "43"):
+        w._handle(
+            r,
+            disp,
+            live,
+            lambda row_id: {"meeting_id": str(row_id), "user_id": owners[row_id]},
+            _payload(mid),
+            *state,
+        )
+
+    assert [inv["identity"]["subject"] for inv in disp.dispatched] == ["7", "8"]
+    assert state[3] == {"42": "7", "43": "8"}
+
+
+def test_session_end_releases_the_verified_owner_cache(monkeypatch):
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+    monkeypatch.delenv("VEXA_BOT_API_KEY", raising=False)
+    r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
+    state = _fresh_state()
+    lookup = _owner_lookup()
+
+    w._handle(r, disp, live, lookup, _payload("42"), *state)
+    assert state[3] == {"42": "7"}
+
+    w._handle(r, disp, live, lookup, {"type": "session_end", "meeting_id": "42"}, *state)
+
+    assert state[3] == {}
 
 
 # ── multi-meeting separation (resolution + keying) ─────────────────────────────────────────────────
@@ -100,9 +235,9 @@ def test_two_distinct_meetings_stay_separate(monkeypatch):
     }.get(mid))
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
-    _, keymap, _ = state = _fresh_state()
+    _, keymap, _, _ = state = _fresh_state()
     for mid in ("42", "43", "42", "43"):
-        w._handle(r, disp, live, "u_live", _payload(mid), *state)
+        w._handle(r, disp, live, _owner_lookup(), _payload(mid), *state)
 
     assert set(live.by_uid) == {"42", "43"}                       # live rows keyed by ROW id
     assert keymap == {"42": "42", "43": "43"}                     # routing key == the row id
@@ -127,16 +262,16 @@ def test_late_native_resolution_does_not_fork_or_collapse(monkeypatch):
     monkeypatch.setattr(w, "_resolve_native", resolve)
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
-    _, keymap, _ = st = _fresh_state()
+    _, keymap, _, _ = st = _fresh_state()
 
-    w._handle(r, disp, live, "u", _payload("42"), *st)
-    w._handle(r, disp, live, "u", _payload("43"), *st)   # 43's native unresolved — still keyed on the ROW id
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *st)
+    w._handle(r, disp, live, _owner_lookup(), _payload("43"), *st)   # 43's native unresolved — still keyed on the ROW id
     assert set(live.by_uid) == {"42", "43"}              # BOTH live, each on its own row id
     assert keymap["43"] == "43"                           # keyed on the row id, never 42's native
     assert live.by_uid["43"]["native_id"] == "43"        # native pending → display falls back to the row id
 
     state["43"] = ("bbb-bbbb-bbb", "google_meet")
-    w._handle(r, disp, live, "u", _payload("43"), *st)
+    w._handle(r, disp, live, _owner_lookup(), _payload("43"), *st)
     assert keymap["43"] == "43"                           # routing key UNCHANGED (no fork)
     assert live.by_uid["43"]["native_id"] == "bbb-bbbb-bbb"  # display native filled in
 
@@ -151,12 +286,13 @@ def test_resolve_native_returns_only_the_matched_id(monkeypatch):
     ]}
 
     class _Resp:
-        def read(self): return json.dumps(listing).encode()
+        headers = {}
+        def read(self, _size=-1): return json.dumps(listing).encode()
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
     monkeypatch.setenv("VEXA_BOT_API_KEY", "k")
-    monkeypatch.setattr(w.urllib.request, "urlopen", lambda req, timeout=5: _Resp())
+    monkeypatch.setattr(w, "open_no_redirect", lambda req, timeout=5: _Resp())
 
     assert w._resolve_native("42") == ("aaa-aaaa-aaa", "google_meet")
     assert w._resolve_native("43") == ("bbb-bbbb-bbb", "google_meet")
@@ -170,7 +306,8 @@ def test_resolve_native_requests_limit_within_gateway_cap(monkeypatch):
     captured: dict[str, str] = {}
 
     class _Resp:
-        def read(self): return json.dumps({"meetings": []}).encode()
+        headers = {}
+        def read(self, _size=-1): return json.dumps({"meetings": []}).encode()
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
@@ -179,7 +316,7 @@ def test_resolve_native_requests_limit_within_gateway_cap(monkeypatch):
         return _Resp()
 
     monkeypatch.setenv("VEXA_BOT_API_KEY", "k")
-    monkeypatch.setattr(w.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(w, "open_no_redirect", _fake_urlopen)
 
     w._resolve_native("42")
     requested = int(captured["url"].split("limit=")[1].split("&")[0])
@@ -201,10 +338,11 @@ def test_arm_resumes_from_the_frozen_cursor(monkeypatch):
     r.set("proc:meeting:42:on", "1")        # processing is opt-in — enable it (ROW-keyed)
     r.set("proc:meeting:42:cursor", "1-0")  # the worker cleaned up to 1-0 before it was reaped
 
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
 
     meeting = disp.dispatched[0]["context"]["meeting"]
     assert meeting["transcript_start_id"] == "1-0"                # the frozen cursor — gap-fill, no skip
+    assert meeting["processing_token"] == "1"                     # worker is bound to this ON generation
     assert len(r.streams["tc:meeting:42"]) == 2                   # unchanged — the agent appended nothing
 
 
@@ -219,7 +357,7 @@ def test_arm_refreshes_the_flag_rolling_ttl(monkeypatch):
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     r.set("proc:meeting:42:on", "1")
 
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
 
     assert len(disp.dispatched) == 1
     assert getattr(r, "expires", {}).get("proc:meeting:42:on") == w.PROC_FLAG_ROLLING_TTL_SEC
@@ -235,7 +373,7 @@ def test_arm_without_cursor_backfills_full_history(monkeypatch):
     r.streams["tc:meeting:42"] = [{"payload": "c-1"}, {"payload": "c-2"}]  # history exists
     r.set("proc:meeting:42:on", "1")
 
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
 
     assert disp.dispatched[0]["context"]["meeting"]["transcript_start_id"] == "0-0"
 
@@ -247,14 +385,30 @@ def test_copilot_processing_is_opt_in(monkeypatch):
     monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
 
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
     assert disp.dispatched == []                    # OFF → no copilot, no processing
     assert "42" in live.by_uid                      # …but the meeting still registers (by ROW id)
     assert _native_streams(r) == []                 # …and the agent writes no transcript carrier
 
     r.set("proc:meeting:42:on", "1")                   # user enables processing (ROW-keyed) → now it arms
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
     assert len(disp.dispatched) == 1
+
+
+def test_retention_fence_prevents_watcher_rearm_after_it_observed_an_old_flag(monkeypatch):
+    _reset_module_caches()
+    monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
+
+    class FencedRedis(_FakeRedis):
+        def claim_processing_if_writable(self, **_kwargs):
+            return False, None
+
+    r, disp, live = FencedRedis(), _FakeDispatcher(), _FakeLive()
+    r.set("proc:meeting:42:on", "1")
+
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
+
+    assert disp.dispatched == []
 
 
 def test_unresolved_native_still_keys_on_row_id_immediately(monkeypatch):
@@ -266,9 +420,9 @@ def test_unresolved_native_still_keys_on_row_id_immediately(monkeypatch):
     monkeypatch.setattr(w.time, "monotonic", lambda: 1000.0)
 
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
-    _, keymap, _ = st = _fresh_state()
+    _, keymap, _, _ = st = _fresh_state()
 
-    w._handle(r, disp, live, "u", _payload("77"), *st)          # keyed IMMEDIATELY on the row id
+    w._handle(r, disp, live, _owner_lookup(), _payload("77"), *st)          # keyed IMMEDIATELY on the row id
     assert "77" in live.by_uid and keymap["77"] == "77"         # surfaced under the row id (not swallowed)
     assert live.by_uid["77"]["native_id"] == "77"              # display falls back to the row id
 
@@ -294,7 +448,7 @@ def test_proc_flag_get_never_hits_the_processed_stream(monkeypatch):
     r.xadd("proc:meeting:77", {"payload": "{}"})               # the ROW-keyed processed-notes STREAM (collision bait)
     r.set("proc:meeting:77:on", "1")                           # processing ENABLED via the ROW-keyed flag
 
-    w._handle(r, disp, live, "u", _payload("77"), *_fresh_state())  # must NOT raise WRONGTYPE
+    w._handle(r, disp, live, _owner_lookup(), _payload("77"), *_fresh_state())  # must NOT raise WRONGTYPE
     assert len(disp.dispatched) == 1                            # armed off the flag
 
 
@@ -308,12 +462,12 @@ def test_session_end_reaps_copilot_without_writing_the_carrier(monkeypatch):
     monkeypatch.setattr(w, "_resolve_native", lambda mid: ("nat-9", "google_meet"))
     monkeypatch.delenv("VEXA_BOT_API_KEY", raising=False)   # _record_meeting_doc → no-op (no network)
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
-    _, keymap, _ = st = _fresh_state()
+    _, keymap, _, _ = st = _fresh_state()
 
-    w._handle(r, disp, live, "u", _payload("9"), *st)        # establish the meeting (keyed by row id 9)
+    w._handle(r, disp, live, _owner_lookup(), _payload("9"), *st)        # establish the meeting (keyed by row id 9)
     assert "9" in live.by_uid and keymap.get("9") == "9"
 
-    w._handle(r, disp, live, "u", {"type": "session_end", "meeting_id": "9"}, *st)
+    w._handle(r, disp, live, _owner_lookup(), {"type": "session_end", "meeting_id": "9"}, *st)
     assert "9" not in live.by_uid                            # live row dropped (by the row-id key)
     assert "9" not in keymap                                 # keymap cleared (clean relaunch)
     assert _native_streams(r) == []                          # the agent wrote NO session_end marker
@@ -331,11 +485,82 @@ def test_session_end_reaps_the_processing_flag(monkeypatch):
     r.set("proc:meeting:9:on", "1")
     r.set("proc:meeting:9:cursor", "5-0")
 
-    w._handle(r, disp, live, "u", _payload("9"), *st)
-    w._handle(r, disp, live, "u", {"type": "session_end", "meeting_id": "9"}, *st)
+    w._handle(r, disp, live, _owner_lookup(), _payload("9"), *st)
+    w._handle(r, disp, live, _owner_lookup(), {"type": "session_end", "meeting_id": "9"}, *st)
 
     assert r.get("proc:meeting:9:on") is None                # desired state reaped with the meeting
     assert r.get("proc:meeting:9:cursor") == "5-0"           # cursor frozen (audit / late gap-fill)
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_event"),
+    [
+        ("reap", "processing-flag reap failed"),
+        ("desired", "processing desired-state lookup failed"),
+        ("claim", "processing retention claim failed"),
+        ("confirmation", "processing generation confirmation failed"),
+    ],
+)
+def test_processing_failures_log_only_content_free_error_type(
+    stage, expected_event, monkeypatch, caplog,
+):
+    raw_marker = "RAW-REDIS-CREDENTIAL-OR-TRANSCRIPT-73f4"
+
+    class FailingRedis(_FakeRedis):
+        def __init__(self):
+            super().__init__()
+            self.flag_reads = 0
+
+        def delete(self, key):
+            if stage == "reap":
+                raise RuntimeError(raw_marker)
+            return super().delete(key)
+
+        def get(self, key):
+            if stage == "desired":
+                raise RuntimeError(raw_marker)
+            if stage == "confirmation" and key.endswith(":on"):
+                self.flag_reads += 1
+                if self.flag_reads > 1:
+                    raise RuntimeError(raw_marker)
+            return super().get(key)
+
+        def claim_processing_if_writable(self, **kwargs):
+            if stage == "claim":
+                raise RuntimeError(raw_marker)
+            if stage == "confirmation":
+                return True, None
+            return super().claim_processing_if_writable(**kwargs)
+
+    monkeypatch.setattr(w, "_resolve_native", lambda _mid: ("nat-9", "google_meet"))
+    monkeypatch.setattr(w, "_record_meeting_doc", lambda _mid: True)
+    caplog.set_level(logging.WARNING, logger=w.logger.name)
+    redis = FailingRedis()
+    if stage != "reap":
+        redis.set("proc:meeting:9:on", "generation-1")
+        payload = _payload("9")
+    else:
+        payload = {"type": "session_end", "meeting_id": "9"}
+
+    w._handle(
+        redis,
+        _FakeDispatcher(),
+        _FakeLive(),
+        _owner_lookup(),
+        payload,
+        *_fresh_state(),
+    )
+
+    assert expected_event in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
+    assert raw_marker not in caplog.text
+    failure_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if expected_event in record.getMessage()
+    ]
+    assert failure_messages
+    assert all("meeting=9" not in message and "for 9" not in message for message in failure_messages)
 
 
 # ── P18 (ADR 0010) — fail-loud regression gates: the 90-minute incident as a red-then-green test ──────
@@ -347,7 +572,6 @@ def test_native_resolve_401_fails_loud(monkeypatch):
     """A stale/invalid VEXA_BOT_API_KEY (401 on GET /meetings) MUST surface a typed, attributed fault on
     relay_health — never a silent best-effort miss. This is exactly the incident that took 90 minutes."""
     import urllib.error
-    import urllib.request
     _reset_module_caches()
     _reset_relay_health()
     monkeypatch.setenv("VEXA_BOT_API_KEY", "stale-key")
@@ -355,7 +579,7 @@ def test_native_resolve_401_fails_loud(monkeypatch):
     def _raise_401(*a, **k):
         raise urllib.error.HTTPError("http://gw/meetings", 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(urllib.request, "urlopen", _raise_401)
+    monkeypatch.setattr(w, "open_no_redirect", _raise_401)
 
     assert w._resolve_native("1") is None
     h = w.relay_health()["native_resolve"]
@@ -377,23 +601,23 @@ def test_native_resolve_missing_key_fails_loud(monkeypatch):
 
 def test_native_resolve_recovers_clears_fault(monkeypatch):
     """A successful resolve after a fault clears health back to ok (loud recovery)."""
-    import urllib.request
     _reset_module_caches()
     w._relay_health["native_resolve"] = {"ok": False, "kind": "unauthorized", "detail": "x", "at": 0.0, "misses": 3}
     monkeypatch.setenv("VEXA_BOT_API_KEY", "good-key")
 
     class _Resp:
+        headers = {}
         def __enter__(self):
             return self
 
         def __exit__(self, *a):
             return False
 
-        def read(self):
+        def read(self, _size=-1):
             return json.dumps({"meetings": [
                 {"id": "1", "native_meeting_id": "nba-agyz-gbe", "platform": "google_meet"}]}).encode()
 
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(w, "open_no_redirect", lambda *a, **k: _Resp())
     assert w._resolve_native("1") == ("nba-agyz-gbe", "google_meet")
     assert w.relay_health()["native_resolve"]["ok"] is True
 
@@ -409,7 +633,7 @@ def test_arm_carries_numeric_meeting_id_for_durable_proc_doc(monkeypatch):
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     r.set("proc:meeting:42:on", "1")
 
-    w._handle(r, disp, live, "u_live", _payload("42"), *_fresh_state())
+    w._handle(r, disp, live, _owner_lookup(), _payload("42"), *_fresh_state())
 
     meeting = disp.dispatched[0]["context"]["meeting"]
     assert meeting["numeric_meeting_id"] == "42"
@@ -418,18 +642,25 @@ def test_arm_carries_numeric_meeting_id_for_durable_proc_doc(monkeypatch):
     assert live.by_uid["42"]["numeric_meeting_id"] == "42"
 
 
-def test_arm_omits_numeric_meeting_id_when_key_is_not_numeric(monkeypatch):
-    """A meeting that never resolved past its uid fallback has no row id to key the proc doc by —
-    the hint is omitted (the worker falls back to the native key), never a bogus value."""
+def test_arm_rejects_a_non_numeric_meeting_identity_before_owner_lookup(monkeypatch):
+    """Only a canonical signed-64-bit meetings row can cross owner/retention boundaries."""
     _reset_module_caches()
     monkeypatch.setattr(w, "_resolve_native", lambda mid: ("aaa-aaaa-aaa", "google_meet"))
     r, disp, live = _FakeRedis(), _FakeDispatcher(), _FakeLive()
     r.set("proc:meeting:sess-uid-fallback:on", "1")   # ROW-keyed flag; here the "row id" is the uid fallback
 
-    payload = {**_payload("sess-uid-fallback"), "meeting_id": "sess-uid-fallback"}
-    w._handle(r, disp, live, "u_live", payload, *_fresh_state())
+    owner_calls: list[str] = []
+    for unsafe_id in ("sess-uid-fallback", "042", str(2**63)):
+        payload = {**_payload(unsafe_id), "meeting_id": unsafe_id}
+        w._handle(
+            r,
+            disp,
+            live,
+            lambda mid: owner_calls.append(mid),
+            payload,
+            *_fresh_state(),
+        )
 
-    meeting = disp.dispatched[0]["context"]["meeting"]
-    assert meeting["meeting_id"] == "sess-uid-fallback"    # keyed on the (non-numeric) uid fallback
-    assert "numeric_meeting_id" not in meeting            # no row id → the durable-proc hint is omitted
-    assert live.by_uid["sess-uid-fallback"]["numeric_meeting_id"] is None
+    assert owner_calls == []
+    assert disp.dispatched == []
+    assert live.by_uid == {}

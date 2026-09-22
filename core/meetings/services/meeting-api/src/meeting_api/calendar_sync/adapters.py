@@ -29,14 +29,26 @@ async def fetch_ics(url: str, *, timeout_s: float = 15.0) -> tuple[Optional[str]
         async with httpx.AsyncClient(
             timeout=timeout_s, transport=build_pinned_transport(), follow_redirects=False,
         ) as client:
-            resp = await client.get(url)
-        if resp.status_code in (301, 302, 303, 307, 308):
-            return None, "the URL redirects — paste the final feed URL (Google: the 'Secret address in iCal format')"
-        if resp.status_code != 200:
-            return None, f"the URL answered HTTP {resp.status_code}"
-        if len(resp.content) > MAX_ICS_BYTES:
-            return None, "the feed is too large (over 2 MB)"
-        text = resp.text
+            async with client.stream("GET", url) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    return None, "the URL redirects — paste the final feed URL (Google: the 'Secret address in iCal format')"
+                if resp.status_code != 200:
+                    return None, f"the URL answered HTTP {resp.status_code}"
+
+                declared = resp.headers.get("content-length")
+                if declared:
+                    try:
+                        if int(declared) > MAX_ICS_BYTES:
+                            return None, "the feed is too large (over 2 MB)"
+                    except ValueError:
+                        pass
+
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    if len(body) + len(chunk) > MAX_ICS_BYTES:
+                        return None, "the feed is too large (over 2 MB)"
+                    body.extend(chunk)
+                text = bytes(body).decode(resp.encoding or "utf-8", errors="replace")
         head = text.lstrip()[:200].lower()
         if head.startswith("<") or "<html" in head:
             return None, ("the URL returns a web page, not a calendar feed — in Google Calendar use "

@@ -67,6 +67,10 @@ RUNTIME_URL = f"http://127.0.0.1:{RUNTIME_HOST_PORT}"
 # Env the stack boots with — pinned so the test knows the secrets it must present.
 ADMIN_TOKEN = "gate-admin-token"
 INTERNAL_API_SECRET = "gate-internal-secret"
+RUNTIME_CONTROL_SECRET = "gate-runtime-control-secret"
+RUNTIME_CALLBACK_SECRET = "gate-runtime-callback-secret"
+MEETING_TOKEN_SECRET = "gate-meeting-token-secret"
+REDIS_PASSWORD = "gate-redis-password"
 MINIO_BUCKET = "vexa"
 
 SERVICES = ["redis", "postgres", "minio", "admin-api", "runtime", "meeting-api", "gateway"]
@@ -132,6 +136,10 @@ def _stack_env() -> dict:
         "COMPOSE_PROJECT_NAME": PROJECT,
         "ADMIN_TOKEN": ADMIN_TOKEN,
         "INTERNAL_API_SECRET": INTERNAL_API_SECRET,
+        "RUNTIME_CONTROL_SECRET": RUNTIME_CONTROL_SECRET,
+        "RUNTIME_CALLBACK_SECRET": RUNTIME_CALLBACK_SECRET,
+        "MEETING_TOKEN_SECRET": MEETING_TOKEN_SECRET,
+        "REDIS_PASSWORD": REDIS_PASSWORD,
         "MINIO_BUCKET": MINIO_BUCKET,
         "BROWSER_IMAGE": os.getenv("BROWSER_IMAGE", "vexaai/vexa-bot:v012"),
         "API_GATEWAY_HOST_PORT": GATEWAY_PORT,
@@ -202,6 +210,10 @@ class Stack:
     runtime: str = RUNTIME_URL
     admin_token: str = ADMIN_TOKEN
     internal_secret: str = INTERNAL_API_SECRET
+    runtime_control_secret: str = RUNTIME_CONTROL_SECRET
+    runtime_callback_secret: str = RUNTIME_CALLBACK_SECRET
+    meeting_token_secret: str = MEETING_TOKEN_SECRET
+    redis_password: str = REDIS_PASSWORD
     bucket: str = MINIO_BUCKET
 
     # ---- exec helpers (the docker CLI is our DB + S3 probe; no extra client deps) ----
@@ -231,6 +243,12 @@ class Stack:
         return keys
 
     def redis_cli(self, *args: str) -> str:
+        return self.exec(
+            "redis", "redis-cli", "--no-auth-warning", "-a", self.redis_password,
+            *args, check=False,
+        )
+
+    def redis_cli_unauthenticated(self, *args: str) -> str:
         return self.exec("redis", "redis-cli", *args, check=False)
 
     def logs(self, service: str, *, tail: int = 400) -> str:
@@ -238,7 +256,7 @@ class Stack:
 
     def redis_host_url(self) -> str:
         port = self.redis_host_port
-        return f"redis://127.0.0.1:{port}/0"
+        return f"redis://:{self.redis_password}@127.0.0.1:{port}/0"
 
     redis_host_port: int = 0
 

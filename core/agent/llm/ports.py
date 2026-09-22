@@ -61,9 +61,11 @@ class CompletionPort(Protocol):
     ``LLMConfigError`` on missing endpoint/model config, ``LLMError`` otherwise."""
 
     name: str
+    supports_max_tokens: bool
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 model: Optional[str] = None) -> CompletionResult: ...
+                 model: Optional[str] = None,
+                 max_tokens: Optional[int] = None) -> CompletionResult: ...
 
 
 class HarnessPort(Protocol):

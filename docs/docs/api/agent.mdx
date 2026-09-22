@@ -106,16 +106,23 @@ curl -X POST "$AGENT_API/events" -H "Content-Type: application/json" -d '{
 
 ## Live meeting copilot
 
-A live-meeting copilot is itself driven through `make_dispatch`; the id invariant is
-`meeting_id == session_uid == native_id`.
+A live-meeting copilot is dispatched by the trusted transcript watcher from the meetings-domain numeric
+row. The row id—not the reusable native meeting link—keys the transcript, processing cursor, retention
+fence, and worker identity.
 
-- `POST /api/meeting/start` `{ native_id, platform, title? }` → `202`, returns the live-meeting record.
-- `POST /api/meeting/process` `{ native_id, platform, on }` → toggle opt-in processing. `on:true` resumes
-  from the per-meeting cursor (`{ ..., "processing":true, "resumed_from":"<id>" }`); `on:false` clears the
-  flag and freezes the cursor (`{ ..., "processing":false }`).
+- `POST /api/meeting/process` `{ meeting_id, native_id, on }` → authenticated, owner-scoped processing
+  consent. `meeting_id` must be the positive numeric row and `native_id` must match that owned row.
+  `on:true` creates a new opaque worker generation and resumes from the per-meeting cursor
+  (`{ ..., "processing":true, "resumed_from":"<id>" }`). `on:false` revokes that generation, stops the
+  active runtime workload, and freezes the cursor (`{ ..., "processing":false }`). Authority or stop
+  failures return `503`; foreign/unknown rows return indistinguishable `404`s.
+- `POST /api/meeting/start` is retired and returns `410`: native-only dispatch was neither tenant-unique
+  nor connected to the numeric retention fence.
 - `GET /api/meeting/relay-health` → typed transcript-relay health (a stale bot key surfaces as
   `native_resolve:{ok:false,kind:"unauthorized"}` rather than silent dead air).
 - `GET /api/meeting/stream?meeting_id=&session_uid=` (SSE) → the merged transcript + copilot-output feed.
+  Both parameters must be the same canonical positive meeting row owned by the authenticated user;
+  native provider link ids are rejected as carrier keys.
   Resumable: every event carries an SSE `id:`; on reconnect echo it as `Last-Event-ID` to resume
   gaplessly. Event types: `transcript`, `card`, `message-delta`, `tool-call`, `ping`, `meeting-end`.
 
@@ -124,7 +131,8 @@ A live-meeting copilot is itself driven through `make_dispatch`; the id invarian
 `GET /api/workspace/tree?hidden=` → `{ "files": ["kg/entities/..."] }` ·
 `GET /api/workspace/file?path=` → `{ "path": "...", "content": "..." }` (`404` if absent) ·
 `GET /api/workspace/git` → `{ branch, changes, commits }` ·
-`POST /api/workspace/upload` (multipart `files`, ≤25 MB each) → `{ "files": [{ name, path }] }` ·
+`POST /api/workspace/upload` (multipart `files`, bounded per-file and in aggregate) →
+`{ "files": [{ name, path }] }` ·
 `POST /api/workspace/init` → `201` `{ workspace, seeded, already_initialized }` (idempotent) ·
 `GET /api/workspace/attached` → `{ active, parked }` ·
 `POST /api/workspace/swap` `{ repo?, ref?, token? }` → attach an external git repo as the active

@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "existingSecretName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+        },
+        "existingSecretRevision": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "redisPassword": {
+          "type": "string",
+          "pattern": "^$|^[A-Za-z0-9._~-]{16,}$"
+        },
+        "meetingTokenSecret": {
+          "type": "string",
+          "pattern": "^$|^.{16,}$"
+        },
+        "gatewayIdentitySecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "gatewayIdentityPreviousSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "minioAccessKey": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{1,126}[!-~]$"
+        },
+        "minioSecretKey": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{14,510}[!-~]$"
+        },
+        "minutesReadToken": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "minutesHubToken": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "agentErasureHmacSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "agentErasurePreviousVerificationSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "minutesErasureSigningSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "minutesErasurePreviousVerificationSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        },
+        "minutesFinalizedSecret": {
+          "type": "string",
+          "pattern": "^$|^[!-~][ -~]{30,510}[!-~]$"
+        }
+      }
+    },
+    "redisConfig": {
+      "type": "object",
+      "required": ["scheme", "host", "port", "database", "username"],
+      "properties": {
+        "scheme": {
+          "enum": ["redis", "rediss"]
+        },
+        "host": {
+          "type": "string",
+          "pattern": "^$|^[A-Za-z0-9.-]+$"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "database": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "username": {
+          "type": "string",
+          "pattern": "^$|^[A-Za-z0-9._~-]+$"
+        }
+      }
+    },
+    "database": {
+      "type": "object",
+      "properties": {
+        "sslMode": {
+          "enum": ["disable", "require", "verify-ca", "verify-full"]
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["backend"],
+      "properties": {
+        "backend": {
+          "enum": ["k8s", "docker", "process"]
+        },
+        "dockerSocketGroup": {
+          "oneOf": [
+            {"type": "string", "pattern": "^$|^(0|[1-9][0-9]{0,9})$"},
+            {"type": "integer", "minimum": 0, "maximum": 2147483647}
+          ]
+        },
+        "workloadNamespace": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "spawnedPods": {
+          "type": "object",
+          "required": ["botIdentity", "agentIdentity"],
+          "properties": {
+            "botIdentity": {
+              "$ref": "#/definitions/workloadIdentity"
+            },
+            "agentIdentity": {
+              "$ref": "#/definitions/workloadIdentity"
+            }
+          }
+        }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "required": ["enabled", "createCredentialsSecret", "credentialsSecretName"],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "createCredentialsSecret": {
+          "type": "boolean"
+        },
+        "credentialsSecretName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$"
+        },
+        "credentialsSecretRevision": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        }
+      }
+    },
+    "minutes": {
+      "type": "object",
+      "required": ["captureEnabled", "invocationV2Enabled", "botImage", "readEnabled", "nullalisErasureBaseUrl", "finalized", "ttl"],
+      "properties": {
+        "captureEnabled": {
+          "type": "boolean"
+        },
+      "invocationV2Enabled": {
+        "type": "boolean"
+      },
+      "botImage": {
+        "type": "string",
+        "pattern": "^$|^[^\\s]+$"
+      },
+      "readEnabled": {
+        "type": "boolean"
+      },
+      "readBaseUrl": {
+        "type": "string"
+      },
+      "nullalisErasureBaseUrl": {
+        "type": "string",
+        "maxLength": 2048,
+        "pattern": "^$|^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^?#]*)?$"
+      },
+      "agentErasureKeyId": {
+        "type": "string",
+        "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+      },
+      "minutesErasureKeyId": {
+        "type": "string",
+        "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+      },
+      "previousAgentErasureKeyId": {
+        "type": "string",
+        "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+      },
+      "previousMinutesErasureKeyId": {
+        "type": "string",
+        "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+      },
+      "finalized": {
+        "type": "object",
+        "required": ["enabled", "url", "keyId"],
+        "properties": {
+          "enabled": {"type": "boolean"},
+          "url": {
+            "type": "string",
+            "maxLength": 2048,
+            "pattern": "^$|^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^?#]*)?$"
+          },
+          "keyId": {
+            "type": "string",
+            "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+          }
+        }
+      },
+      "ttl": {
+          "type": "object",
+          "required": ["enabled", "intervalSeconds", "batchSize"],
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "intervalSeconds": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 86400
+            },
+            "batchSize": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "workloadIdentity": {
+      "type": "object",
+      "required": ["runAsUser", "runAsGroup", "fsGroup"],
+      "properties": {
+        "runAsUser": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "runAsGroup": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "fsGroup": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      }
+    }
+  }
+}

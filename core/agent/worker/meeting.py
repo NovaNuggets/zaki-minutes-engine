@@ -2,19 +2,26 @@
 
 Consumes the meeting's ``transcript.v1`` Stream, gates cheaply, cleans the transcript + surfaces
 proactive cards via a DIRECT ``CompletionPort`` call (a card beat is a pure prompt→text turn — no
-tools, no subprocess, no workspace memory), and (on ``session_end``) authors the post-meeting kg
-meeting entity via the governed harness turn (``run_turn_over_workspace``).
+tools, no subprocess, no workspace memory), and (on ``session_end``) writes the post-meeting kg
+meeting entity through deterministic structured serialization. Untrusted meeting content never
+enters a tool-enabled prompt.
 
 Imports the GENERIC helpers it needs from ``worker.engine`` (one direction); the engine imports the
 meeting entry functions only inside ``main()`` (function-local) to avoid an import cycle.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Iterator
+
+import yaml
 
 from llm import (
     LLMAuthError,
@@ -27,6 +34,18 @@ from shared.agent_config import (
     DEFAULT_CARD_KINDS,
     DEFAULT_POLISH_RULES,
     DEFAULT_TAG_RULES,
+)
+from shared.adapters import workspace_write_lock
+from shared.meeting_retention import (
+    carrier_is_writable,
+    meeting_id_from_proc_stream,
+    processing_deadline_from_token,
+    processing_is_current,
+    retention_fence_key,
+    set_if_writable,
+    set_if_writable_and_current,
+    xadd_if_writable,
+    xadd_if_writable_and_current,
 )
 from worker.engine import _Stream
 from worker.engine import run_turn_over_workspace as _engine_run_turn_over_workspace
@@ -294,36 +313,152 @@ def meeting_card_turn(
 
 # ── Auth-B/#3(a): persist the processed transcript to the workspace, INCREMENTALLY ────────────────
 # As the worker emits 1:1 cleaned `proc:meeting` notes, it ALSO upserts a per-meeting workspace file at
-# kg/entities/meeting/<native>.md so a chat agent focused on the meeting can `Read` it and answer "what's
+# kg/entities/meeting/<row_id>.md so a chat agent focused on the meeting can `Read` it and answer "what's
 # the meeting about" — WITHOUT waiting for the post-meeting doc turn. The write is idempotent: each line
 # is keyed by its note id (== segment_id) with an HTML-comment marker, so a refining pass UPDATES the
 # line in place rather than duplicating it. This reuses the same VISIBLE, git-tracked kg/entities/meeting
 # path the post-meeting doc turn authors (the doc turn later distills a summary into the SAME tree).
 
 _PROC_LINE_RE = re.compile(r"^<!-- id:(?P<id>.*?) -->", )
+_MEETING_ROW_RE = re.compile(r"^[1-9][0-9]{0,18}$")
+_SAFE_NOTE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
-def render_meeting_transcript(meta: dict, notes: list[dict]) -> str:
-    """Render the per-meeting transcript file: YAML frontmatter (type/id/title/… from ``meta``), a
-    Speakers list, and a Transcript section with one id-keyed line per note. Pure + deterministic so the
-    upsert is testable offline."""
+def _note_marker_id(value: object) -> str:
+    raw = str(value or "").strip()
+    if _SAFE_NOTE_ID_RE.fullmatch(raw):
+        return raw
+    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def meeting_artifact_paths(work: Path, row_id: str | int) -> tuple[Path, Path]:
+    """Return containment-checked artifact paths for one canonical meetings-domain row.
+
+    Native meeting ids and titles are display data, not storage authority.  Only a positive decimal
+    database row may select a file, and an existing symlink must not redirect either artifact outside
+    the mounted workspace.
+    """
+    canonical = str(row_id)
+    if not _MEETING_ROW_RE.fullmatch(canonical):
+        raise ValueError("meeting row id must be a positive decimal")
+    root = Path(work).resolve()
+    meeting_dir = root / "kg" / "entities" / "meeting"
+    resolved_dir = meeting_dir.resolve(strict=False)
+    if resolved_dir != root and root not in resolved_dir.parents:
+        raise ValueError("meeting artifact path resolves outside the workspace")
+    document = meeting_dir / f"{canonical}.md"
+    envelope = meeting_dir / f"{canonical}.envelope.json"
+    for candidate in (document, envelope):
+        resolved = candidate.resolve(strict=False)
+        if resolved != resolved_dir and resolved_dir not in resolved.parents:
+            raise ValueError("meeting artifact path resolves outside the workspace")
+    return document, envelope
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Replace one sensitive artifact atomically with owner-only permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    _atomic_write_bytes(path, content.encode("utf-8"))
+
+
+def write_artifact_if_current(
+    work: Path,
+    path: Path,
+    writer: Callable[[], None],
+    authority_current: Callable[[], bool],
+) -> bool:
+    """Run one local artifact write and roll it back if authority expires in flight.
+
+    Redis and the filesystem cannot share a transaction.  Holding the workspace write lock prevents a
+    replacement worker from racing the snapshot/rollback window; checks immediately before and after
+    the write close the worker-owned part of the gap.  The caller remains responsible for an atomic
+    Redis generation/fence check inside ``authority_current``.
+    """
+    root = Path(work).resolve()
+    target = Path(path)
+    resolved = target.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("meeting artifact path resolves outside the workspace")
+    if target.is_symlink():
+        raise ValueError("meeting artifact path resolves outside the workspace")
+
+    def current() -> bool:
+        try:
+            return bool(authority_current())
+        except Exception:  # noqa: BLE001 — authority errors fail closed
+            return False
+
+    with workspace_write_lock(root):
+        if not current():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        resolved = target.resolve(strict=False)
+        if resolved != root and root not in resolved.parents:
+            raise ValueError("meeting artifact path resolves outside the workspace")
+        existed = target.exists()
+        previous = target.read_bytes() if existed else b""
+        writer()
+        if current():
+            return True
+        if existed:
+            _atomic_write_bytes(target, previous)
+        else:
+            target.unlink(missing_ok=True)
+        return False
+
+
+def _meeting_frontmatter_text(meta: dict) -> str:
+    fm_keys = ("type", "id", "title", "meeting_id", "session_uid", "platform", "date")
+    frontmatter = {key: str(meta[key]) for key in fm_keys if meta.get(key) is not None}
+    return yaml.safe_dump(
+        frontmatter,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    ).rstrip()
+
+
+def _meeting_transcript_body(notes: list[dict]) -> list[str]:
     speakers: list[str] = []
     for n in notes:
-        sp = str(n.get("speaker") or "Speaker").strip() or "Speaker"
+        sp = _structured_inline(n.get("speaker") or "Speaker", limit=200) or "Speaker"
+        sp = sp.replace("*", "").replace("`", "")
         if sp not in speakers:
             speakers.append(sp)
-    fm_keys = ("type", "id", "title", "meeting_id", "session_uid", "platform", "date")
-    fm_lines = [f"{k}: {meta[k]}" for k in fm_keys if meta.get(k) is not None]
-    parts = ["---", *fm_lines, "---", "", "## Speakers", ""]
+    parts = ["## Speakers", ""]
     parts += [f"- {sp}" for sp in speakers] or ["- (none yet)"]
     parts += ["", "## Transcript", ""]
     for n in notes:
-        nid = str(n.get("id") or "").strip()
-        sp = str(n.get("speaker") or "Speaker").strip() or "Speaker"
-        text = " ".join(str(n.get("text") or "").split())
+        nid = _note_marker_id(n.get("id"))
+        sp = _structured_inline(n.get("speaker") or "Speaker", limit=200) or "Speaker"
+        sp = sp.replace("*", "").replace("`", "")
+        text = _structured_inline(n.get("text"), limit=10_000)
         tags = n.get("tags") or []
-        suffix = f"  _[tags: {', '.join(str(t) for t in tags)}]_" if tags else ""
+        safe_tags = [value for tag in tags if (value := _structured_inline(tag, limit=100))]
+        suffix = f"  _[tags: {', '.join(safe_tags)}]_" if safe_tags else ""
         parts.append(f"<!-- id:{nid} --> **{sp}:** {text}{suffix}")
+    return parts
+
+
+def render_meeting_transcript(meta: dict, notes: list[dict]) -> str:
+    """Render YAML frontmatter plus one deterministic, id-keyed line per processed note."""
+    parts = ["---", _meeting_frontmatter_text(meta), "---", "", *_meeting_transcript_body(notes)]
     return "\n".join(parts) + "\n"
 
 
@@ -334,8 +469,7 @@ def persist_envelope(path: Path, envelope: dict) -> None:
     This is the deterministic dual-source seam: live folds the redis stream, finished reads THIS file,
     and one renderer renders both identically. The serialization is DETERMINISTIC (``indent=2``,
     ``sort_keys=True``) so the persisted file is byte-stable and == the folded live stream."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(envelope, indent=2, sort_keys=True))
+    _atomic_write_text(path, json.dumps(envelope, indent=2, sort_keys=True))
 
 
 def _seed_dir() -> Path:
@@ -373,26 +507,11 @@ def upsert_meeting_transcript_file(path: Path, meta: dict, note: dict) -> None:
     file at ``path``. Reads the current id-keyed lines, replaces the matching id (or appends a new one),
     preserves order, and rewrites the whole file. Re-running with the same note id never duplicates a
     line; a refining note for an existing id overwrites its text."""
-    nid = str(note.get("id") or "").strip()
-    if not nid:
+    raw_nid = str(note.get("id") or "").strip()
+    if not raw_nid:
         return
-    notes: list[dict] = []
-    if path.exists():
-        try:
-            for line in path.read_text().splitlines():
-                m = _PROC_LINE_RE.match(line)
-                if not m:
-                    continue
-                rest = line[m.end():].strip()
-                # parse "**Speaker:** text"
-                sp = "Speaker"
-                body = rest
-                if rest.startswith("**") and ":**" in rest:
-                    sp = rest[2:rest.index(":**")].strip() or "Speaker"
-                    body = rest[rest.index(":**") + 3:].strip()
-                notes.append({"id": m.group("id"), "speaker": sp, "text": body})
-        except OSError:
-            notes = []
+    nid = _note_marker_id(raw_nid)
+    notes = _read_meeting_notes(path)
     replaced = False
     for existing in notes:
         if existing.get("id") == nid:
@@ -402,22 +521,53 @@ def upsert_meeting_transcript_file(path: Path, meta: dict, note: dict) -> None:
             break
     if not replaced:
         notes.append({"id": nid, "speaker": note.get("speaker") or "Speaker", "text": note.get("text") or ""})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_meeting_transcript(meta, notes))
+    _atomic_write_text(path, render_meeting_transcript(meta, notes))
 
 
-def _set_cursor(stream: _Stream, cursor_key: str | None, raw_id: str) -> None:
+def _set_cursor(
+    stream: _Stream,
+    cursor_key: str | None,
+    raw_id: str,
+    *,
+    fence_key: str | None = None,
+    processing_flag_key: str | None = None,
+    processing_token: str | None = None,
+    processing_expires_at_ms: int | None = None,
+) -> bool:
     """Freeze the per-meeting processed CURSOR = the last raw transcript stream-id cleaned. Best-effort:
     a fake stream without ``set`` (or a transient redis error) must never break the live beat."""
     if not cursor_key:
-        return
+        return True
+    if fence_key is not None:
+        try:
+            if processing_flag_key is not None and processing_token is not None:
+                return set_if_writable_and_current(
+                    stream,
+                    cursor_key,
+                    str(raw_id),
+                    fence_key=fence_key,
+                    flag_key=processing_flag_key,
+                    token=processing_token,
+                    expires_at_ms=processing_expires_at_ms,
+                )
+            return set_if_writable(
+                stream,
+                cursor_key,
+                str(raw_id),
+                fence_key=fence_key,
+                expires_at_ms=processing_expires_at_ms,
+            )
+        except Exception:  # noqa: BLE001 — retention authority failure is fail-closed
+            log.warning("serve_meeting: atomic cursor fence check failed", exc_info=True)
+            return False
     setter = getattr(stream, "set", None)
     if setter is None:
-        return
+        return True
     try:
         setter(cursor_key, str(raw_id))
     except Exception:  # noqa: BLE001 — the cursor is an optimization; never crash the meeting loop
-        pass
+        return True
+    return True
 
 
 def _proc_note(segment: dict) -> dict | None:
@@ -436,9 +586,13 @@ def serve_meeting(
     start_id: str = "0",
     proc_stream: str | None = None,
     cursor_key: str | None = None,
-    on_proc_note: Callable[[dict], None] | None = None,
-    on_envelope: Callable[[dict], None] | None = None,
+    on_proc_note: Callable[[dict], bool | None] | None = None,
+    on_envelope: Callable[[dict], bool | None] | None = None,
     proc_params: dict | None = None,
+    processing_flag_key: str | None = None,
+    processing_token: str | None = None,
+    processing_expires_at_ms: int | None = None,
+    deadline_now_ms: Callable[[], int] | None = None,
 ) -> None:
     """Consume the meeting's ``transcript.v1`` Stream (the meetings⊥agent seam — read by schema), gate
     cheaply (a NEW speaker, or ``beat_segments`` segments), and run a copilot beat that XADDs proactive
@@ -460,27 +614,111 @@ def serve_meeting(
     last = start_id
     n = 0
 
-    def _persist_envelope() -> None:
+    fence_key = None
+    if proc_stream:
+        fence_key = retention_fence_key(meeting_id_from_proc_stream(proc_stream))
+
+    # Managed processing always carries both values.  Treat a half-configured guard as revoked rather
+    # than silently falling back to the legacy unguarded worker path.
+    processing_guarded = (
+        processing_flag_key is not None or processing_token is not None
+    )
+    if processing_guarded and not (processing_flag_key and processing_token):
+        log.warning("serve_meeting: incomplete processing consent generation; refusing work")
+        return
+    if processing_guarded:
+        try:
+            bound_deadline = processing_deadline_from_token(processing_token)
+        except ValueError:
+            log.warning("serve_meeting: invalid processing deadline generation; refusing work")
+            return
+        if processing_expires_at_ms is None:
+            processing_expires_at_ms = bound_deadline
+        elif bound_deadline != processing_expires_at_ms:
+            log.warning("serve_meeting: processing deadline does not match generation; refusing work")
+            return
+    now_ms = deadline_now_ms or (lambda: int(time.time() * 1000))
+
+    def _local_deadline_current() -> bool:
+        return (
+            processing_expires_at_ms is None
+            or now_ms() < processing_expires_at_ms
+        )
+
+    def _processed_writable() -> bool:
+        if not _local_deadline_current():
+            return False
+        if fence_key is None:
+            return not processing_guarded
+        try:
+            if processing_guarded:
+                return processing_is_current(
+                    stream,
+                    fence_key=fence_key,
+                    flag_key=processing_flag_key,
+                    token=processing_token,
+                    expires_at_ms=processing_expires_at_ms,
+                )
+            return carrier_is_writable(
+                stream, fence_key, expires_at_ms=processing_expires_at_ms
+            )
+        except Exception:  # noqa: BLE001 — unavailable authority must not permit derivatives
+            log.warning("serve_meeting: retention fence check failed", exc_info=True)
+            return False
+
+    def _guarded_xadd(name: str, fields: dict) -> bool:
+        if not _local_deadline_current():
+            return False
+        if fence_key is None:
+            stream.xadd(name, fields)
+            return True
+        try:
+            if processing_guarded:
+                return xadd_if_writable_and_current(
+                    stream,
+                    name,
+                    fields,
+                    fence_key=fence_key,
+                    flag_key=processing_flag_key,
+                    token=processing_token,
+                    expires_at_ms=processing_expires_at_ms,
+                )
+            return xadd_if_writable(
+                stream,
+                name,
+                fields,
+                fence_key=fence_key,
+                expires_at_ms=processing_expires_at_ms,
+            )
+        except Exception:  # noqa: BLE001 — Redis/script failures fail closed
+            log.warning("serve_meeting: retention-fenced append failed", exc_info=True)
+            return False
+
+    def _persist_envelope() -> bool:
         """DURABLE RENDER SOURCE (deterministic dual-source): persist the SAME running notes/cards the
         worker already tracks as the envelope, alongside (not replacing) the markdown. Best-effort —
         the render-source mirror is an optimization and must never crash the live loop."""
         if on_envelope is None:
-            return
+            return True
+        if not _processed_writable():
+            return False
         try:
-            on_envelope({"notes": notes, "cards": cards})
+            if on_envelope({"notes": notes, "cards": cards}) is False:
+                return False
         except Exception:  # noqa: BLE001 — render-source mirror is an optimization; never crash the loop
             log.warning("serve_meeting: on_envelope persist failed", exc_info=True)
+        return True
 
     mirror_dirty: dict[str, dict] = {}  # note id → latest merged note, awaiting a mirror flush
 
-    def _emit_proc_note(note: dict) -> None:
+    def _emit_proc_note(note: dict) -> bool:
         """XADD ONE cleaned note (id == segment_id) onto the per-meeting processed STREAM — the ONE
         live carrier of cleaned notes (processed-notes.v1; the SSE tails it, the db-writer persists
         it) — and accumulate it into the running envelope + the mirror batch. The workspace-file and
         envelope mirrors are DERIVED views flushed per beat / at session_end (ADR 0027) — writing
         them per note was an O(n²) rewrite in the hot loop."""
         if not note:
-            return
+            return True
         if proc_stream:
             fields = {"note": json.dumps(note)}
             if proc_params:
@@ -488,7 +726,8 @@ def serve_meeting(
                 # durable consumer (meeting-api db-writer → meeting.data processed views) records
                 # reproducible provenance for the view it persists.
                 fields["params"] = json.dumps(proc_params)
-            stream.xadd(proc_stream, fields)
+            if not _guarded_xadd(proc_stream, fields):
+                return False
         # Accumulate the SAME 1:1 cleaned note (keyed by id) into the running envelope notes — a refining
         # pass UPDATES its line in place rather than duplicating, exactly like the markdown upsert.
         nid = str(note.get("id") or "").strip()
@@ -500,25 +739,48 @@ def serve_meeting(
             else:
                 existing.update(note)
             mirror_dirty[nid] = notes_by_id[nid]
+        return True
 
-    def _flush_mirror() -> None:
+    def _flush_mirror() -> bool:
         """Flush the DERIVED views (per beat + session_end): upsert each dirty note into the
         per-meeting workspace file (Auth-B/#3a — a chat agent can Read the meeting mid-flight) and
         re-persist the envelope render source. Best-effort — mirrors never crash the live loop."""
         if on_proc_note is not None:
             for note in mirror_dirty.values():
+                # Re-check for every local write. A callback may block long enough for OFF or the
+                # immutable processed-content cutoff to land between two notes in the same batch.
+                if not _processed_writable():
+                    return False
                 try:
-                    on_proc_note(note)
+                    if on_proc_note(note) is False:
+                        return False
                 except Exception:  # noqa: BLE001 — the workspace mirror is an optimization
                     log.warning("serve_meeting: on_proc_note upsert failed", exc_info=True)
         if mirror_dirty:
-            _persist_envelope()
+            if not _persist_envelope():
+                return False
         mirror_dirty.clear()
+        return True
 
-    def _run_beat(segs: list[dict], idx: int) -> None:
+    def _run_beat(segs: list[dict], idx: int) -> bool:
+        # Do not send a transcript window to the model once processed retention is already fenced.
+        # Output XADDs remain atomically guarded too, covering a fence installed during the call.
+        if not _processed_writable():
+            return False
         tid = f"beat{idx}"
         staged = [{**seg, "rewrite_pass": int(seg.get("_rewrite_passes", 0)) + 1} for seg in segs]
-        for ev in card_turn(staged):
+        events = iter(card_turn(staged))
+        while True:
+            # A generator advances into the remote model call on ``next``. Check both immediately
+            # before that boundary and after it returns so a call crossing OFF/deadline cannot publish.
+            if not _processed_writable():
+                return False
+            try:
+                ev = next(events)
+            except StopIteration:
+                break
+            if not _processed_writable():
+                return False
             if ev.get("type") == "card":
                 _accumulate_card(cards, seen_titles, ev.get("card") or {})
             elif ev.get("type") == "note":
@@ -526,20 +788,57 @@ def serve_meeting(
                 # (baseline already emitted at ingest; this is the richer pass, still 1:1 by segment_id).
                 # Notes ride ONLY processed-notes.v1 — the out-stream is cards + agent activity, per
                 # its name (ADR 0027 carrier collapse; the SSE tails the proc stream directly).
-                _emit_proc_note(ev.get("note") or {})
+                if not _emit_proc_note(ev.get("note") or {}):
+                    return False
                 continue
-            stream.xadd(out_topic, {"event": json.dumps({**ev, "turn_id": tid})})
-        stream.xadd(out_topic, {"event": json.dumps({"type": "turn-complete", "turn_id": tid})})
+            if not _guarded_xadd(
+                out_topic, {"event": json.dumps({**ev, "turn_id": tid})}
+            ):
+                return False
+        if not _guarded_xadd(
+            out_topic,
+            {"event": json.dumps({"type": "turn-complete", "turn_id": tid})},
+        ):
+            return False
         sent_ids = {id(seg) for seg in segs}
         for seg in processing_window:
             if id(seg) in sent_ids:
                 seg["_rewrite_passes"] = int(seg.get("_rewrite_passes", 0)) + 1
-        _flush_mirror()
+        return _flush_mirror()
+
+    def _emit_guarded_turn(turn: Callable[[], Iterator[dict]], tid: str) -> bool:
+        if not _processed_writable():
+            return False
+        events = iter(turn())
+        while True:
+            if not _processed_writable():
+                return False
+            try:
+                ev = next(events)
+            except StopIteration:
+                break
+            if not _processed_writable():
+                return False
+            if not _guarded_xadd(
+                out_topic, {"event": json.dumps({**ev, "turn_id": tid})}
+            ):
+                return False
+        return _guarded_xadd(
+            out_topic,
+            {"event": json.dumps({"type": "turn-complete", "turn_id": tid})},
+        )
 
     while True:
+        # OFF removes the generation before stopping the runtime workload.  Check before blocking so a
+        # stale or race-spawned worker never reads transcript content, then check again after XREAD so a
+        # revocation that wakes the blocked read cannot reach the model or any derivative carrier.
+        if not _processed_writable():
+            return
         resp = stream.xread({transcript_stream: last}, count=50, block=idle_ms)
         if not resp:
             return  # transcript idle/ended → reap
+        if not _processed_writable():
+            return
         new_speaker = False
         for _name, entries in resp:
             for entry_id, fields in entries:
@@ -549,9 +848,12 @@ def serve_meeting(
                     mutable = [seg for seg in processing_window if int(seg.get("_rewrite_passes", 0)) < 3]
                     if mutable and enabled:
                         n += 1
-                        _run_beat(mutable, n)
-                    _flush_mirror()      # ingest-only notes (no beat ran) reach the mirrors too
-                    _persist_envelope()  # final durable render source (notes + accumulated cards)
+                        if not _run_beat(mutable, n):
+                            return
+                    if not _flush_mirror():  # ingest-only notes reach the mirrors too
+                        return
+                    if not _persist_envelope():  # final durable render source
+                        return
                     # processed-notes.v1 ``view_end`` (ADR 0027): the stream is COMPLETE here — the
                     # final beat has run and every note is emitted. The db-writer flushes the durable
                     # view ON this marker (its bounded deadline covers a worker that dies without one);
@@ -562,9 +864,18 @@ def serve_meeting(
                         end_marker: dict = {"type": "view_end"}
                         if last and last != "0":
                             end_marker["cursor"] = str(last)
-                        stream.xadd(proc_stream, end_marker)
+                        if not _guarded_xadd(proc_stream, end_marker):
+                            return
                     if doc_turn is not None:  # post-meeting WRITE: author/update the kg meeting entity
-                        _emit_turn(stream, out_topic, lambda: doc_turn(cards), "meeting-doc")
+                        # Redis cannot atomically serialize a workspace write. S09 still owns the
+                        # authoritative worker stop + workspace/Brain purge; this acknowledgement
+                        # prevents known-fenced work from starting and its output is fenced below.
+                        if not _processed_writable():
+                            return
+                        if not _emit_guarded_turn(
+                            lambda: doc_turn(cards), "meeting-doc"
+                        ):
+                            return
                     return  # meeting ended → reap
                 for seg_index, seg in enumerate(payload.get("segments", [])):
                     sid = seg.get("segment_id") or f"{entry_id}:{seg_index}"
@@ -586,19 +897,30 @@ def serve_meeting(
                     # so the cleaned channel never has a gap even before/without an LLM upgrade beat.
                     base = _proc_note(item)
                     if base is not None:
-                        _emit_proc_note(base)
+                        if not _emit_proc_note(base):
+                            return
                     sp = seg.get("speaker")
                     if sp and sp not in seen_speakers:
                         seen_speakers.add(sp)
                         new_speaker = True
                 # Advance the per-meeting CURSOR to the last raw stream-id we've now cleaned (gap-fill
                 # picks up from here on re-enable; OFF freezes it at the last processed entry).
-                _set_cursor(stream, cursor_key, entry_id)
+                if not _set_cursor(
+                    stream,
+                    cursor_key,
+                    entry_id,
+                    fence_key=fence_key,
+                    processing_flag_key=processing_flag_key,
+                    processing_token=processing_token,
+                    processing_expires_at_ms=processing_expires_at_ms,
+                ):
+                    return
         if enabled and buffer and (new_speaker or len(buffer) >= beat_segments):
             n += 1
             mutable = [seg for seg in processing_window if int(seg.get("_rewrite_passes", 0)) < 3]
             if mutable:
-                _run_beat(mutable, n)
+                if not _run_beat(mutable, n):
+                    return
             processing_window = [seg for seg in processing_window if int(seg.get("_rewrite_passes", 0)) < 3]
             window_by_id = {seg["segment_id"]: seg for seg in processing_window}
             buffer = []
@@ -630,45 +952,127 @@ def _emit_beat(stream: _Stream, out_topic: str, card_turn, segments: list[dict],
 # ── post-meeting WRITE turn: distill the surfaced cards into the kg meeting entity ────────────────
 
 _CARD_GROUP = {  # card kind → the section it lands under in the doc
-    "person": "Attendees", "company": "Companies", "product": "Products",
+    "person": "Attendees",
+    "company": "Companies",
+    "product": "Products",
+    "topic": "Topics",
+    "decision": "Decisions",
+    "action": "Actions",
 }
 
-MEETING_DOC_PROMPT = (
-    "The meeting has ENDED. Author or update the knowledge-graph entity for it as a SINGLE markdown "
-    "file at the EXACT path `kg/entities/meeting/{native}.md` in this workspace (create parent dirs if "
-    "needed). This must be IDEMPOTENT — if the file already exists, UPDATE it in place (do not create a "
-    "duplicate or a new path).\n\n"
-    "The file MUST have this exact YAML frontmatter (between `---` fences) as the very first lines:\n"
-    "---\n"
-    "type: meeting\n"
-    "id: {native}\n"
-    "title: {title}\n"
-    "meeting_id: {meeting_id}\n"
-    "session_uid: {session_uid}\n"
-    "platform: {platform}\n"
-    "date: {date}\n"
-    "---\n\n"
-    "After the frontmatter, write a 2-4 line plain-English SUMMARY of the meeting (no transcript — a "
-    "distilled summary), then the surfaced entities grouped under `## Attendees`, `## Companies`, "
-    "`## Topics`, `## Decisions`, `## Actions` headings, each entry a `[[wikilink]]` (omit a heading if "
-    "it has no entries). Here are the entities surfaced during the meeting (JSON):\n\n{cards}\n\n"
-    "Do NOT copy the raw transcript. When done, write/edit ONLY that one file."
-)
+# Backward import compatibility only. Post-meeting documents are no longer prompts: the worker writes
+# them deterministically below, so raw native ids/titles/cards never reach a tool-capable harness.
+MEETING_DOC_PROMPT = None
+
+
+def _structured_inline(value: object, *, limit: int) -> str:
+    """Flatten untrusted display text into one bounded, HTML-inert markdown line."""
+    text = " ".join(str(value or "").split())[:limit]
+    return (
+        text.replace("\\", "/")
+        .replace("[", "(")
+        .replace("]", ")")
+        .replace("`", "'")
+        .replace("*", "")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _wikilink_title(value: object) -> str:
+    return (
+        _structured_inline(value, limit=200)
+        .replace("[", "(")
+        .replace("]", ")")
+        .replace("|", "-")
+    )
+
+
+def _read_meeting_notes(path: Path) -> list[dict]:
+    notes: list[dict] = []
+    if not path.exists():
+        return notes
+    try:
+        for line in path.read_text().splitlines():
+            match = _PROC_LINE_RE.match(line)
+            if not match:
+                continue
+            rest = line[match.end():].strip()
+            speaker = "Speaker"
+            body = rest
+            if rest.startswith("**") and ":**" in rest:
+                speaker = rest[2:rest.index(":**")].strip() or "Speaker"
+                body = rest[rest.index(":**") + 3:].strip()
+            notes.append({"id": match.group("id"), "speaker": speaker, "text": body})
+    except OSError:
+        return []
+    return notes
+
+
+def render_meeting_document(meta: dict, notes: list[dict], cards: list[dict]) -> str:
+    """Render a deterministic final document from already-structured notes/cards."""
+    groups: dict[str, list[tuple[str, str]]] = {}
+    summary_lines: list[str] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        heading = _CARD_GROUP.get(str(card.get("kind") or "").strip().lower())
+        title = _wikilink_title(card.get("title"))
+        if not heading or not title:
+            continue
+        body = _structured_inline(card.get("body"), limit=500)
+        groups.setdefault(heading, []).append((title, body))
+        if len(summary_lines) < 4:
+            summary_lines.append(f"{title}: {body}" if body else title)
+
+    if not summary_lines:
+        for note in notes[:4]:
+            text = _structured_inline(note.get("text"), limit=500)
+            if text:
+                summary_lines.append(text)
+    if not summary_lines:
+        summary_lines.append("No processed meeting notes were retained.")
+
+    parts = ["---", _meeting_frontmatter_text(meta), "---", "", "## Summary", ""]
+    parts.extend(line if line.endswith((".", "!", "?")) else f"{line}." for line in summary_lines)
+    for heading in ("Attendees", "Companies", "Products", "Topics", "Decisions", "Actions"):
+        entries = groups.get(heading)
+        if not entries:
+            continue
+        parts.extend(["", f"## {heading}", ""])
+        for title, body in entries:
+            suffix = f" — {body}" if body else ""
+            parts.append(f"- [[{title}]]{suffix}")
+    parts.extend(["", *_meeting_transcript_body(notes)])
+    return "\n".join(parts).rstrip() + "\n"
 
 
 def meeting_doc_turn(
-    work: Path, cards: list[dict], *, native: str, meeting_id: str, session_uid: str,
-    platform: str, date: str, title: str, model: str | None = None,
+    work: Path,
+    cards: list[dict],
+    *,
+    row_id: str | int,
+    platform: str,
+    date: str,
+    authority_current: Callable[[], bool] | None = None,
 ) -> Iterator[dict]:
-    """The post-meeting WRITE turn: ONE governed turn (commit=True, Write/Edit allowed,
-    session_continuity=False so it never touches the chat session) that authors/updates the meeting
-    entity at ``kg/entities/meeting/<native>.md`` — a distilled summary + the surfaced cards as grouped
-    wikilinks. Idempotent (re-running updates rather than duplicates)."""
-    prompt = MEETING_DOC_PROMPT.format(
-        native=native, title=title, meeting_id=meeting_id, session_uid=session_uid,
-        platform=platform, date=date, cards=json.dumps(cards, ensure_ascii=False),
-    )
-    yield from run_turn_over_workspace(
-        work, prompt, model=model, allowed_tools=["Read", "Write", "Edit"],
-        commit=True, session_continuity=False,
-    )
+    """Write one row-scoped final meeting document without invoking a model or tools."""
+    document, _envelope = meeting_artifact_paths(work, row_id)
+    canonical = str(row_id)
+    meta = {
+        "type": "meeting",
+        "id": canonical,
+        "title": f"Meeting {canonical}",
+        "meeting_id": canonical,
+        "session_uid": canonical,
+        "platform": str(platform),
+        "date": str(date),
+    }
+    notes = _read_meeting_notes(document)
+    writer = lambda: _atomic_write_text(document, render_meeting_document(meta, notes, cards))
+    if authority_current is not None:
+        if not write_artifact_if_current(work, document, writer, authority_current):
+            return
+    else:
+        writer()
+    yield {"type": "message-delta", "text": f"Updated meeting {canonical}."}

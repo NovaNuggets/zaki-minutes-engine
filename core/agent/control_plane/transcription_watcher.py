@@ -5,6 +5,10 @@ the jobs only the agent-api can do — key the copilot on the meetings-domain nu
 REGISTER the live meeting, RE-ARM the copilot dispatch while the user has processing enabled (spawn-or-touch,
 idempotent), and on ``session_end`` reap the copilot + connect the meeting's kg doc.
 
+Before registration or dispatch, every numeric row is resolved to its canonical database owner through
+meeting-api's secret-protected internal owner edge. Missing, unreachable, or malformed authority fails
+closed; bot/caller owner hints are ignored and there is no shared production subject fallback.
+
 P0 (cross-tenant leak fix): the transcript CARRIER + ``:on`` + ``:cursor`` + dispatch keys are the numeric
 ROW id ``mid`` (unique per (user, platform, native, run)), NOT the native Meet code (which collides across
 DIFFERENT users AND across ONE user's re-sends — keying transcript data by it leaked one user's transcript
@@ -32,6 +36,11 @@ import urllib.error
 import urllib.request
 
 from shared import units
+from shared.http import open_no_redirect, read_json_bounded
+from shared.meeting_retention import (
+    claim_processing_if_writable,
+    processing_deadline_from_token,
+)
 
 logger = logging.getLogger("agent_api.tx_watch")
 
@@ -68,6 +77,7 @@ MEETINGS_LIST_LIMIT = 100
 # TYPED fault surfaced on an OBSERVABLE channel, and "absence of an expected signal is itself a reportable
 # state." `relay_health()` is that channel (read by /api/meeting/relay-health → the control panel).
 _relay_health: dict = {
+    "owner_resolve": {"ok": True, "kind": None, "detail": None, "at": None, "misses": 0},
     "native_resolve": {"ok": True, "kind": None, "detail": None, "at": None, "misses": 0},
     "ingest": {"ok": True, "last_segment_at": None, "segments": 0},
 }
@@ -120,6 +130,75 @@ def _title(platform: str, native: str) -> str:
     return f"{_PLATFORM.get(platform, platform)} · {native}"
 
 
+OWNER_RESPONSE_MAX_BYTES = 4096
+DOC_LINK_RESPONSE_MAX_BYTES = 8192
+MAX_MEETING_ROW_ID = 2**63 - 1
+
+
+def _canonical_meeting_id(value) -> "str | None":
+    raw = str(value or "")
+    if not raw.isdigit() or raw.startswith("0") or len(raw) > 19:
+        return None
+    return raw if int(raw) <= MAX_MEETING_ROW_ID else None
+
+
+def _validated_owner_record(record, expected_mid: int) -> "dict | None":
+    expected = str(expected_mid)
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"meeting_id", "user_id"}
+        or not isinstance(record.get("meeting_id"), str)
+        or _canonical_meeting_id(record["meeting_id"]) != expected
+        or not isinstance(record.get("user_id"), str)
+        or _canonical_meeting_id(record["user_id"]) is None
+    ):
+        return None
+    return {"meeting_id": expected, "user_id": record["user_id"]}
+
+
+def _http_owner_lookup(meeting_api_url: str, internal_secret: str):
+    """Build the trusted row-owner lookup used by the production watcher.
+
+    The edge is deliberately narrower than the user-facing meeting read: one exact numeric row in,
+    ``{meeting_id, user_id}`` out.  The internal credential never follows a redirect, responses are
+    bounded before JSON parsing, and any missing/malformed/dependency state fails closed.
+    """
+    base = (meeting_api_url or "").rstrip("/")
+    secret = internal_secret or ""
+
+    def _lookup(meeting_id: str) -> "dict | None":
+        raw_mid = _canonical_meeting_id(meeting_id)
+        if not base or not secret or raw_mid is None:
+            return None
+        mid = int(raw_mid)
+        try:
+            request = urllib.request.Request(
+                f"{base}/internal/meetings/{mid}/owner",
+                headers={"X-Internal-Secret": secret},
+            )
+            with open_no_redirect(request, timeout=5) as response:
+                if response.status != 200:
+                    _report_fault("owner_resolve", _classify_http(response.status),
+                                  f"HTTP {response.status}")
+                    return None
+                record = read_json_bounded(response, max_bytes=OWNER_RESPONSE_MAX_BYTES)
+        except urllib.error.HTTPError as error:
+            _report_fault("owner_resolve", _classify_http(error.code), f"HTTP {error.code}")
+            return None
+        except Exception as error:  # noqa: BLE001 — dependency/parse faults deny attribution
+            _report_fault("owner_resolve", "unavailable", type(error).__name__)
+            return None
+
+        record = _validated_owner_record(record, mid)
+        if record is None:
+            _report_fault("owner_resolve", "bad_response", "invalid owner response")
+            return None
+        _clear_fault("owner_resolve")
+        return record
+
+    return _lookup
+
+
 def _resolve_native(meeting_id: str) -> "tuple[str, str] | None":
     """Map the bot's NUMERIC meeting_id → its native Meet code (e.g. nba-agyz-gbe) via the gateway, so
     the wire/dispatch/feed key on ONE id per physical meeting (re-launches dedupe to one entry) — and the
@@ -144,14 +223,31 @@ def _resolve_native(meeting_id: str) -> "tuple[str, str] | None":
     try:
         req = urllib.request.Request(
             gw + f"/meetings?limit={MEETINGS_LIST_LIMIT}", headers={"X-API-Key": key})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read().decode() or "{}")
-        items = data if isinstance(data, list) else (data.get("meetings") or data.get("items") or [])
+        with open_no_redirect(req, timeout=5) as resp:
+            data = read_json_bounded(resp)
+        items = data if isinstance(data, list) else (
+            (data.get("meetings") or data.get("items") or []) if isinstance(data, dict) else None
+        )
+        if (not isinstance(items, list) or len(items) > MEETINGS_LIST_LIMIT
+                or any(not isinstance(item, dict) for item in items)):
+            raise ValueError("invalid gateway meetings response")
+        resolved: dict[str, tuple[str, str]] = {}
         for mt in items:
-            mid = str(mt.get("id") or mt.get("meeting_id") or "")
+            raw_mid = mt.get("id") or mt.get("meeting_id") or ""
             nat = mt.get("native_meeting_id") or mt.get("native_id") or mt.get("platform_specific_id")
+            platform = mt.get("platform") or "google_meet"
+            if (raw_mid and (
+                not isinstance(raw_mid, (str, int))
+                or isinstance(raw_mid, bool)
+                or len(str(raw_mid)) > 128
+            )) or (nat and (not isinstance(nat, str) or len(nat) > 512)) or (
+                not isinstance(platform, str) or len(platform) > 64
+            ):
+                raise ValueError("invalid gateway meetings response")
+            mid = str(raw_mid)
             if mid and nat:
-                _native[mid] = (nat, mt.get("platform") or "google_meet")
+                resolved[mid] = (nat, platform)
+        _native.update(resolved)
     except urllib.error.HTTPError as e:
         # P18: a TYPED, ATTRIBUTED fault — not a swallowed "best-effort" miss. 401/403 almost always means
         # the bot key is stale/invalid (e.g. after a DB wipe), which is exactly the 90-minute mystery.
@@ -173,31 +269,60 @@ def _resolve_native(meeting_id: str) -> "tuple[str, str] | None":
     return hit
 
 
-def _record_meeting_doc(native: str, platform: str, subject: str) -> None:
-    """Best-effort: connect the meeting's own kg doc ref to the meeting on session_end, via the
-    gateway (X-API-Key). Recorded from the watcher — NOT the isolated worker — so the user key never
-    enters the agent container. MUST NEVER raise: a failure here can't be allowed to crash the
-    watcher, so everything is wrapped and merely logged."""
+def _validated_doc_link_response(record, expected_mid: int) -> bool:
+    if not isinstance(record, dict) or set(record) != {"meeting_id", "doc"}:
+        return False
+    if (
+        not isinstance(record.get("meeting_id"), str)
+        or _canonical_meeting_id(record["meeting_id"]) != str(expected_mid)
+    ):
+        return False
+    doc = record.get("doc")
+    if not isinstance(doc, dict) or set(doc) != {"workspace", "path", "title", "kind"}:
+        return False
+    workspace = doc.get("workspace")
+    expected_title = f"Meeting {expected_mid}"
+    return (
+        isinstance(workspace, str)
+        and _canonical_meeting_id(workspace) is not None
+        and doc.get("title") == expected_title
+        and doc.get("kind") == "meeting"
+        and doc.get("path") == f"kg/entities/meeting/{expected_mid}.md"
+    )
+
+
+def _record_meeting_doc(meeting_id: str) -> bool:
+    """Best-effort exact-row doc link over meeting-api's secret-protected internal edge.
+
+    Meeting-api derives the owner workspace and native-id path from the locked numeric row. The
+    watcher sends neither a global user API key nor a native/owner carrier. Redirects are refused,
+    the response is bounded + shape-checked, and every failure is contained so session reaping
+    cannot crash.
+    """
+    raw_mid = _canonical_meeting_id(meeting_id)
+    base = os.environ.get("VEXA_MEETING_API_URL", "http://meeting-api:8080").rstrip("/")
+    secret = os.environ.get("VEXA_INTERNAL_API_SECRET", "")
+    if raw_mid is None or not base or not secret:
+        return False
+    mid = int(raw_mid)
     try:
-        key = os.environ.get("VEXA_BOT_API_KEY", "")
-        if not key:
-            return
-        gw = os.environ.get("VEXA_GATEWAY_URL", "http://gateway:8000").rstrip("/")
-        body = json.dumps({
-            "workspace": subject,
-            "path": f"kg/entities/meeting/{native}.md",
-            "title": native,
-            "kind": "meeting",
-        }).encode()
-        url = f"{gw}/meetings/{platform}/{native}/docs"
         req = urllib.request.Request(
-            url, data=body, method="POST",
-            headers={"X-API-Key": key, "Content-Type": "application/json"},
+            f"{base}/internal/meetings/{mid}/docs",
+            data=b"",
+            method="POST",
+            headers={"X-Internal-Secret": secret},
         )
-        with urllib.request.urlopen(req, timeout=5):
-            pass
-    except Exception:  # noqa: BLE001 — recording the doc ref is best-effort; never crash the watcher
-        logger.exception("connect meeting doc ref failed for %s/%s", platform, native)
+        with open_no_redirect(req, timeout=5) as response:
+            if response.status != 200:
+                return False
+            record = read_json_bounded(response, max_bytes=DOC_LINK_RESPONSE_MAX_BYTES)
+        if not _validated_doc_link_response(record, mid):
+            logger.error("connect meeting doc ref returned an invalid response for row %s", mid)
+            return False
+        return True
+    except Exception as error:  # noqa: BLE001 — doc linking is best-effort; never crash the watcher
+        logger.error("connect meeting doc ref failed for row %s: %s", mid, type(error).__name__)
+        return False
 
 
 def _resume_cursor(r, key: str) -> str:
@@ -213,23 +338,23 @@ def _resume_cursor(r, key: str) -> str:
     return str(cursor) if cursor else "0-0"
 
 
-def start(redis_url: str, dispatcher, live, *, subject: str = "u_live") -> threading.Thread:
-    """Spawn the watcher (the ARM daemon thread) and return it (tests/introspection). ``keymap``
-    (numeric meeting_id → row-id routing key) is the arm thread's own state.
+def start(redis_url: str, dispatcher, live, *, owner_lookup) -> threading.Thread:
+    """Spawn the ARM daemon with a mandatory authoritative row-owner lookup.
 
-    ``subject`` is a PRE-M2 placeholder (defaults to ``u_live``): every armed copilot is attributed to
-    this one subject. Live-meeting dispatch (M2) must resolve and pass the real meeting OWNER instead —
-    until then the copilot's meeting doc lands in the placeholder workspace, not the owner's."""
+    ``keymap`` and the verified row-owner cache are thread-local and cleared at ``session_end``.  There
+    is intentionally no default subject: production cannot register or dispatch a meeting until its
+    numeric row has been bound to the owner returned by meeting-api.
+    """
     keymap: dict[str, str] = {}
     t = threading.Thread(
-        target=_run_arm, args=(redis_url, dispatcher, live, subject, keymap),
+        target=_run_arm, args=(redis_url, dispatcher, live, owner_lookup, keymap),
         daemon=True, name="tx-watch",
     )
     t.start()
     return t
 
 
-def _run_arm(redis_url: str, dispatcher, live, subject: str, keymap: dict) -> None:
+def _run_arm(redis_url: str, dispatcher, live, owner_lookup, keymap: dict) -> None:
     """Inbound watch → key on the row id, register live, re-arm copilot, reap on session_end. Does NOT
     write the transcript carrier — meeting-api's collector owns ``tc:meeting:{row_id}`` (P23/P0)."""
     import redis as redislib
@@ -241,8 +366,12 @@ def _run_arm(redis_url: str, dispatcher, live, subject: str, keymap: dict) -> No
     except redislib.exceptions.ResponseError as e:
         if "BUSYGROUP" not in str(e):
             raise
-    last_arm: dict[str, float] = {}     # native key → last spawn-or-touch (monotonic)
+    # row key → (last spawn-or-touch monotonic time, opaque consent generation).  A new ON token
+    # bypasses the keep-alive throttle so re-enabling does not wait up to REARM_SEC, while an old
+    # worker remains permanently tied to its prior token.
+    last_arm: dict[str, tuple[float, str]] = {}
     first_seen: dict[str, float] = {}   # numeric meeting_id → first segment time (resolve-grace window)
+    owner_cache: dict[str, str] = {}    # exact verified row id → immutable owner subject
     logger.info("transcription watcher up — consuming %s (group=%s)", SRC, GROUP)
 
     while True:
@@ -258,8 +387,17 @@ def _run_arm(redis_url: str, dispatcher, live, subject: str, keymap: dict) -> No
             for msg_id, fields in entries:
                 try:
                     r.xack(SRC, GROUP, msg_id)
-                    _handle(r, dispatcher, live, subject, json.loads(fields.get("payload") or "{}"),
-                            last_arm, keymap, first_seen)
+                    _handle(
+                        r,
+                        dispatcher,
+                        live,
+                        owner_lookup,
+                        json.loads(fields.get("payload") or "{}"),
+                        last_arm,
+                        keymap,
+                        first_seen,
+                        owner_cache,
+                    )
                 except Exception:  # noqa: BLE001
                     logger.exception("bad transcription frame; skipping")
 
@@ -267,7 +405,28 @@ def _run_arm(redis_url: str, dispatcher, live, subject: str, keymap: dict) -> No
 RESOLVE_GRACE_SEC = 6.0  # how long to wait for a native id before falling back to the numeric key
 
 
-def _handle(r, dispatcher, live, subject, p, last_arm, keymap, first_seen) -> None:
+def _verified_owner(meeting_id: str, owner_lookup, owner_cache: dict[str, str]) -> "str | None":
+    """Resolve and cache only an exact, minimal meeting-api owner record."""
+    cached = owner_cache.get(meeting_id)
+    if cached is not None:
+        return cached
+    try:
+        record = owner_lookup(meeting_id)
+    except Exception as error:  # noqa: BLE001 — owner authority uncertainty always denies processing
+        _report_fault("owner_resolve", "unavailable", type(error).__name__)
+        return None
+    expected_mid = int(meeting_id)
+    record = _validated_owner_record(record, expected_mid)
+    if record is None:
+        _report_fault("owner_resolve", "bad_response", "invalid owner response")
+        return None
+    subject = str(record["user_id"])
+    owner_cache[meeting_id] = subject
+    _clear_fault("owner_resolve")
+    return subject
+
+
+def _handle(r, dispatcher, live, owner_lookup, p, last_arm, keymap, first_seen, owner_cache) -> None:
     # P0 (cross-tenant leak fix): the TRANSCRIPT CARRIER + :on + :cursor + dispatch keys are the numeric
     # ROW id `mid` — NOT the native Meet code. The native id is NOT unique (it collides across DIFFERENT
     # users and across ONE user's re-sends of the same link), so keying transcript data by it leaked one
@@ -275,12 +434,16 @@ def _handle(r, dispatcher, live, subject, p, last_arm, keymap, first_seen) -> No
     # meetings-domain row id, unique per run) on every segment, so we can key on it IMMEDIATELY — no
     # resolve-grace wait, no gateway round-trip on the hot path.
     #
-    # The native code is still resolved (best-effort) but ONLY for DISPLAY: the kg doc (`_record_meeting_doc`),
-    # the human-readable title, and the `native_id` field on the live entry / meeting_ref. A resolution
+    # The native code is still resolved (best-effort) but ONLY for DISPLAY: the human-readable title
+    # and the `native_id` field on the live entry / meeting_ref. The doc-link edge uses the exact row
+    # id and derives its native/owner server-side. A resolution
     # miss no longer diverges the carrier key (that is `mid`, always present) — it only degrades display,
     # so the P18 relay-health fault is still reported (display only) but the transcript never leaks/starves.
-    mid = str(p.get("meeting_id") or p.get("uid") or "")
-    if not mid:
+    mid = _canonical_meeting_id(p.get("meeting_id"))
+    if mid is None:
+        return
+    subject = _verified_owner(mid, owner_lookup, owner_cache)
+    if subject is None:
         return
     # PREFER the native id stamped on the segment by its producer (the bot knows it from its invocation).
     # The gateway lookup is only a labeled fallback for older bots that don't stamp it — and now purely a
@@ -320,14 +483,18 @@ def _handle(r, dispatcher, live, subject, p, last_arm, keymap, first_seen) -> No
         last_arm.pop(key, None)
         keymap.pop(mid, None)
         first_seen.pop(mid, None)
+        owner_cache.pop(mid, None)
         try:
             r.delete(f"proc:meeting:{key}:on")
-        except Exception:  # noqa: BLE001 — best-effort; a leftover flag only wastes a re-arm attempt
-            logger.exception("processing-flag reap failed for %s", key)
+        except Exception as error:  # noqa: BLE001 — best-effort; a leftover flag only wastes a re-arm attempt
+            logger.warning(
+                "processing-flag reap failed (error_type=%s)",
+                type(error).__name__,
+            )
         logger.info("meeting %s ended → reaping copilot", key)
-        # Connect this meeting's own kg doc (authored by the §4 worker on session_end) to the
-        # meeting — from here, so the user key stays out of the isolated worker container.
-        _record_meeting_doc(native, platform, subject)
+        # Connect this meeting's own kg doc (authored by the §4 worker on session_end) to the exact
+        # row. Meeting-api derives owner/native under its row lock; no global user key participates.
+        _record_meeting_doc(mid)
         return
     if kind != "transcription":
         return
@@ -351,22 +518,72 @@ def _handle(r, dispatcher, live, subject, p, last_arm, keymap, first_seen) -> No
     now = time.monotonic()
     # The opt-in flag is ``proc:meeting:{key}:on`` — a DISTINCT key from the processed-notes stream
     # ``proc:meeting:{key}`` (a GET on that stream raises WRONGTYPE and would crash this arm loop).
-    if r.get(f"proc:meeting:{key}:on") and now - last_arm.get(key, 0.0) > REARM_SEC:
-        last_arm[key] = now
-        # Rolling TTL refresh (P21/P22 — the flag's REAL end-of-life): segments flowing = the flag
-        # stays; flow stopped = it expires within the hour. Needed because NO session_end frame
-        # crosses this wire on the stop path (verified on the eyeball) — the reap branch below only
-        # covers bots that do publish one; without this, an armed flag persisted forever.
+    flag_key = f"proc:meeting:{key}:on"
+    cursor_key = f"proc:meeting:{key}:cursor"
+    try:
+        desired_token = r.get(flag_key)
+    except Exception as error:  # noqa: BLE001 — consent authority failure must not arm a worker
+        logger.warning(
+            "processing desired-state lookup failed (error_type=%s)",
+            type(error).__name__,
+        )
+        return
+    prior = last_arm.get(key)
+    prior_at = prior[0] if isinstance(prior, tuple) else float(prior or 0.0)
+    prior_token = prior[1] if isinstance(prior, tuple) else None
+    if desired_token and (
+        str(desired_token) != prior_token or now - prior_at > REARM_SEC
+    ):
+        desired_token = str(desired_token)
         try:
-            r.expire(f"proc:meeting:{key}:on", PROC_FLAG_ROLLING_TTL_SEC)
-        except Exception:  # noqa: BLE001 — refresh is hygiene; never block the arm
-            pass
-        _arm(dispatcher, subject, key, platform, transcript_start_id=_resume_cursor(r, key),
-             numeric_meeting_id=mid if mid.isdigit() else None, native_id=native)
+            expires_at_ms = processing_deadline_from_token(desired_token)
+            claimed, cursor = claim_processing_if_writable(
+                r,
+                key,
+                flag_key=flag_key,
+                cursor_key=cursor_key,
+                ttl_seconds=PROC_FLAG_ROLLING_TTL_SEC,
+                token=desired_token,
+                expires_at_ms=expires_at_ms,
+            )
+        except Exception as error:  # noqa: BLE001 — retention authority failure is fail-closed
+            logger.warning(
+                "processing retention claim failed (error_type=%s)",
+                type(error).__name__,
+            )
+            return
+        if claimed:
+            # Close claim→dispatch against OFF/re-ON.  The worker also validates this exact token before
+            # reading or writing, so a delete after this check still produces a harmless stale worker.
+            try:
+                confirmed_token = r.get(flag_key)
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "processing generation confirmation failed (error_type=%s)",
+                    type(error).__name__,
+                )
+                return
+            if not confirmed_token or str(confirmed_token) != desired_token:
+                return
+            confirmed_token = str(confirmed_token)
+            last_arm[key] = (now, confirmed_token)
+            _arm(
+                dispatcher,
+                subject,
+                key,
+                platform,
+                transcript_start_id=cursor or "0-0",
+                numeric_meeting_id=mid if mid.isdigit() else None,
+                native_id=native,
+                processing_token=confirmed_token,
+                processing_expires_at_ms=expires_at_ms,
+            )
 
 
 def _arm(dispatcher, subject: str, key: str, platform: str, *, transcript_start_id: str = "0-0",
-         numeric_meeting_id: str | None = None, native_id: str | None = None) -> None:
+         numeric_meeting_id: str | None = None, native_id: str | None = None,
+         processing_token: str | None = None,
+         processing_expires_at_ms: int | None = None) -> None:
     """Spawn-or-touch the meeting's copilot (keyed agent-meet-{key}, where key is the ROW id). Idempotent
     FOR REAL since ADR 0027: runtime.v1 create touches a running workload (returns its live status) and
     only spawns one that is absent/exited — before that, every re-arm force-replaced the live container
@@ -387,6 +604,10 @@ def _arm(dispatcher, subject: str, key: str, platform: str, *, transcript_start_
         # (proc:meeting:{numeric}) so a re-sent bot on the same native link never mixes/clobbers a
         # previous meeting's processed doc. An internal hint — stripped before the unit.v1 check.
         meeting_ref["numeric_meeting_id"] = str(numeric_meeting_id)
+    if processing_token:
+        meeting_ref["processing_token"] = str(processing_token)
+    if processing_expires_at_ms is not None:
+        meeting_ref["processing_expires_at_ms"] = processing_expires_at_ms
     inv = units.make_dispatch(
         subject=subject, trigger="transcription",
         start=units.entrypoint(inline=_BRIEF),

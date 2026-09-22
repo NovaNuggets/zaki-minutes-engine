@@ -5,7 +5,12 @@
  *  The `scheduled`-intent body uses the same flat `intent` PUT the producer (meeting-api) accepts.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { actionsFor } from "../meeting";
+import {
+  actionsFor,
+  canShowMeetingHeaderOwnerControls,
+  canShowRowActions,
+  shouldShowMeetingStatusBadge,
+} from "../meeting";
 import type { MeetingMock } from "../meetingModel";
 
 const NATIVE = "abc-defg-hij";
@@ -44,21 +49,38 @@ afterEach(() => vi.restoreAllMocks());
 describe("actionsFor — offered action sets per status", () => {
   const ids = (s: string) => actionsFor(row(s)).map((a) => a.id);
 
-  it("idle → Schedule + Send now + Delete", () => expect(ids("idle")).toEqual(["schedule", "send", "delete"]));
-  it("scheduled → Send now + Cancel + Delete", () => expect(ids("scheduled")).toEqual(["send", "cancel", "delete"]));
+  it("never exposes managed capture, withdrawal, or erasure controls in the reference Terminal", () => {
+    for (const status of ["idle", "scheduled", "requested", "joining", "active", "completed", "failed", "stopped"]) {
+      for (const unsupported of ["send", "resend", "stop", "erase"]) {
+        expect(ids(status)).not.toContain(unsupported);
+      }
+    }
+  });
+
+  it("idle → Schedule + Delete", () => expect(ids("idle")).toEqual(["schedule", "delete"]));
+  it("scheduled → Cancel + Delete", () => expect(ids("scheduled")).toEqual(["cancel", "delete"]));
   it("link-less planned rows → row-id actions only (no native path exists)", () => {
     const linkless = (s: string) => actionsFor({ ...row(s), native_id: undefined, id: "42" });
     expect(linkless("idle").map((a) => a.id)).toEqual(["delete"]);
     expect(linkless("scheduled").map((a) => a.id)).toEqual(["cancel", "delete"]);
   });
-  it("active → Stop only", () => expect(ids("active")).toEqual(["stop"]));
-  it("joining/awaiting/needs_help/stopping → Stop only", () => {
-    for (const s of ["requested", "joining", "awaiting_admission", "needs_help", "stopping"]) {
-      expect(ids(s)).toEqual(["stop"]);
+  it("active has no unsupported lifecycle control", () => expect(ids("active")).toEqual([]));
+  it("joining/awaiting/needs_human_help/stopping have no unsupported lifecycle control", () => {
+    for (const s of ["requested", "joining", "awaiting_admission", "needs_human_help", "stopping"]) {
+      expect(ids(s)).toEqual([]);
+      expect(shouldShowMeetingStatusBadge(row(s))).toBe(true);
     }
   });
-  it("completed/failed/stopped → Re-send", () => {
-    for (const s of ["completed", "failed", "stopped"]) expect(ids(s)).toEqual(["resend"]);
+  it("terminal and unknown rows expose no managed re-send or erasure controls", () => {
+    for (const s of ["completed", "failed", "stopped", "future_status"]) {
+      const terminal = { ...row(s), id: "42" };
+      expect(actionsFor(terminal)).toEqual([]);
+      expect(canShowRowActions(terminal)).toBe(false);
+    }
+  });
+  it("shared meeting headers never expose owner lifecycle or transcript-share controls", () => {
+    expect(canShowMeetingHeaderOwnerControls(row("active"))).toBe(true);
+    expect(canShowMeetingHeaderOwnerControls({ ...row("active"), shared: true })).toBe(false);
   });
 });
 
@@ -71,42 +93,20 @@ describe("actionsFor — each action fires the correct endpoint+body", () => {
     expect(body).toEqual({ intent: "idle" });
   });
 
-  it("idle→Send now POSTs the bot launch to the gateway-fronted /api/bots", () => {
-    actionsFor(row("idle")).find((a) => a.id === "send")!.run();
-    const { url, init, body } = lastFetch();
-    expect(url).toBe("/api/bots");
-    expect(init.method).toBe("POST");
-    expect(body).toEqual({ platform: "google_meet", native_meeting_id: NATIVE, meeting_url: `https://meet.google.com/${NATIVE}`, bot_name: "Vexa" });
-  });
-
-  it("active→Stop DELETEs the bot by platform+native (the gateway /api/bots route)", () => {
-    actionsFor(row("active")).find((a) => a.id === "stop")!.run();
-    const { url, init } = lastFetch();
-    expect(url).toBe(`/api/bots/google_meet/${NATIVE}`);
-    expect(init.method).toBe("DELETE");
-  });
-
-  it("active→Stop uses the meeting's REAL platform (Teams), not a hardcoded google_meet", () => {
-    actionsFor({ ...row("active"), platform: "teams" }).find((a) => a.id === "stop")!.run();
-    const { url, init } = lastFetch();
-    expect(url).toBe(`/api/bots/teams/${NATIVE}`);
-    expect(init.method).toBe("DELETE");
-  });
-
-  it("active→Stop reports network failures instead of throwing", async () => {
+  it("planned-row actions report network failures instead of throwing", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const onFailure = vi.fn();
     fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
 
-    await expect(actionsFor(row("active")).find((a) => a.id === "stop")!.run(onFailure)).resolves.toBeUndefined();
+    await expect(actionsFor(row("idle")).find((a) => a.id === "delete")!.run(onFailure)).resolves.toBeUndefined();
 
     expect(onFailure).toHaveBeenCalledWith({
-      actionId: "stop",
-      actionLabel: "Stop",
+      actionId: "delete",
+      actionLabel: "Delete",
       native: NATIVE,
       message: "Failed to fetch",
     });
-    expect(warn).toHaveBeenCalledWith("meeting action failed", expect.objectContaining({ actionId: "stop", message: "Failed to fetch" }));
+    expect(warn).toHaveBeenCalledWith("meeting action failed", expect.objectContaining({ actionId: "delete", message: "Failed to fetch" }));
   });
 
   it("idle→Schedule PUTs intent:scheduled with an ISO `at`", () => {
@@ -119,12 +119,6 @@ describe("actionsFor — each action fires the correct endpoint+body", () => {
     expect(init.method).toBe("PUT");
     expect(body.intent).toBe("scheduled");
     expect(body.at).toBe(at);
-  });
-
-  it("completed→Re-send POSTs the bot launch", () => {
-    actionsFor(row("completed")).find((a) => a.id === "resend")!.run();
-    const { url } = lastFetch();
-    expect(url).toBe("/api/bots");
   });
 
   it("planned→Delete DELETEs by ROW id (works link-less)", () => {
@@ -142,12 +136,4 @@ describe("actionsFor — each action fires the correct endpoint+body", () => {
     expect(body).toEqual({ scheduled_at: null });
   });
 
-  it("send uses the row's REAL meeting_url when present (zoom/teams need it)", () => {
-    actionsFor({ ...row("scheduled"), platform: "zoom", native_id: "1234567890", meeting_url: "https://us02web.zoom.us/j/1234567890?pwd=x" })
-      .find((a) => a.id === "send")!.run();
-    const { url, body } = lastFetch();
-    expect(url).toBe("/api/bots");
-    expect(body.platform).toBe("zoom");
-    expect(body.meeting_url).toBe("https://us02web.zoom.us/j/1234567890?pwd=x");
-  });
 });

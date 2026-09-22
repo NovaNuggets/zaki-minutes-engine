@@ -1,3 +1,31 @@
+{{- $minutesBoundaryMaterial := or (ne (trim (toString (.Values.minutes.agentErasureKeyId | default ""))) "") (ne (trim (toString (.Values.minutes.minutesErasureKeyId | default ""))) "") (ne (trim (toString (.Values.minutes.previousAgentErasureKeyId | default ""))) "") (ne (trim (toString (.Values.minutes.previousMinutesErasureKeyId | default ""))) "") (ne (trim (toString (.Values.secrets.agentErasureHmacSecret | default ""))) "") (ne (trim (toString (.Values.secrets.agentErasurePreviousVerificationSecret | default ""))) "") (ne (trim (toString (.Values.secrets.minutesErasureSigningSecret | default ""))) "") (ne (trim (toString (.Values.secrets.minutesErasurePreviousVerificationSecret | default ""))) "") -}}
+{{- $minutesErasure := or .Values.minutes.captureEnabled .Values.minutes.invocationV2Enabled .Values.minutes.readEnabled .Values.minutes.finalized.enabled .Values.minutes.ttl.enabled $minutesBoundaryMaterial -}}
+{{- $reservedMeetingRuntimeEnv := list
+  "DATABASE_URL" "DB_HOST" "DB_PORT" "DB_NAME" "DB_USER" "DB_PASSWORD" "DB_SSL_MODE"
+  "REDIS_URL" "RUNTIME_API_URL" "RUNTIME_CONTROL_SECRET" "RUNTIME_CALLBACK_SECRET"
+  "ADMIN_API_URL" "AGENT_API_URL" "INTERNAL_API_SECRET" "MEETING_TOKEN_SECRET"
+  "ADMIN_TOKEN" "ADMIN_API_TOKEN" "TRANSCRIPTION_SERVICE_URL" "TRANSCRIPTION_SERVICE_TOKEN"
+  "MINIO_ENDPOINT" "MINIO_ACCESS_KEY" "MINIO_SECRET_KEY" "MINIO_BUCKET" "MINIO_SECURE"
+  "S3_ENDPOINT" "S3_ACCESS_KEY" "S3_SECRET_KEY" "RECORDING_BUCKET" "STORAGE_BACKEND"
+  "ZAKI_MINUTES_CAPTURE_ENABLED" "ZAKI_MINUTES_INVOCATION_V2_ENABLED"
+  "ZAKI_MINUTES_READ_ENABLED" "ZAKI_MINUTES_AUTO_JOIN_ENABLED" "ZAKI_MINUTES_MANAGED_ONLY"
+  "ZAKI_READ_TOKEN_MINUTES" "ZAKI_MINUTES_HUB_TOKEN"
+  "ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID" "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET"
+  "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID" "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET"
+  "ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID"
+  "ZAKI_MINUTES_ERASURE_SIGNING_SECRET" "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID"
+  "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET" "ZAKI_MINUTES_FINALIZED_ENABLED"
+  "ZAKI_MINUTES_FINALIZED_URL" "ZAKI_MINUTES_FINALIZED_KEY_ID" "ZAKI_MINUTES_FINALIZED_SECRET"
+  "MINUTES_TTL_ENABLED" "MINUTES_TTL_INTERVAL_S" "MINUTES_TTL_BATCH_SIZE" "LOG_LEVEL"
+-}}
+{{- if .Values.meetingApi.enabled -}}
+{{- range .Values.meetingApi.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if or (has $name $reservedMeetingRuntimeEnv) (eq $name "ZAKI_READ_TOKEN_MINUTES") (hasPrefix "ZAKI_MINUTES_" $name) (hasPrefix "ZAKI_AGENT_ERASURE_" $name) (hasPrefix "MINUTES_" $name) -}}
+  {{- fail (printf "meetingApi.extraEnv may not override reserved runtime authentication setting %s; use the chart field and operator Secret" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.meetingApi.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +46,14 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: meeting-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        checksum/database-secret: {{ include "vexa.databaseSecretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml (mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.meetingApi.runAsUser) "fsGroupChangePolicy" "OnRootMismatch")) | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -29,8 +61,8 @@ spec:
       containers:
         - name: meeting-api
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.meetingApi.image.repository }}:{{ .Values.global.imageTag | default .Values.meetingApi.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.meetingApi.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.meetingApi.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.meetingApi.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -40,6 +72,8 @@ spec:
               value: {{ include "vexa.dbHostEffective" . | quote }}
             - name: DB_PORT
               value: {{ include "vexa.dbPortEffective" . | quote }}
+            - name: DB_SSL_MODE
+              value: {{ .Values.database.sslMode | quote }}
             - name: DB_NAME
               valueFrom:
                 secretKeyRef:
@@ -56,20 +90,43 @@ spec:
                   name: {{ include "vexa.postgresCredentialsSecretName" . | quote }}
                   key: POSTGRES_PASSWORD
             - name: REDIS_URL
-              value: {{ include "vexa.redisUrl" . | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: REDIS_URL
             - name: RUNTIME_API_URL
               value: "http://{{ include "vexa.componentName" (list . "runtime") }}:{{ .Values.runtime.service.port }}"
+            - name: RUNTIME_CONTROL_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: RUNTIME_CONTROL_SECRET
+            - name: RUNTIME_CALLBACK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: RUNTIME_CALLBACK_SECRET
+            - name: ADMIN_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "admin-api") }}:{{ .Values.adminApi.service.port }}"
+            {{- if $minutesErasure }}
+            - name: AGENT_API_URL
+              value: {{ .Values.minutes.nullalisErasureBaseUrl | quote }}
+            {{- else if .Values.agentApi.enabled }}
+            - name: AGENT_API_URL
+              value: "http://{{ include "vexa.componentName" (list . "agent-api") }}:{{ .Values.agentApi.service.port }}"
+            {{- end }}
             - name: INTERNAL_API_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
-            # MeetingToken is signed AND verified with the SAME admin secret admin-api holds.
-            - name: ADMIN_TOKEN
+            # Per-spawn MeetingTokens use a dedicated capability-signing key. Administrative auth
+            # is not projected into meeting-api.
+            - name: MEETING_TOKEN_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: ADMIN_API_TOKEN
+                  key: MEETING_TOKEN_SECRET
             - name: TRANSCRIPTION_SERVICE_URL
               value: {{ .Values.meetingApi.transcriptionServiceUrl | default "" | quote }}
             - name: TRANSCRIPTION_SERVICE_TOKEN
@@ -81,19 +138,106 @@ spec:
             - name: MINIO_ENDPOINT
               value: "{{ include "vexa.componentName" (list . "minio") }}:{{ .Values.minio.service.port }}"
             - name: MINIO_ACCESS_KEY
-              value: {{ .Values.minio.accessKey | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MINIO_ACCESS_KEY
             - name: MINIO_SECRET_KEY
-              value: {{ .Values.minio.secretKey | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MINIO_SECRET_KEY
             - name: MINIO_BUCKET
               value: {{ .Values.minio.bucket | quote }}
             {{- end }}
             - name: MINIO_SECURE
               value: {{ .Values.meetingApi.minioSecure | default "false" | quote }}
+            - name: ZAKI_MINUTES_CAPTURE_ENABLED
+              value: {{ .Values.minutes.captureEnabled | quote }}
+            - name: ZAKI_MINUTES_INVOCATION_V2_ENABLED
+              value: {{ .Values.minutes.invocationV2Enabled | quote }}
+            - name: ZAKI_MINUTES_READ_ENABLED
+              value: {{ .Values.minutes.readEnabled | quote }}
+            # Calendar auto-join is unavailable in launch v1.
+            - name: ZAKI_MINUTES_AUTO_JOIN_ENABLED
+              value: "false"
+            # Close the legacy POST /bots bypass only for the complete managed/historical
+            # topology. Ordinary Vexa keeps its upstream bot-create path.
+            - name: ZAKI_MINUTES_MANAGED_ONLY
+              value: {{ $minutesErasure | quote }}
+            {{- if .Values.minutes.readEnabled }}
+            - name: ZAKI_READ_TOKEN_MINUTES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_READ_TOKEN_MINUTES
+            {{- end }}
+            {{- if $minutesErasure }}
+            - name: ZAKI_MINUTES_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_MINUTES_HUB_TOKEN
+            - name: ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID
+              value: {{ .Values.minutes.agentErasureKeyId | quote }}
+            - name: ZAKI_AGENT_ERASURE_VERIFICATION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_AGENT_ERASURE_VERIFICATION_SECRET
+            {{- if ne (trim (toString (.Values.minutes.previousAgentErasureKeyId | default ""))) "" }}
+            - name: ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID
+              value: {{ .Values.minutes.previousAgentErasureKeyId | quote }}
+            - name: ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET
+            {{- end }}
+            - name: ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID
+              value: {{ .Values.minutes.minutesErasureKeyId | quote }}
+            - name: ZAKI_MINUTES_ERASURE_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_MINUTES_ERASURE_SIGNING_SECRET
+            {{- if ne (trim (toString (.Values.minutes.previousMinutesErasureKeyId | default ""))) "" }}
+            - name: ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID
+              value: {{ .Values.minutes.previousMinutesErasureKeyId | quote }}
+            - name: ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET
+            {{- end }}
+            {{- end }}
+            - name: ZAKI_MINUTES_FINALIZED_ENABLED
+              value: {{ .Values.minutes.finalized.enabled | quote }}
+            {{- if .Values.minutes.finalized.enabled }}
+            - name: ZAKI_MINUTES_FINALIZED_URL
+              value: {{ .Values.minutes.finalized.url | quote }}
+            - name: ZAKI_MINUTES_FINALIZED_KEY_ID
+              value: {{ .Values.minutes.finalized.keyId | quote }}
+            - name: ZAKI_MINUTES_FINALIZED_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: ZAKI_MINUTES_FINALIZED_SECRET
+            {{- end }}
+            - name: MINUTES_TTL_ENABLED
+              value: {{ .Values.minutes.ttl.enabled | quote }}
+            - name: MINUTES_TTL_INTERVAL_S
+              value: {{ .Values.minutes.ttl.intervalSeconds | quote }}
+            - name: MINUTES_TTL_BATCH_SIZE
+              value: {{ .Values.minutes.ttl.batchSize | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.meetingApi.logLevel | default "info" | quote }}
             {{- with .Values.meetingApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           startupProbe:
             httpGet:
               path: /health
@@ -115,6 +259,9 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.meetingApi.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

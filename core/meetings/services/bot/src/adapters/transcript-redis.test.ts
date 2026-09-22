@@ -14,7 +14,14 @@ import addFormats from 'ajv-formats';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRedisTranscriptSink, TRANSCRIPTION_STREAM, mutableChannel, type RedisTranscriptClient } from './transcript-redis.js';
+import {
+  createRedisTranscriptSink,
+  fenceAllMeetingCarriers,
+  TRANSCRIPTION_STREAM,
+  TRANSCRIPTION_STREAM_MAXLEN,
+  mutableChannel,
+  type RedisTranscriptClient,
+} from './transcript-redis.js';
 import type { TranscriptSegment } from '../contracts.js';
 
 let failed = 0;
@@ -32,14 +39,39 @@ addFormats(ajv);
 ajv.addSchema(txSchema);
 const validateSeg: ValidateFunction = ajv.compile({ $ref: `${txSchema.$id}#/$defs/TranscriptSegment` });
 
-interface XAddCall { key: string; id: string; fields: Record<string, string> }
+interface XAddCall {
+  key: string;
+  id: string;
+  fields: Record<string, string>;
+  options?: { TRIM?: { strategy?: string; strategyModifier?: string; threshold: number } };
+}
 interface PubCall { channel: string; message: string }
-function fakeClient() {
+function fakeClient(rawFenced = false) {
   const xadds: XAddCall[] = [];
   const pubs: PubCall[] = [];
-  const client: RedisTranscriptClient = {
-    async xAdd(key, id, fields) { xadds.push({ key, id, fields }); return '1-0'; },
+  const client = {
+    async xAdd(key, id, fields, options) { xadds.push({ key, id, fields, options }); return '1-0'; },
     async publish(channel, message) { pubs.push({ channel, message }); return 1; },
+    async writeTranscriptIfWritable(call: {
+      sourceStream: string;
+      payload: string;
+      channel: string;
+      message: string;
+      maxLen: number;
+      fenceKey: string;
+    }) {
+      if (rawFenced) return false;
+      xadds.push({
+        key: call.sourceStream,
+        id: '*',
+        fields: { payload: call.payload },
+        options: { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: call.maxLen } },
+      });
+      pubs.push({ channel: call.channel, message: call.message });
+      return true;
+    },
+  } as RedisTranscriptClient & {
+    writeTranscriptIfWritable(call: Record<string, unknown>): Promise<boolean>;
   };
   return { client, xadds, pubs };
 }
@@ -62,6 +94,13 @@ async function main(): Promise<void> {
     check('xAdd: key = transcription_segments', xadds[0]?.key === TRANSCRIPTION_STREAM, xadds[0]?.key);
     check('xAdd: id = *', xadds[0]?.id === '*', xadds[0]?.id);
     check('xAdd: single `payload` field', JSON.stringify(Object.keys(xadds[0]?.fields ?? {})) === JSON.stringify(['payload']), JSON.stringify(Object.keys(xadds[0]?.fields ?? {})));
+    check(
+      'xAdd: global source stream is producer-bounded',
+      xadds[0]?.options?.TRIM?.strategy === 'MAXLEN'
+        && xadds[0]?.options?.TRIM?.strategyModifier === '~'
+        && xadds[0]?.options?.TRIM?.threshold === TRANSCRIPTION_STREAM_MAXLEN,
+      JSON.stringify(xadds[0]?.options),
+    );
 
     const payload = JSON.parse(xadds[0]!.fields.payload) as Record<string, unknown>;
     check('xAdd: payload type = transcription', payload.type === 'transcription', String(payload.type));
@@ -92,6 +131,79 @@ async function main(): Promise<void> {
     const sink = createRedisTranscriptSink({ client, meetingId: 'abc-defg-hij' });
     await sink.publish(seg);
     check('string-id: channel = tc:meeting:abc-defg-hij:mutable', pubs[0]?.channel === 'tc:meeting:abc-defg-hij:mutable', pubs[0]?.channel);
+  }
+
+  // ── retention fence → a delayed bot buffer cannot recreate raw transcript carriers ──
+  {
+    const { client, xadds, pubs } = fakeClient(true);
+    const sink = createRedisTranscriptSink({ client, meetingId: 42 });
+    let refusal: unknown;
+    try {
+      await sink.publish(seg);
+    } catch (error) {
+      refusal = error;
+    }
+    check('raw fence: publish fails closed', refusal instanceof Error, String(refusal));
+    check('raw fence: no source entry is recreated', xadds.length === 0, String(xadds.length));
+    check('raw fence: no mutable transcript is published', pubs.length === 0, String(pubs.length));
+  }
+
+  // ── command queued before the local latch → Redis-side absolute deadline still refuses it ──
+  {
+    const cutoffMs = Date.parse('2026-07-15T09:00:00Z');
+    let redisNowMs = cutoffMs - 1_000;
+    let resume!: () => void;
+    const queued = new Promise<void>((resolve) => { resume = resolve; });
+    let redisWrites = 0;
+    const client: RedisTranscriptClient = {
+      async xAdd() { return '1-0'; },
+      async publish() { return 1; },
+      async writeTranscriptIfWritable(call) {
+        await queued;
+        if (call.captureExpiresAtMs !== undefined && redisNowMs >= call.captureExpiresAtMs) {
+          return false;
+        }
+        redisWrites++;
+        return true;
+      },
+    };
+    const sink = createRedisTranscriptSink({
+      client,
+      meetingId: 42,
+      captureExpiresAt: '2026-07-15T09:00:00Z',
+    });
+    const pending = sink.publish(seg);
+    sink.revoke();
+    redisNowMs = cutoffMs;
+    resume();
+    let refusal: unknown;
+    try {
+      await pending;
+    } catch (error) {
+      refusal = error;
+    }
+    check('queued-before-latch: absolute cutoff is threaded to the atomic Redis write', refusal instanceof Error, String(refusal));
+    check('queued-before-latch: recovery at the cutoff cannot append', redisWrites === 0, String(redisWrites));
+  }
+
+  // ── active retention deadline → bot installs both permanent scopes before stopping ──
+  {
+    const calls: Array<{ fenceKey: string; raw: boolean; processed: boolean }> = [];
+    const client = {
+      async fenceMeetingCarriers(call: { fenceKey: string; raw: boolean; processed: boolean }) {
+        calls.push(call);
+      },
+    };
+
+    await fenceAllMeetingCarriers(client, 42);
+
+    check(
+      'deadline fence: raw + processed scopes share the numeric-row tombstone',
+      JSON.stringify(calls) === JSON.stringify([{
+        fenceKey: 'zaki:retention:meeting:42:fence', raw: true, processed: true,
+      }]),
+      JSON.stringify(calls),
+    );
   }
 
   if (failed) { console.error(`\n❌ transcript-redis (L3): ${failed} check(s) FAILED.`); process.exit(1); }

@@ -15,12 +15,26 @@ import hashlib
 import os
 from typing import Optional
 
-from ..meeting_writes import capture_is_withdrawn
+from ..meeting_writes import content_scopes_are_writable, meeting_write_lock_key
 from .ports import (
-    MEETING_WRITE_LOCK_NAMESPACE,
     RECORDING_CHUNK_LOCK_NAMESPACE,
+    RECORDING_MANIFEST_LOCK_NAMESPACE,
     RecordingWriteRefused,
 )
+
+
+async def _rollback_or_invalidate_advisory_transaction(db) -> None:
+    """Release transaction locks, invalidating a connection whose rollback is uncertain."""
+
+    try:
+        await db.rollback()
+    except BaseException:
+        invalidate = getattr(db, "invalidate", None)
+        if callable(invalidate):
+            try:
+                await invalidate()
+            except BaseException:
+                pass
 
 
 class S3Storage:
@@ -125,7 +139,7 @@ class SqlAlchemyRecordingRepo:
 
     @asynccontextmanager
     async def recording_write(self, meeting_id: int):
-        """Hold a session-level shared advisory lock across object + JSONB mutation.
+        """Hold a transaction-scoped shared advisory lock across object + JSONB mutation.
 
         The erasure adapter queues for the exclusive transaction lock in the same namespace, then
         stores ``zaki_retention.state=erasing`` before releasing it. A writer queued behind erasure
@@ -133,52 +147,34 @@ class SqlAlchemyRecordingRepo:
         """
 
         async with self._session_factory() as db:
-            params = {
-                "lock_namespace": MEETING_WRITE_LOCK_NAMESPACE,
-                "meeting_id": int(meeting_id),
-            }
-            await db.execute(
-                self._statement(
-                    "SELECT pg_advisory_lock_shared(:lock_namespace, :meeting_id)"
-                ),
-                params,
-            )
+            mid = int(meeting_id)
+            params = {"meeting_lock_key": meeting_write_lock_key(mid)}
             try:
+                await db.execute(
+                    self._statement(
+                        "SELECT pg_advisory_xact_lock_shared(:meeting_lock_key)"
+                    ),
+                    params,
+                )
                 result = await db.execute(
                     self._statement(
                         "SELECT data FROM meetings WHERE id = :meeting_id"
                     ),
-                    {"meeting_id": int(meeting_id)},
+                    {"meeting_id": mid},
                 )
                 row = result.mappings().first()
                 data = row["data"] if row and isinstance(row["data"], dict) else {}
-                retention = data.get("zaki_retention") if row else None
-                expired_scopes = (
-                    retention.get("expired_scopes", [])
-                    if isinstance(retention, dict)
-                    else []
-                )
-                if row is None or capture_is_withdrawn(data) or (
-                    isinstance(retention, dict)
-                    and (
-                        retention.get("state") == "erasing"
-                        or not isinstance(expired_scopes, list)
-                        or "audio" in expired_scopes
-                    )
-                ):
+                if row is None or not content_scopes_are_writable(data, "audio"):
                     raise RecordingWriteRefused("meeting is not writable")
                 yield
-            finally:
-                await db.execute(
-                    self._statement(
-                        "SELECT pg_advisory_unlock_shared(:lock_namespace, :meeting_id)"
-                    ),
-                    params,
-                )
+                await db.commit()
+            except BaseException:
+                await _rollback_or_invalidate_advisory_transaction(db)
+                raise
 
     @asynccontextmanager
     async def chunk_write(self, key: str):
-        """Hold one cross-process exclusive advisory lock for a deterministic chunk key."""
+        """Hold one auto-releasing cross-process transaction lock for a chunk key."""
 
         lock_id = int.from_bytes(hashlib.sha256(key.encode()).digest()[:4], "big", signed=True)
         params = {
@@ -186,21 +182,42 @@ class SqlAlchemyRecordingRepo:
             "chunk_lock_id": lock_id,
         }
         async with self._session_factory() as db:
-            await db.execute(
-                self._statement(
-                    "SELECT pg_advisory_lock(:lock_namespace, :chunk_lock_id)"
-                ),
-                params,
-            )
             try:
-                yield
-            finally:
                 await db.execute(
                     self._statement(
-                        "SELECT pg_advisory_unlock(:lock_namespace, :chunk_lock_id)"
+                        "SELECT pg_advisory_xact_lock(:lock_namespace, :chunk_lock_id)"
                     ),
                     params,
                 )
+                yield
+                await db.commit()
+            except BaseException:
+                await _rollback_or_invalidate_advisory_transaction(db)
+                raise
+
+    @asynccontextmanager
+    async def manifest_write(self, recording_id: int, media_type: str):
+        """Hold one auto-releasing cross-process lock for a media manifest."""
+
+        identity = f"{int(recording_id)}:{media_type}".encode()
+        lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:4], "big", signed=True)
+        params = {
+            "lock_namespace": RECORDING_MANIFEST_LOCK_NAMESPACE,
+            "manifest_lock_id": lock_id,
+        }
+        async with self._session_factory() as db:
+            try:
+                await db.execute(
+                    self._statement(
+                        "SELECT pg_advisory_xact_lock(:lock_namespace, :manifest_lock_id)"
+                    ),
+                    params,
+                )
+                yield
+                await db.commit()
+            except BaseException:
+                await _rollback_or_invalidate_advisory_transaction(db)
+                raise
 
     async def register_recording_prefix(self, meeting_id: int, prefix: str) -> None:
         from sqlalchemy.orm.attributes import flag_modified
@@ -210,17 +227,8 @@ class SqlAlchemyRecordingRepo:
             if meeting is None:
                 raise RecordingWriteRefused("meeting is not writable")
             data = dict(meeting.data) if isinstance(meeting.data, dict) else {}
-            if capture_is_withdrawn(data):
+            if not content_scopes_are_writable(data, "audio"):
                 raise RecordingWriteRefused("meeting is not writable")
-            retention = data.get("zaki_retention")
-            if isinstance(retention, dict):
-                expired_scopes = retention.get("expired_scopes", [])
-                if (
-                    retention.get("state") == "erasing"
-                    or not isinstance(expired_scopes, list)
-                    or "audio" in expired_scopes
-                ):
-                    raise RecordingWriteRefused("meeting is not writable")
             prefixes = list(data.get("zaki_recording_prefixes") or [])
             if prefix in prefixes:
                 return
@@ -230,7 +238,7 @@ class SqlAlchemyRecordingRepo:
             flag_modified(meeting, "data")
             await db.commit()
 
-    async def find_session(self, session_uid):
+    async def find_session(self, *, meeting_id, session_uid):
         from sqlalchemy import select
 
         from ..sessions.models import MeetingSession
@@ -238,9 +246,12 @@ class SqlAlchemyRecordingRepo:
         async with self._session_factory() as db:
             s = (
                 await db.execute(
-                    select(MeetingSession).where(MeetingSession.session_uid == session_uid)
+                    select(MeetingSession).where(
+                        MeetingSession.meeting_id == meeting_id,
+                        MeetingSession.session_uid == session_uid,
+                    )
                 )
-            ).scalars().first()
+            ).scalars().one_or_none()
             return {"meeting_id": s.meeting_id, "session_uid": s.session_uid} if s else None
 
     async def _meeting(self, db, meeting_id):
@@ -296,19 +307,24 @@ class SqlAlchemyRecordingRepo:
             return m.user_id if m else None
 
     async def list_meeting_recordings(self, user_id):
-        from sqlalchemy import select
-
-        from ..sessions.models import Meeting
-
         async with self._session_factory() as db:
             rows = (
-                await db.execute(select(Meeting).where(Meeting.user_id == user_id))
-            ).scalars().all()
+                await db.execute(
+                    self._statement(
+                        "SELECT id, data FROM meetings WHERE user_id = :user_id"
+                    ),
+                    {"user_id": int(user_id)},
+                )
+            ).mappings().all()
             out = []
             for m in rows:
-                data = m.data if isinstance(m.data, dict) else {}
+                data = m["data"] if isinstance(m.get("data"), dict) else {}
+                # Retention is authorization, not merely a deletion schedule. A missed/delayed TTL
+                # sweep must never leave past-expiry audio readable through list/detail/master/raw.
+                if not content_scopes_are_writable(data, "audio"):
+                    continue
                 for r in data.get("recordings", []):
-                    out.append({**r, "meeting_id": m.id})
+                    out.append({**r, "meeting_id": m["id"]})
             return out
 
 

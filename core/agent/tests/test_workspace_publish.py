@@ -12,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+import shared.adapters as adapters
+import control_plane.workspace_publish as workspace_publish
+
 from control_plane.workspace_attach import swap_workspace
 from control_plane.workspace_publish import (
     PUBLISH_REMOTE,
@@ -144,6 +147,93 @@ def test_token_never_persisted_and_errors_redacted(tmp_path):
     assert TOKEN not in str(ei.value)
 
 
+def test_github_push_uses_ephemeral_askpass_and_never_places_pat_in_git_argv(monkeypatch, tmp_path):
+    """A GitHub PAT is supplied as Basic-auth password through a one-shot askpass helper only.
+
+    In particular, neither a process listing nor the persisted remote command may contain it.
+    """
+    real_run = subprocess.run
+    monkeypatch.setenv("GIT_TRACE_CURL", "1")
+    monkeypatch.setenv("GIT_CURL_VERBOSE", "1")
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    askpass_path: Path | None = None
+    hooks_path: Path | None = None
+
+    def fake_run(argv, *, cwd, env, capture_output, text):
+        nonlocal askpass_path, hooks_path
+        args = [str(arg) for arg in argv]
+        copied_env = {str(key): str(value) for key, value in env.items()}
+        calls.append((args, copied_env))
+
+        assert TOKEN not in "\0".join(args)
+        assert TOKEN not in "\0".join(copied_env.values())
+        if "push" in args:
+            assert "GIT_TRACE_CURL" not in copied_env
+            assert "GIT_CURL_VERBOSE" not in copied_env
+            askpass_path = Path(copied_env["GIT_ASKPASS"])
+            assert copied_env["GIT_CONFIG_COUNT"] == "3"
+            assert copied_env["GIT_CONFIG_KEY_0"] == "credential.helper"
+            assert copied_env["GIT_CONFIG_VALUE_0"] == ""
+            assert copied_env["GIT_CONFIG_KEY_1"] == "http.followRedirects"
+            assert copied_env["GIT_CONFIG_VALUE_1"] == "false"
+            assert copied_env["GIT_CONFIG_KEY_2"] == "core.hooksPath"
+            hooks_path = Path(copied_env["GIT_CONFIG_VALUE_2"])
+            assert hooks_path.is_dir() and list(hooks_path.iterdir()) == []
+            username = real_run(
+                [str(askpass_path), "Username for 'https://github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            password = real_run(
+                [str(askpass_path), "Password for 'https://x-access-token@github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert username == "x-access-token"
+            assert password == TOKEN
+
+        stdout = "deadbeef\n" if "rev-parse" in args else ""
+        return subprocess.CompletedProcess(args, 0, stdout, "")
+
+    monkeypatch.setattr(adapters.subprocess, "run", fake_run)
+
+    assert adapters.push_with_token(
+        tmp_path, "https://github.com/acme/minutes.git", "main", TOKEN
+    ) == "deadbeef"
+    assert calls
+    assert askpass_path is not None and not askpass_path.exists()
+    assert hooks_path is not None and not hooks_path.exists()
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "http://github.com/acme/minutes.git",
+        "https://github.example/acme/minutes.git",
+        "https://github.com.evil.example/acme/minutes.git",
+        "https://user@github.com/acme/minutes.git",
+        "https://github.com:443/acme/minutes.git",
+        "https://github.com/acme/minutes.git?redirect=evil",
+        "https://github.com/acme/minutes.git#fragment",
+        "https://github.com/acme%2fother/minutes.git",
+        "https://github.com/../minutes.git",
+    ],
+)
+def test_github_pat_rejects_every_noncanonical_remote_before_git_runs(
+    monkeypatch, tmp_path, remote_url
+):
+    def unexpected_run(*args, **kwargs):  # pragma: no cover - validation must precede git
+        raise AssertionError("git ran before the authenticated remote was validated")
+
+    monkeypatch.setattr(adapters.subprocess, "run", unexpected_run)
+    with pytest.raises(adapters.GitPushError, match="exact GitHub HTTPS"):
+        adapters.push_with_token(tmp_path, remote_url, "main", TOKEN)
+
+
 def test_create_failure_errors_are_token_free(tmp_path):
     """Creator failures (already-exists and generic) surface redacted, actionable errors."""
     root = tmp_path / "workspaces"
@@ -156,6 +246,58 @@ def test_create_failure_errors_are_token_free(tmp_path):
     with pytest.raises(RepoExistsError) as ei:
         publish_workspace(root, "u1", token=TOKEN, repo_name="w", create_repo=exists)
     assert "already exists" in str(ei.value) and TOKEN not in str(ei.value)
+
+
+def test_github_repo_creation_disables_redirects_and_reads_a_bounded_response(monkeypatch):
+    clone_url = "https://github.com/acme/minutes.git"
+    body = (f'{{"clone_url":"{clone_url}"}}').encode()
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=None):
+            assert size == workspace_publish.MAX_INTERNAL_JSON_BYTES + 1
+            return body
+
+    def safe_open(request, *, timeout):
+        assert request.full_url == "https://api.github.com/user/repos"
+        assert timeout == 15
+        return Response()
+
+    def unexpected_urlopen(*args, **kwargs):  # pragma: no cover - bearer requests cannot redirect
+        raise AssertionError("redirect-following urlopen was used")
+
+    monkeypatch.setattr(workspace_publish, "open_no_redirect", safe_open, raising=False)
+    monkeypatch.setattr(workspace_publish.urllib.request, "urlopen", unexpected_urlopen)
+
+    assert workspace_publish._github_create_repo("minutes", True, TOKEN, None) == clone_url
+
+
+def test_github_repo_creation_rejects_a_noncanonical_clone_url(monkeypatch):
+    body = b'{"clone_url":"https://github.com.evil.example/acme/minutes.git"}'
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size=None):
+            return body
+
+    monkeypatch.setattr(workspace_publish, "open_no_redirect", lambda *args, **kwargs: Response())
+
+    with pytest.raises(PublishError, match="invalid clone URL"):
+        workspace_publish._github_create_repo("minutes", True, TOKEN, None)
 
 
 def test_attached_workspace_is_refused(tmp_path):
@@ -190,6 +332,23 @@ def test_bad_inputs_are_value_errors(tmp_path):
         publish_workspace(root, "u2", token=TOKEN, repo_name="bad name!")  # invalid repo name
     with pytest.raises(ValueError):
         publish_workspace(root, "u2", token=TOKEN)  # neither repo_name nor remote_url
+
+
+@pytest.mark.parametrize("org", ["../user", "acme/repos?private=false", "-leading", "trailing-"])
+def test_publish_rejects_noncanonical_github_org_before_repo_creation(tmp_path, org):
+    root = tmp_path / "workspaces"
+    _workspace(root, "u1")
+    bare = _bare(tmp_path / "remote.git")
+    called = False
+
+    def creator(*args):
+        nonlocal called
+        called = True
+        return str(bare)
+
+    with pytest.raises(ValueError, match="invalid GitHub org"):
+        publish_workspace(root, "u1", token=TOKEN, repo_name="minutes", org=org, create_repo=creator)
+    assert called is False
 
 # ── published_remote_url — the read-side probe the terminal renders the published state from ────────
 

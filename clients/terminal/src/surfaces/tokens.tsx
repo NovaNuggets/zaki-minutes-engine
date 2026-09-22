@@ -23,7 +23,12 @@ const EXPIRIES: Array<{ label: string; seconds?: number }> = [
 const fmtDate = (iso?: string | null) => (iso ? new Date(iso).toLocaleDateString() : null);
 
 // Scopes speak CAPABILITIES to the user (the raw scope id rides in the tooltip + the API).
-const SCOPE_LABELS: Record<string, string> = { bot: "Join meetings", tx: "Read transcripts", browser: "Browse web" };
+const SCOPE_LABELS: Record<string, string> = {
+  bot: "Join meetings",
+  tx: "Read transcripts",
+  browser: "Browse web",
+  agent: "Use my agent",
+};
 const scopeLabel = (s: string) => SCOPE_LABELS[s] ?? s;
 
 function TokenRow({ token, onRevoke }: { token: TokenInfo; onRevoke: (id: number) => void }) {
@@ -75,12 +80,24 @@ function MintedTokenCard({ minted, onDismiss }: { minted: MintedToken; onDismiss
   );
 }
 
-function CreateTokenForm({ onCreated }: { onCreated: (t: MintedToken) => void }) {
-  const [scopes, setScopes] = useState<TokenScope[]>(["bot", "tx", "browser"]);
+function CreateTokenForm({ onCreated, availableScopes }: {
+  onCreated: (t: MintedToken) => void;
+  availableScopes: TokenScope[];
+}) {
+  const [scopes, setScopes] = useState<TokenScope[]>(availableScopes);
   const [name, setName] = useState("");
   const [expiryIdx, setExpiryIdx] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setScopes((previous) => {
+      const stillAllowed = previous.filter((scope) => availableScopes.includes(scope));
+      return stillAllowed.length > 0 || availableScopes.length === 0
+        ? stillAllowed
+        : [...availableScopes];
+    });
+  }, [availableScopes]);
 
   const toggle = (s: TokenScope) =>
     setScopes((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]));
@@ -105,7 +122,7 @@ function CreateTokenForm({ onCreated }: { onCreated: (t: MintedToken) => void })
     <div style={{ margin: "4px 4px 10px", padding: 10, borderRadius: 8, border: "1px solid var(--line)" }}>
       <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name (optional)" style={{ ...field, marginBottom: 8 }} />
       <div style={{ display: "flex", gap: 10, marginBottom: 8 }}>
-        {TOKEN_SCOPES.map((s) => (
+        {TOKEN_SCOPES.filter((scope) => availableScopes.includes(scope)).map((s) => (
           <label key={s} title={`scope: ${s}`} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--t2)", cursor: "pointer" }}>
             <input type="checkbox" checked={scopes.includes(s)} onChange={() => toggle(s)} />{scopeLabel(s)}
           </label>
@@ -188,11 +205,16 @@ export function GitHubTokenCard() {
 
 export function TokensPanel() {
   const [tokens, setTokens] = useState<TokenInfo[]>([]);
+  const [availableScopes, setAvailableScopes] = useState<TokenScope[]>([]);
   const [minted, setMinted] = useState<MintedToken | null>(null);
   const [error, setError] = useState<string | null>(null);  // fail-loud (P18)
 
   const refresh = useCallback(() => {
-    void listTokens().then((t) => { setTokens(t); setError(null); }).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+    void listTokens().then((result) => {
+      setTokens(result.tokens);
+      setAvailableScopes(result.availableScopes);
+      setError(null);
+    }).catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
   }, []);
   useEffect(() => refresh(), [refresh]);
 
@@ -205,7 +227,7 @@ export function TokensPanel() {
     <div style={{ padding: "8px" }}>
       {error && <div role="alert" style={{ fontSize: 12, color: "var(--danger)", padding: "6px 9px" }}>⚠ Couldn’t load tokens — {error}</div>}
       {minted && <MintedTokenCard minted={minted} onDismiss={() => setMinted(null)} />}
-      <CreateTokenForm onCreated={onCreated} />
+      <CreateTokenForm onCreated={onCreated} availableScopes={availableScopes} />
       {tokens.map((t) => <TokenRow key={t.id} token={t} onRevoke={onRevoke} />)}
       {tokens.length === 0 && !error && <div style={{ padding: "8px 4px", color: "var(--t3)", fontSize: 12 }}>No API tokens yet.</div>}
     </div>

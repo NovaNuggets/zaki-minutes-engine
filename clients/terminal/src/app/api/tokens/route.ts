@@ -6,14 +6,14 @@
  *  resolved from the auth cookies (currentUser.ts) — a user_id from the client is never accepted (P20).
  */
 import { NextResponse, type NextRequest } from "next/server";
-import { listUserTokens, mintUserToken } from "../auth/adminApi";
+import { getIdentityTokenCapabilities, listUserTokens, mintUserToken } from "../auth/adminApi";
 import { currentUser } from "./currentUser";
+import { readBoundedText } from "../boundedBody";
+import { MAX_AUTH_REQUEST_BYTES } from "../proxyLimits";
 
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { "Cache-Control": "no-store, no-cache, must-revalidate" } as const;
-const VALID_SCOPES = new Set(["bot", "tx", "browser"]);
-
 export async function GET() {
   const me = await currentUser();
   if (!me.ok) return NextResponse.json({ error: me.error }, { status: me.status, headers: NO_STORE });
@@ -22,30 +22,79 @@ export async function GET() {
   if (!listed.ok) {
     return NextResponse.json({ error: listed.error || "Failed to list tokens" }, { status: listed.status || 502, headers: NO_STORE });
   }
-  return NextResponse.json({ tokens: listed.data ?? [] }, { headers: NO_STORE });
+  const capabilities = await getIdentityTokenCapabilities();
+  if (!capabilities.ok || !capabilities.data) {
+    return NextResponse.json(
+      { error: capabilities.error || "Failed to negotiate token capabilities" },
+      { status: capabilities.status || 503, headers: NO_STORE },
+    );
+  }
+  return NextResponse.json({
+    tokens: listed.data ?? [],
+    available_scopes: capabilities.data.scopes,
+    identity_contract: capabilities.data.version,
+  }, { headers: NO_STORE });
 }
 
 export async function POST(request: NextRequest) {
   const me = await currentUser();
   if (!me.ok) return NextResponse.json({ error: me.error }, { status: me.status, headers: NO_STORE });
 
-  let body: { scopes?: unknown; name?: unknown; expiresIn?: unknown };
+  let parsed: unknown;
   try {
-    body = await request.json();
+    const raw = await readBoundedText(request, MAX_AUTH_REQUEST_BYTES);
+    if (raw === null) {
+      return NextResponse.json({ error: "Request body is too large" }, { status: 413, headers: NO_STORE });
+    }
+    parsed = JSON.parse(raw);
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400, headers: NO_STORE });
   }
-
-  const scopes = Array.isArray(body.scopes) ? body.scopes.filter((s): s is string => typeof s === "string") : [];
-  if (scopes.length === 0 || scopes.some((s) => !VALID_SCOPES.has(s))) {
-    return NextResponse.json({ error: `Scopes must be a non-empty subset of ${[...VALID_SCOPES].join(", ")}` }, { status: 400, headers: NO_STORE });
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400, headers: NO_STORE });
   }
-  const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 255) : undefined;
-  const expiresIn = typeof body.expiresIn === "number" && Number.isFinite(body.expiresIn) && body.expiresIn > 0
-    ? Math.floor(body.expiresIn)
-    : undefined;
+  const body = parsed as { scopes?: unknown; name?: unknown; expiresIn?: unknown };
+  if (Object.keys(body).some((key) => !["scopes", "name", "expiresIn"].includes(key))) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400, headers: NO_STORE });
+  }
 
-  const minted = await mintUserToken(me.userId, { scopes, name, expiresIn });
+  const capabilities = await getIdentityTokenCapabilities();
+  if (!capabilities.ok || !capabilities.data) {
+    return NextResponse.json(
+      { error: capabilities.error || "Failed to negotiate token capabilities" },
+      { status: capabilities.status || 503, headers: NO_STORE },
+    );
+  }
+  const validScopes = new Set(capabilities.data.scopes);
+  const scopes = body.scopes;
+  if (!Array.isArray(scopes)
+      || scopes.length === 0
+      || scopes.length > validScopes.size
+      || scopes.some((scope) => typeof scope !== "string" || !validScopes.has(scope))
+      || new Set(scopes).size !== scopes.length) {
+    return NextResponse.json({ error: `Scopes must be a non-empty subset of ${[...validScopes].join(", ")}` }, { status: 400, headers: NO_STORE });
+  }
+  const validatedScopes = scopes as string[];
+  if (body.name !== undefined && (typeof body.name !== "string" || body.name.trim().length > 255)) {
+    return NextResponse.json({ error: "Token name must be at most 255 characters" }, { status: 400, headers: NO_STORE });
+  }
+  const name = typeof body.name === "string" && body.name.trim() ? body.name.trim() : undefined;
+  if (body.expiresIn !== undefined && (
+    typeof body.expiresIn !== "number"
+    || !Number.isSafeInteger(body.expiresIn)
+    || body.expiresIn <= 0
+    || body.expiresIn > 10 * 365 * 24 * 60 * 60
+  )) {
+    return NextResponse.json({ error: "Token expiry must be a positive number of seconds up to 10 years" }, { status: 400, headers: NO_STORE });
+  }
+  const expiresIn = body.expiresIn as number | undefined;
+
+  const minted = await mintUserToken(me.userId, {
+    scopes: validatedScopes,
+    name,
+    expiresIn,
+    contractVersion: capabilities.data.version,
+  });
   if (!minted.ok || !minted.data?.token) {
     return NextResponse.json({ error: minted.error || "Failed to mint token" }, { status: minted.status || 502, headers: NO_STORE });
   }

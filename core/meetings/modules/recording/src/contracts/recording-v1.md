@@ -16,9 +16,18 @@ One frame per chunk:
 | `format`   | the chunk's container — `webm` (MediaRecorder) or `wav` (PCM)   |
 | `bytes`    | the raw chunk bytes                                             |
 
+The hosted assembler persists a private bounded manifest (`seq -> byte length` plus the one
+declared final sequence). A master is publishable only when the declaration exists and the exact
+contiguous census `0..final` is present. Finalization generates those keys directly rather than
+enumerating an object prefix, validates the aggregate limit and every object size before fetching
+a chunk body, and serializes against uploads with a cross-process per-manifest lock. Once stamped,
+the master is immutable; a later sequence is a conflict, while an exact replay remains idempotent.
+
 Two transports carry the same frame, one per deployment:
 
-- **bot / prod** — HTTP multipart per chunk → `meeting-api` (token-gated).
+- **bot / prod** — HTTP multipart per chunk → `meeting-api` (token-gated). Its metadata part carries
+  both `meeting_id` and `session_uid`; the receiver resolves the exact pair and never treats a
+  session uid as globally unique tenant authority.
 - **desktop** — a `REC1`-magic binary frame over the ingest WS → `vexa-desktop`
   (`encodeRecordingChunk` / `decodeRecordingChunk` in `@vexa/capture-codec`).
 

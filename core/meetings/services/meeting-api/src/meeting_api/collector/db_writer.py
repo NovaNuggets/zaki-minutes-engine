@@ -57,14 +57,27 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from .carriers import (
+    ACTIVE_MEETINGS_KEY,
+    PROC_PENDING_KEY,
+    proc_stream_key,
+    segments_hash_key,
+    zadd_if_carrier_writable,
+)
+from ..meeting_writes import (
+    MAX_FINAL_TRANSCRIPT_CONTENT_BYTES,
+    MAX_FINAL_TRANSCRIPT_SEGMENTS,
+    MAX_FINAL_TRANSCRIPT_TURN_CHARS,
+    TranscriptFinalizationOutcome,
+)
 from .ports import TranscriptWriteRefused
 
 log = logging.getLogger("meeting_api.collector.db_writer")
 
-ACTIVE_MEETINGS_KEY = "active_meetings"
 IMMUTABILITY_THRESHOLD = float(os.environ.get("IMMUTABILITY_THRESHOLD", "30"))
 
 # ── the end-of-processing protocol (ADR 0027 / processed-notes.v1) ────────────────────────────────
@@ -75,7 +88,6 @@ IMMUTABILITY_THRESHOLD = float(os.environ.get("IMMUTABILITY_THRESHOLD", "30"))
 # finalized meeting whose stream is not yet marker-complete PARKS in `processed_pending` (zset,
 # score = deadline) and every tick re-drains it until the marker is seen — or the deadline passes
 # (the P22 pairing: graceful marker, hard bounded guarantee for a worker that died markerless).
-PROC_PENDING_KEY = "processed_pending"
 PROC_PENDING_GRACE_SEC = float(os.environ.get("PROC_PENDING_GRACE_SEC", "120"))
 
 # The one processed view the collector maintains today: the copilot's 1:1 cleaned transcript.
@@ -83,18 +95,8 @@ PROC_PENDING_GRACE_SEC = float(os.environ.get("PROC_PENDING_GRACE_SEC", "120"))
 # summaries, translations) ADD views instead of overwriting this one.
 PROC_VIEW_ID = "copilot-notes"
 PROC_VIEW_KIND = "cleaned_transcript"
-
-
-def segments_hash_key(meeting_id) -> str:
-    """The live Redis hash of in-flight segments (``ingest`` writes it; the read path merges it)."""
-    return f"meeting:{meeting_id}:segments"
-
-
-def proc_stream_key(meeting_id) -> str:
-    """The copilot's cleaned-notes stream for ONE meeting row — keyed by the NUMERIC meeting id
-    (unique per row) so a re-sent bot on the same native link can never mix/clobber a previous
-    meeting's processed doc (the native-id keying defect)."""
-    return f"proc:meeting:{meeting_id}"
+TERMINAL_SEGMENT_SCAN_COUNT = 100
+TERMINAL_CARRIER_MAX_BYTES = 2 * MAX_FINAL_TRANSCRIPT_CONTENT_BYTES
 
 
 def _s(v) -> str:
@@ -108,8 +110,94 @@ def _parse_updated_at(raw: Optional[str]) -> Optional[datetime]:
         s = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
+    except (AttributeError, ValueError, TypeError):
         return None
+
+
+def terminal_segment_batch(raw: object) -> list[dict]:
+    """Decode an already bounded terminal hash (test/compatibility seam only)."""
+
+    if not isinstance(raw, dict):
+        return []
+    if len(raw) > MAX_FINAL_TRANSCRIPT_SEGMENTS:
+        raise ValueError("terminal transcript exceeds safe bounds")
+    batch: list[dict] = []
+    total_bytes = 0
+    for field, value in raw.items():
+        encoded = value if isinstance(value, bytes) else str(value).encode("utf-8")
+        total_bytes += len(encoded)
+        if total_bytes > TERMINAL_CARRIER_MAX_BYTES:
+            raise ValueError("terminal transcript exceeds safe bounds")
+        try:
+            segment = json.loads(_s(value))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        text = segment.get("text") if isinstance(segment, dict) else None
+        if (
+            not isinstance(segment, dict)
+            or not isinstance(text, str)
+            or not text.strip()
+            or len(text) > MAX_FINAL_TRANSCRIPT_TURN_CHARS
+        ):
+            continue
+        if not segment.get("segment_id"):
+            segment = {**segment, "segment_id": _s(field)}
+        batch.append(segment)
+    return batch
+
+
+async def iter_terminal_segment_batches(
+    redis_c, meeting_id: int
+) -> AsyncIterator[list[dict]]:
+    """HSCAN a terminal carrier and yield validated chunks under hard count/byte bounds.
+
+    Redis ``COUNT`` is a server-side iteration hint rather than a strict response limit, so the
+    cumulative field/byte guards are authoritative and run before JSON decoding or retention in a
+    Python batch. The exclusive meeting transaction lock keeps the hash stable during the scan.
+    """
+
+    cursor = 0
+    field_count = 0
+    carrier_bytes = 0
+    hash_key = segments_hash_key(meeting_id)
+    while True:
+        cursor, raw = await redis_c.hscan(
+            hash_key, cursor=cursor, count=TERMINAL_SEGMENT_SCAN_COUNT
+        )
+        if not isinstance(raw, dict):
+            raise ValueError("terminal transcript carrier is invalid")
+        batch: list[dict] = []
+        for field, value in raw.items():
+            field_count += 1
+            if field_count > MAX_FINAL_TRANSCRIPT_SEGMENTS:
+                raise ValueError("terminal transcript exceeds safe bounds")
+            field_bytes = field if isinstance(field, bytes) else str(field).encode("utf-8")
+            value_bytes = value if isinstance(value, bytes) else str(value).encode("utf-8")
+            carrier_bytes += len(field_bytes) + len(value_bytes)
+            if carrier_bytes > TERMINAL_CARRIER_MAX_BYTES:
+                raise ValueError("terminal transcript exceeds safe bounds")
+            try:
+                segment = json.loads(_s(value))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            text = segment.get("text") if isinstance(segment, dict) else None
+            if (
+                not isinstance(segment, dict)
+                or not isinstance(text, str)
+                or not text.strip()
+                or len(text) > MAX_FINAL_TRANSCRIPT_TURN_CHARS
+            ):
+                continue
+            if not segment.get("segment_id"):
+                segment = {**segment, "segment_id": _s(field)}
+            batch.append(segment)
+            if len(batch) == TERMINAL_SEGMENT_SCAN_COUNT:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+        if int(cursor) == 0:
+            break
 
 
 async def flush_meeting_segments(
@@ -334,7 +422,9 @@ async def db_writer_tick(
     return total
 
 
-async def finalize_meeting(redis_c, sink, meeting_id: int) -> int:
+async def finalize_meeting(
+    redis_c, sink, meeting_id: int
+) -> TranscriptFinalizationOutcome:
     """The COMPLETION flush — called by the lifecycle callback the moment a meeting reaches a
     terminal status (completed/failed): flush EVERYTHING still in the hash (threshold 0 — the
     mutable tail and trailing drafts included; no more updates are coming) and drain the processed
@@ -344,12 +434,26 @@ async def finalize_meeting(redis_c, sink, meeting_id: int) -> int:
     AFTER session_end (ADR 0027). Unless the ``view_end`` marker is already drained-through, the
     meeting PARKS in ``processed_pending``; ``db_writer_tick`` keeps re-draining it until the
     marker (or the bounded deadline). Never processed ⇒ the deadline simply expires the parking."""
-    stored = await flush_meeting_segments(redis_c, sink, meeting_id, immutability_threshold=0)
+    finalize = getattr(sink, "finalize_transcript", None)
+    if callable(finalize):
+        outcome = await finalize(redis_c, meeting_id)
+    else:
+        # Compatibility for narrow durable sinks outside the production TranscriptStore. Such
+        # sinks cannot prove Minutes authority/immutability, so they never authorize the platform
+        # event even though the legacy durability flush still runs.
+        await flush_meeting_segments(redis_c, sink, meeting_id, immutability_threshold=0)
+        outcome = TranscriptFinalizationOutcome(state="cancelled")
     await flush_meeting_processed(redis_c, sink, meeting_id)
     if not await _processed_complete(redis_c, sink, meeting_id):
         try:
             deadline = datetime.now(timezone.utc).timestamp() + PROC_PENDING_GRACE_SEC
-            await redis_c.zadd(PROC_PENDING_KEY, {str(meeting_id): deadline})
+            await zadd_if_carrier_writable(
+                redis_c,
+                meeting_id,
+                scope="processed",
+                key=PROC_PENDING_KEY,
+                mapping={str(meeting_id): deadline},
+            )
         except Exception:  # noqa: BLE001 — parking is the safety net, never fail the finalize
             log.exception("could not park meeting %s for the pending processed re-drain", meeting_id)
-    return stored
+    return outcome

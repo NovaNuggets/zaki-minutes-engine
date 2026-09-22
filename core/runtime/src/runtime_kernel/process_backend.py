@@ -8,13 +8,17 @@ logs the first time the exit is observed, so a crashed worker (e.g. an ImportErr
 diagnosable from the runtime service logs instead of vanishing into /dev/null."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
+import signal
 import subprocess
 import tempfile
 from typing import Optional
 
 from .backend import WorkloadHandle
+from .models import Resources
 from .isolation import apply_process_isolation, child_env_for, plan_process_isolation, preexec_for
 from .mounts import mount_set
 from .profiles import Runnable
@@ -24,9 +28,59 @@ log = logging.getLogger("runtime_kernel.process")
 # How much of a failed workload's log lands in the runtime log line (the full file stays on disk).
 _TAIL_BYTES = 4096
 
+# A workload child starts from process mechanics only. Everything product-, tenant-, provider-, or
+# operator-specific must cross the authenticated WorkloadSpec.env projection boundary explicitly.
+# An allowlist is essential: a deny-list silently leaks the next AWS/GitHub/model credential added
+# to the root supervisor environment.
+_SAFE_AMBIENT_KEYS = frozenset({
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "TMPDIR",
+    "DISPLAY",
+    "PULSE_SERVER",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "PYTHONUTF8",
+    "PYTHONIOENCODING",
+})
+
+
+def _is_safe_ambient_key(key: str) -> bool:
+    return key in _SAFE_AMBIENT_KEYS or key.startswith("LC_")
+
+
+def _child_process_env(workload_env: dict[str, str]) -> dict[str, str]:
+    """Build a minimum ambient environment, then layer the authenticated explicit projection."""
+    child = {
+        key: value
+        for key, value in os.environ.items()
+        if _is_safe_ambient_key(key)
+    }
+    child.update(workload_env)
+    return child
+
 
 def _log_dir() -> str:
     return os.environ.get("PROCESS_LOG_DIR") or os.path.join(tempfile.gettempdir(), "vexa-workloads")
+
+
+_SAFE_LOG_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def _workload_log_path(log_dir: str, workload_id: str) -> str:
+    """Keep caller-chosen runtime.v1 ids out of filesystem path resolution."""
+    if _SAFE_LOG_ID.fullmatch(workload_id):
+        leaf = f"{workload_id}.log"
+    else:
+        digest = hashlib.sha256(workload_id.encode("utf-8")).hexdigest()
+        leaf = f"workload-{digest}.log"
+    return os.path.join(log_dir, leaf)
 
 
 def _tail(path: str, limit: int = _TAIL_BYTES) -> str:
@@ -49,22 +103,31 @@ class ProcessBackend:
         # exit codes are unobservable without a live handle anyway.
         self._capture: dict[str, dict] = {}
 
-    def start(self, workload_id: str, runnable: Runnable, env: dict[str, str]) -> WorkloadHandle:
+    def start(
+        self,
+        workload_id: str,
+        runnable: Runnable,
+        env: dict[str, str],
+        *,
+        resources: Optional[Resources] = None,
+    ) -> WorkloadHandle:
         if not runnable.command:
             raise ValueError("process backend requires a command")
         # Workspace mount set (WP-A1.1): the lite/process backend shares the HOST filesystem — there is
         # nothing to bind, so tenant isolation is POSIX instead (runtime_kernel.isolation): the worker
         # drops to a per-subject uid, private tiers are 0700-owned, shared workspaces get per-workspace
-        # gids. Unavailable conditions (non-root runtime, non-numeric subject) degrade LOUDLY to the
-        # old shared-trust spawn.
+        # gids. Agent workloads fail closed if that wall is unavailable; meeting bots have no
+        # workspace plan and cross their own dedicated-uid launcher boundary instead.
         mounts = mount_set(env)
         if len(mounts) > 1:
             log.info("workload %s: %d active workspace mounts: %s",
                      workload_id, len(mounts), ", ".join(m.get("slug", "?") for m in mounts))
         preexec = None
-        child_env = {**os.environ, **env}
+        child_env = _child_process_env(env)
         try:
             iso = plan_process_isolation(env)
+            if iso is None and runnable.broker_model_credentials:
+                raise RuntimeError("Agent process isolation is unavailable; refusing root spawn")
             if iso is not None:
                 iso = apply_process_isolation(iso)
                 preexec = preexec_for(iso)
@@ -72,10 +135,15 @@ class ProcessBackend:
                 log.info("workload %s: POSIX-isolated as uid %d (%d shared group(s))",
                          workload_id, iso.uid, len(iso.groups))
         except OSError as e:
-            # a broken store layout must not brick dispatch — but say exactly what didn't apply
-            log.error("workload %s: isolation setup failed (%s) — spawning shared-trust", workload_id, e)
+            if runnable.broker_model_credentials:
+                raise RuntimeError(
+                    "Agent process isolation setup failed; refusing root spawn"
+                ) from e
+            # Workspaceless profiles (meeting bots) have a separate launcher wall. Preserve their
+            # ability to start while making the absent POSIX workspace layer explicit.
+            log.error("workload %s: optional process isolation setup failed (%s)", workload_id, e)
             preexec = None
-            child_env = {**os.environ, **env}
+            child_env = _child_process_env(env)
         # Capture the child's output to a per-workload file (both streams interleaved, like
         # `docker logs`). Fail-open: if the log dir is unwritable we fall back to DEVNULL rather
         # than refusing to start the workload.
@@ -83,9 +151,19 @@ class ProcessBackend:
         out_fh = None
         try:
             log_dir = _log_dir()
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, f"{workload_id}.log")
-            out_fh = open(log_path, "ab")
+            if os.path.islink(log_dir):
+                raise OSError("log directory must not be a symlink")
+            os.makedirs(log_dir, mode=0o700, exist_ok=True)
+            os.chmod(log_dir, 0o700)
+            log_path = _workload_log_path(log_dir, workload_id)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(log_path, flags, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                out_fh = os.fdopen(fd, "ab")
+            except Exception:
+                os.close(fd)
+                raise
         except OSError as e:
             log.warning("workload %s: cannot capture output (%s) — falling back to DEVNULL", workload_id, e)
             log_path = None
@@ -129,15 +207,19 @@ class ProcessBackend:
         if state is not None:
             state["reported"] = True
 
+    def _signal_group(self, h: WorkloadHandle, sig: signal.Signals) -> None:
+        """Signal the start_new_session process group, including children after leader exit."""
+        self._suppress_report(h.id)
+        try:
+            os.killpg(h._impl.pid, sig)  # type: ignore[attr-defined]
+        except ProcessLookupError:
+            pass
+
     def terminate(self, h: WorkloadHandle) -> None:
-        if h._impl.poll() is None:  # type: ignore[attr-defined]
-            self._suppress_report(h.id)
-            h._impl.terminate()  # type: ignore[attr-defined]
+        self._signal_group(h, signal.SIGTERM)
 
     def kill(self, h: WorkloadHandle) -> None:
-        if h._impl.poll() is None:  # type: ignore[attr-defined]
-            self._suppress_report(h.id)
-            h._impl.kill()  # type: ignore[attr-defined]
+        self._signal_group(h, signal.SIGKILL)
 
     def cleanup(self, h: WorkloadHandle) -> None:
         self.kill(h)

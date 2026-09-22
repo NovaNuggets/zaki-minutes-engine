@@ -6,12 +6,18 @@
  */
 import { NextResponse } from "next/server";
 import { instanceHasAdmin } from "../adminApi";
+import { directLoginEnabled } from "../../../../proxyAuthPolicy.mjs";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
   return NextResponse.json(
-    { admin_exists: await instanceHasAdmin() },
+    {
+      admin_exists: await instanceHasAdmin(),
+      // Boolean capability only; the exact email allow policy is operator configuration and is
+      // intentionally not exposed to unauthenticated clients.
+      direct_login_enabled: directLoginEnabled(process.env),
+    },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

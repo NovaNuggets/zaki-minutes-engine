@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/minutes-finalized.v1",
+  "title": "minutes-finalized.v1",
+  "description": "The exact content-free Minutes transcript-finalized platform event and its HMAC authentication headers.",
+  "$defs": {
+    "PositiveRowId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "description": "Canonical PostgreSQL bigint identifier encoded as decimal text; builders and consumers additionally reject values above 9223372036854775807."
+    },
+    "Data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "artifact", "state", "idempotency_key"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "artifact": { "const": "transcript" },
+        "state": { "const": "finalized" },
+        "idempotency_key": {
+          "type": "string",
+          "pattern": "^minutes:meeting:[1-9][0-9]{0,18}:transcript$"
+        }
+      }
+    },
+    "Envelope": {
+      "description": "Exact content-free notification emitted only after one meeting's transcript is durably finalized.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "event_id", "event_type", "created_at", "data"],
+      "properties": {
+        "version": { "const": "minutes-finalized.v1" },
+        "event_id": {
+          "type": "string",
+          "pattern": "^evt_transcript_finalized_[1-9][0-9]{0,18}$"
+        },
+        "event_type": { "const": "transcript.finalized" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "data": { "$ref": "#/$defs/Data" }
+      }
+    },
+    "SignatureHeaders": {
+      "description": "The exact non-bearer HMAC headers on a minutes-finalized.v1 delivery. The signature covers `<X-Webhook-Timestamp>.<raw-body>`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Content-Type", "X-Webhook-Key-Id", "X-Webhook-Timestamp", "X-Webhook-Signature"],
+      "properties": {
+        "Content-Type": { "const": "application/json" },
+        "X-Webhook-Key-Id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "X-Webhook-Timestamp": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "X-Webhook-Signature": {
+          "type": "string",
+          "pattern": "^sha256=[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

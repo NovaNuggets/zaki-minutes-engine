@@ -8,14 +8,19 @@ policy/ PLATFORM-WRITE-ONLY turn-commit guard.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import subprocess
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from control_plane import workspace_membership as m
+from control_plane import api as api_mod
 from control_plane.api import create_app
 from control_plane.dispatch import Dispatcher
 from control_plane.workspace_reader import WorkspaceReader
@@ -64,6 +69,43 @@ def _client(root: Path, index=None):
 
 def _h(subject: str) -> dict:
     return {"X-User-Id": subject}
+
+
+def _gateway_h(
+    *, subject: str, path: str, query: str = "", method: str = "GET",
+    body: bytes = b"", content_type: str | None = None,
+) -> dict[str, str]:
+    secret = "test-gateway-proof-0123456789abcdef"
+    timestamp = str(int(time.time()))
+    nonce = f"nonce-{time.time_ns()}"
+    content_digest = hashlib.sha256(body).hexdigest()
+    signed_headers_digest = hashlib.sha256(json.dumps(
+        {
+            "content-type": content_type,
+            "last-event-id": None,
+            "x-user-email": None,
+            "x-user-id": subject,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    canonical = (
+        f"gateway-request.v1\n{method}\n{path}\n{subject}\n{query}\n{content_digest}\n"
+        f"{signed_headers_digest}\n{timestamp}\n{nonce}"
+    ).encode("utf-8")
+    headers = {
+        "X-User-Id": subject,
+        "X-Gateway-Key-Id": hashlib.sha256(secret.encode()).hexdigest()[:16],
+        "X-Gateway-Timestamp": timestamp,
+        "X-Gateway-Nonce": nonce,
+        "X-Gateway-Content-Sha256": content_digest,
+        "X-Gateway-Signature": hmac.new(
+            secret.encode(), canonical, hashlib.sha256,
+        ).hexdigest(),
+    }
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    return headers
 
 
 # ── the store: both writes, is_member, require_role ───────────────────────────────────────────────
@@ -293,6 +335,77 @@ def test_api_role_gating_viewer_cannot_invite_owner_can(tmp_path):
                json={"workspace_id": "wsA", "role": "contributor"})
     assert r.status_code == 201
     assert r.json()["token"]
+
+
+def test_shared_workspace_viewer_can_read_management_state_but_cannot_mutate_it(
+    tmp_path, monkeypatch
+):
+    _init_ws(tmp_path, "wsA")
+    idx = m.InMemoryMembershipIndex()
+    m.ensure_owner(tmp_path, "wsA", "owner1", index=idx)
+    m.grant_membership(tmp_path, "wsA", "viewer1", "viewer", added_by="owner1", index=idx)
+
+    monkeypatch.setattr(
+        api_mod,
+        "publish_workspace",
+        lambda *args, **kwargs: SimpleNamespace(
+            repo_url="https://github.com/acme/wsA",
+            pushed_ref="main",
+            head_sha="deadbeef",
+            created=False,
+        ),
+    )
+    monkeypatch.setattr(
+        api_mod,
+        "push_origin",
+        lambda *args, **kwargs: SimpleNamespace(
+            remote="origin", url="https://github.com/acme/wsA", branch="main", head_sha="deadbeef"
+        ),
+    )
+    monkeypatch.setattr(
+        api_mod,
+        "pull_origin",
+        lambda *args, **kwargs: SimpleNamespace(
+            remote="origin",
+            url="https://github.com/acme/wsA",
+            branch="main",
+            head_sha="deadbeef",
+            updated=False,
+            behind_before=0,
+        ),
+    )
+    monkeypatch.setattr(api_mod, "write_purpose", lambda *args, **kwargs: "changed")
+    monkeypatch.setattr(api_mod, "read_purpose", lambda *args, **kwargs: "reference workspace")
+    monkeypatch.setattr(
+        api_mod,
+        "remote_status",
+        lambda *args, **kwargs: SimpleNamespace(
+            has_home=True,
+            remote="origin",
+            url="https://github.com/acme/wsA",
+            branch="main",
+            tracked=True,
+            ahead=0,
+            behind=0,
+        ),
+    )
+    client = _client(tmp_path, idx)
+    headers = _h("viewer1")
+
+    mutations = [
+        ("/api/workspace/publish", {"slug": "wsA", "token": "token", "remote_url": str(tmp_path)}),
+        ("/api/workspace/push", {"slug": "wsA", "token": "token"}),
+        ("/api/workspace/pull", {"slug": "wsA", "token": "token"}),
+        ("/api/workspace/purpose", {"slug": "wsA", "purpose": "changed"}),
+    ]
+    for path, body in mutations:
+        response = client.post(path, headers=headers, json=body)
+        assert response.status_code == 403, (path, response.text)
+
+    purpose = client.get("/api/workspace/purpose", headers=headers, params={"slug": "wsA"})
+    status = client.get("/api/workspace/git-remote-status", headers=headers, params={"slug": "wsA"})
+    assert purpose.status_code == 200 and purpose.json()["purpose"] == "reference workspace"
+    assert status.status_code == 200 and status.json()["has_home"] is True
 
 
 def test_api_full_invite_accept_flow(tmp_path):
@@ -618,16 +731,84 @@ def test_policy_guard_removes_policy_in_freshly_seeded_workspace(tmp_path):
 
 # ── vector 2 (topology): the opt-in gateway-identity gate rejects non-gateway callers ──────────────
 def test_require_gateway_identity_flag_rejects_direct_edge(tmp_path, monkeypatch):
-    """With VEXA_REQUIRE_GATEWAY_IDENTITY set, a request WITHOUT the gateway's signed marker
-    (X-Gateway-Verified) is rejected 401 — a hardened deploy stops a direct/host-local caller from
-    forging X-User-Id. The marker present → normal auth. Default (flag unset) is unaffected."""
+    """The hardened edge accepts only a fresh request-bound Gateway signature."""
     _init_ws(tmp_path, "wsA")
     monkeypatch.setenv("VEXA_REQUIRE_GATEWAY_IDENTITY", "1")
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", "test-gateway-proof-0123456789abcdef")
+    monkeypatch.setenv("VEXA_INTERNAL_API_SECRET", "test-internal-secret-0123456789abcdef")
     c = _client(tmp_path)
     # direct caller forging X-User-Id but lacking the gateway marker → 401
     r = c.get("/api/workspace/members?workspace_id=wsA", headers={"X-User-Id": "attacker"})
     assert r.status_code == 401
-    # gateway-fronted request (marker present) reaches the normal role gate (403 non-member, not 401)
-    r2 = c.get("/api/workspace/members?workspace_id=wsA",
-               headers={"X-User-Id": "attacker", "X-Gateway-Verified": "1"})
+    # A caller cannot satisfy the boundary with the former raw bearer marker.
+    wrong = c.get(
+        "/api/workspace/members?workspace_id=wsA",
+        headers={
+            "X-User-Id": "attacker",
+            # Possession of the broader service credential cannot mint Gateway identity.
+            "X-Gateway-Verified": "test-internal-secret-0123456789abcdef",
+        },
+    )
+    assert wrong.status_code == 401
+    # A fresh method/path/user-bound proof reaches the normal role gate (403 non-member, not 401).
+    r2 = c.get(
+        "/api/workspace/members?workspace_id=wsA",
+        headers=_gateway_h(
+            subject="999",
+            path="/api/workspace/members",
+            query="workspace_id=wsA",
+        ),
+    )
     assert r2.status_code == 403
+
+    assert c.get("/api/meeting/relay-health").status_code == 401
+    relay = c.get(
+        "/api/meeting/relay-health",
+        headers=_gateway_h(subject="999", path="/api/meeting/relay-health"),
+    )
+    assert relay.status_code == 200
+
+
+def test_gateway_middleware_replays_verified_multipart_body_to_fastapi(tmp_path, monkeypatch):
+    _init_ws(tmp_path, "999")
+    monkeypatch.setenv("VEXA_REQUIRE_GATEWAY_IDENTITY", "1")
+    monkeypatch.setenv("GATEWAY_IDENTITY_SECRET", "test-gateway-proof-0123456789abcdef")
+    monkeypatch.setenv("VEXA_INTERNAL_API_SECRET", "test-internal-secret-0123456789abcdef")
+    client = _client(tmp_path)
+    boundary = "zaki-proof-boundary"
+    content_type = f"multipart/form-data; boundary={boundary}"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="files"; filename="note.txt"\r\n'
+        "Content-Type: text/plain\r\n\r\n"
+        "hello from signed upload\r\n"
+        f"--{boundary}--\r\n"
+    ).encode()
+
+    response = client.post(
+        "/api/workspace/upload",
+        headers=_gateway_h(
+            subject="999",
+            path="/api/workspace/upload",
+            method="POST",
+            body=body,
+            content_type=content_type,
+        ),
+        content=body,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["files"][0]["name"].endswith("-note.txt")
+    assert list((tmp_path / "999" / "uploads").glob("*-note.txt"))[0].read_text() == (
+        "hello from signed upload"
+    )
+
+
+def test_require_gateway_identity_refuses_missing_dedicated_secret(tmp_path, monkeypatch):
+    _init_ws(tmp_path, "wsA")
+    monkeypatch.setenv("VEXA_REQUIRE_GATEWAY_IDENTITY", "1")
+    monkeypatch.setenv("VEXA_INTERNAL_API_SECRET", "test-internal-secret-0123456789abcdef")
+    monkeypatch.delenv("GATEWAY_IDENTITY_SECRET", raising=False)
+
+    with pytest.raises(RuntimeError, match="GATEWAY_IDENTITY_SECRET"):
+        _client(tmp_path)

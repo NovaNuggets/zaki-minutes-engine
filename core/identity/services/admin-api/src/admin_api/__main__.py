@@ -8,6 +8,9 @@ request. uvicorn-target: ``uvicorn admin_api.__main__:app`` / ``python -m admin_
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
+
+_DATABASE_SSL_MODES = frozenset({"disable", "require", "verify-ca", "verify-full"})
 
 
 def _database_url() -> str:
@@ -20,7 +23,18 @@ def _database_url() -> str:
     name = os.getenv("DB_NAME", "vexa")
     user = os.getenv("DB_USER", "postgres")
     password = os.getenv("DB_PASSWORD", "postgres")
-    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}"
+    ssl_mode = os.getenv("DB_SSL_MODE", "disable")
+    if ssl_mode not in _DATABASE_SSL_MODES:
+        raise RuntimeError(
+            "DB_SSL_MODE must be one of: disable, require, verify-ca, verify-full"
+        )
+    # DB_USER/DB_PASSWORD are raw operator-Secret values, not URL components.
+    url = (
+        "postgresql+asyncpg://"
+        f"{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/"
+        f"{quote(name, safe='')}"
+    )
+    return url if ssl_mode == "disable" else f"{url}?ssl={ssl_mode}"
 
 
 def build_production_app():

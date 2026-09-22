@@ -7,6 +7,10 @@ seam); env-level tri-state tests pass explicit env dicts (pure, no monkeypatchin
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -19,7 +23,10 @@ HEADERS = {"x-user-id": "7"}
 
 @pytest.fixture(autouse=True)
 def _admin_token(monkeypatch):
-    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", "test-meeting-token-secret")
+    monkeypatch.setenv("INTERNAL_API_SECRET", "test-internal-secret")
+    monkeypatch.setenv("RUNTIME_CONTROL_SECRET", "test-runtime-control-secret")
+    monkeypatch.setenv("RUNTIME_CALLBACK_SECRET", "test-runtime-callback-secret")
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +38,19 @@ def _fresh_probe_cache():
 
 def _client(repo=None):
     return TestClient(create_app(meeting_repo=repo or InMemoryMeetingRepo(), runtime=FakeRuntimeClient()))
+
+
+@contextmanager
+def _serve(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 # ── the declaration itself ───────────────────────────────────────────────────────────────────────
@@ -49,17 +69,65 @@ def test_declaration_loads_and_is_internally_consistent():
     assert stt_keys == {"TRANSCRIPTION_SERVICE_URL", "TRANSCRIPTION_SERVICE_TOKEN"}
     # required-explicit is exactly the A4 boot bar
     required = {k["key"] for k in decl["keys"] if k["class"] == "required-explicit"}
-    assert required == {"ADMIN_TOKEN"}
+    assert required == {
+        "MEETING_TOKEN_SECRET",
+        "INTERNAL_API_SECRET",
+        "RUNTIME_CALLBACK_SECRET",
+        "RUNTIME_CONTROL_SECRET",
+    }
+    database_ssl = next(key for key in decl["keys"] if key["key"] == "DB_SSL_MODE")
+    assert database_ssl["default"] == "disable"
+
+
+def test_minutes_operator_controls_are_declared_default_off():
+    declaration = cp.load_declaration()
+    keys = {entry["key"]: entry for entry in declaration["keys"]}
+    assert keys["ZAKI_MINUTES_CAPTURE_ENABLED"]["default"] == "false"
+    assert keys["ZAKI_MINUTES_INVOCATION_V2_ENABLED"]["default"] == "false"
+    assert keys["ZAKI_MINUTES_AUTO_JOIN_ENABLED"]["default"] == "false"
+    assert keys["ZAKI_MINUTES_MANAGED_ONLY"]["default"] == "false"
+    assert keys["ZAKI_MINUTES_READ_ENABLED"]["default"] == "false"
+    assert keys["MINUTES_TTL_ENABLED"]["default"] == "false"
+    assert keys["MINUTES_TTL_INTERVAL_S"]["default"] == "60"
+    assert keys["MINUTES_TTL_BATCH_SIZE"]["default"] == "100"
+    assert keys["ZAKI_READ_TOKEN_MINUTES"]["secret"] is True
+    assert keys["ZAKI_READ_TOKEN_MINUTES"]["default"].startswith("(unset")
+    assert keys["ZAKI_MINUTES_HUB_TOKEN"]["secret"] is True
+    assert keys["ZAKI_MINUTES_HUB_TOKEN"]["default"].startswith("(unset")
+    assert keys["AGENT_API_URL"]["default"] == "http://agent-api:8080"
+    for key in (
+        "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET",
+        "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+        "ZAKI_MINUTES_ERASURE_SIGNING_SECRET",
+        "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+    ):
+        assert keys[key]["secret"] is True
+        assert keys[key]["default"].startswith("(unset")
+    for key in (
+        "ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID",
+        "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+        "ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID",
+        "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+    ):
+        assert keys[key]["default"].startswith("(unset")
+    assert keys["ZAKI_MINUTES_FINALIZED_ENABLED"]["default"] == "false"
+    for key in (
+        "ZAKI_MINUTES_FINALIZED_URL",
+        "ZAKI_MINUTES_FINALIZED_KEY_ID",
+        "ZAKI_MINUTES_FINALIZED_SECRET",
+    ):
+        assert keys[key]["default"].startswith("(unset")
+    assert keys["ZAKI_MINUTES_FINALIZED_SECRET"]["secret"] is True
 
 
 # ── boot preflight (A4, now declaration-driven) ──────────────────────────────────────────────────
 
 
 def test_preflight_refuses_to_boot_without_admin_token(monkeypatch):
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("MEETING_TOKEN_SECRET", raising=False)
     with pytest.raises(cp.ConfigError) as ei:
         cp.preflight()
-    assert "ADMIN_TOKEN" in str(ei.value), "the boot error must NAME the missing required key"
+    assert "MEETING_TOKEN_SECRET" in str(ei.value), "the boot error must NAME the missing required key"
 
 
 def test_preflight_reports_capability_rows(monkeypatch):
@@ -70,6 +138,25 @@ def test_preflight_reports_capability_rows(monkeypatch):
     assert report["capabilities"]["stt"]["state"] == cp.CONFIGURED
     assert report["capabilities"]["stt"]["probe"]["ok"] is True
     assert "object_storage" in report["capabilities"]
+
+
+def test_redis_client_options_are_bounded_and_fail_fast():
+    from meeting_api.collector.adapters import redis_client_options
+
+    assert redis_client_options({}) == {
+        "socket_connect_timeout": 5.0,
+        "socket_timeout": 5.0,
+        "retry_on_timeout": False,
+    }
+    assert redis_client_options(
+        {"REDIS_CONNECT_TIMEOUT_S": "1.25", "REDIS_IO_TIMEOUT_S": "2.5"}
+    ) == {
+        "socket_connect_timeout": 1.25,
+        "socket_timeout": 2.5,
+        "retry_on_timeout": False,
+    }
+    with pytest.raises(ValueError, match="REDIS_IO_TIMEOUT_S"):
+        redis_client_options({"REDIS_IO_TIMEOUT_S": "0"})
 
 
 # ── the capability tri-state (env-level, pure) ───────────────────────────────────────────────────
@@ -108,6 +195,69 @@ def test_probe_rejection_demotes_health_row_to_misconfigured(monkeypatch):
         "transcription-less meeting"
     )
     assert rows["stt"]["probe"]["status"] == 401
+
+
+def test_http_probe_refuses_redirect_without_replaying_operator_token():
+    sink_requests = []
+
+    class Sink(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — stdlib handler contract
+            sink_requests.append(self.headers.get("Authorization"))
+            self.send_response(204)
+            self.end_headers()
+
+        do_POST = do_GET
+
+        def log_message(self, *_args):
+            pass
+
+    class Direct(BaseHTTPRequestHandler):
+        authorization = None
+
+        def do_POST(self):  # noqa: N802 — stdlib handler contract
+            type(self).authorization = self.headers.get("Authorization")
+            self.send_response(405)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    spec = {
+        "url_key": "STT_URL",
+        "auth_key": "STT_TOKEN",
+        "method": "POST",
+        "unauthorized_statuses": [401, 403],
+    }
+    with _serve(Sink) as sink_url:
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 — stdlib handler contract
+                self.send_response(302)
+                self.send_header("Location", f"{sink_url}/credential-sink")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        with _serve(Redirect) as redirect_url:
+            result = cp._http_probe(
+                spec,
+                {"STT_URL": redirect_url, "STT_TOKEN": "operator-secret"},
+                timeout=2,
+            )
+
+    assert result["ok"] is False
+    assert result["status"] == 302
+    assert "redirect" in result["reason"].lower()
+    assert sink_requests == [], "the redirect target must receive neither probe nor bearer token"
+
+    with _serve(Direct) as direct_url:
+        direct_result = cp._http_probe(
+            spec,
+            {"STT_URL": direct_url, "STT_TOKEN": "operator-secret"},
+            timeout=2,
+        )
+    assert direct_result == {"ok": True, "status": 405}
+    assert Direct.authorization == "Bearer operator-secret"
 
 
 def test_probe_result_is_cached_per_ttl(monkeypatch):

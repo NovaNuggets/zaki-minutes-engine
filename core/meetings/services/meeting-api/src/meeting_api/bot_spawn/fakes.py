@@ -16,13 +16,20 @@ fully in-process.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from ..meeting_writes import capture_authority_is_stale, capture_is_withdrawn
+from ..meeting_writes import (
+    capture_authority_is_stale,
+    capture_is_withdrawn,
+    minutes_transcript_is_finalizable,
+)
+from .lifecycle_write import classify_lifecycle_write
 from .ports import (
     CaptureGrantConsumed,
     DuplicateMeeting,
     MaxBotsExceeded,
+    MeetingStatusWrite,
     QuotaExceeded,
     SpawnFailed,
     WorkloadUnknown,
@@ -62,6 +69,16 @@ class InMemoryMeetingRepo:
         if not rows:
             return None
         return dict(max(rows, key=lambda m: m["id"]))  # id is monotonic → most recent
+
+    async def find_owned_minutes(self, *, user_id: int, meeting_id: int) -> Optional[dict]:
+        row = self._meetings.get(meeting_id)
+        if row is None or row.get("user_id") != user_id:
+            return None
+        data = row.get("data")
+        capture = data.get("zaki_capture") if isinstance(data, dict) else None
+        if not isinstance(capture, dict) or capture.get("tenant_id") != f"user:{user_id}":
+            return None
+        return dict(row)
 
     async def create_meeting(self, *, user_id, platform, native_meeting_id, data) -> dict:
         mid = self._next_id
@@ -201,6 +218,23 @@ class InMemoryMeetingRepo:
             else:
                 m["data"][k] = v
 
+    async def confirm_capture_teardown(self, *, meeting_id: int) -> bool:
+        meeting = self._meetings.get(meeting_id)
+        if meeting is None:
+            return False
+        capture = meeting["data"].get("zaki_capture")
+        if not isinstance(capture, dict) or capture.get("state") != "withdrawn":
+            return False
+        confirmed = dict(capture)
+        confirmed["teardown_state"] = "confirmed"
+        meeting["data"]["zaki_capture"] = confirmed
+        if meeting["status"] not in _TERMINAL_STATUSES:
+            meeting["status"] = "completed"
+            meeting["data"]["completion_reason"] = "stopped"
+        if meeting.get("end_time") is None:
+            meeting["end_time"] = datetime.now(timezone.utc).isoformat()
+        return True
+
     async def reopen_meeting(self, *, meeting_id) -> dict:
         row = self._meetings[meeting_id]
         row["status"] = "requested"
@@ -229,7 +263,9 @@ class InMemoryMeetingRepo:
             return None
         row["status"] = "failed"
         row["end_time"] = "2026-06-20T09:00:00Z"
-        row["data"]["failure_stage"] = "runtime_spawn"
+        # Public lifecycle stage, not an infrastructure sub-step: runtime spawn fails while the
+        # meeting is still in `requested`. The content-free reason keeps the finer attribution.
+        row["data"]["failure_stage"] = "requested"
         row["data"]["spawn_failure_reason"] = reason
         patch = dict(data or {})
         if capture_is_withdrawn(row["data"]):
@@ -261,6 +297,7 @@ class InMemoryMeetingRepo:
         ):
             return None
         prior_status = row["status"]
+        terminal_stop_already_durable = prior_status in _TERMINAL_STATUSES
         changed = capture.get("state") != "withdrawn"
         if changed:
             capture = dict(capture)
@@ -269,11 +306,17 @@ class InMemoryMeetingRepo:
                     "state": "withdrawn",
                     "withdrawal_reason": "consent_withdrawn",
                     "withdrawn_at": withdrawn_at,
+                    "teardown_state": (
+                        "confirmed" if terminal_stop_already_durable else "pending"
+                    ),
                 }
             )
             row["data"]["zaki_capture"] = capture
+        elif terminal_stop_already_durable and capture.get("teardown_state") != "confirmed":
+            capture = {**capture, "teardown_state": "confirmed"}
+            row["data"]["zaki_capture"] = capture
         row["data"]["stop_requested"] = True
-        should_stop = prior_status not in _TERMINAL_STATUSES
+        should_stop = not terminal_stop_already_durable
         if should_stop:
             row["status"] = "stopping"
         return {
@@ -290,6 +333,12 @@ class InMemoryMeetingRepo:
         row = self._meetings.get(sess["meeting_id"])
         return row["status"] if row else None
 
+    async def get_meeting_id_by_session(self, *, session_uid) -> Optional[int]:
+        sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
+        if sess is None or sess["meeting_id"] not in self._meetings:
+            return None
+        return int(sess["meeting_id"])
+
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         row = next(
             (m for m in self._meetings.values() if m.get("bot_container_id") == bot_container_id), None
@@ -302,29 +351,87 @@ class InMemoryMeetingRepo:
         return {"meeting_id": row["id"], "status": row["status"], "session_uid": sid}
 
     async def update_meeting_status(
-        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
-    ) -> None:
+        self,
+        *,
+        session_uid,
+        status,
+        completion_reason=None,
+        failure_stage=None,
+        data=None,
+        expected_status=None,
+        force_terminal=False,
+    ) -> Optional[MeetingStatusWrite]:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:
             return  # unknown session — no-op (mirrors the SQL adapter)
         row = self._meetings.get(sess["meeting_id"])
         if row is None:
             return
+        previous_status = row["status"]
         suppressed_nonterminal = (
             capture_is_withdrawn(row["data"])
             and status not in _TERMINAL_STATUSES
         )
-        if suppressed_nonterminal:
+        capture = row["data"].get("zaki_capture")
+        suppressed_terminal_after_withdrawal = (
+            capture_is_withdrawn(row["data"])
+            and row["status"] in _TERMINAL_STATUSES
+            and status in _TERMINAL_STATUSES
+            and (
+                status != row["status"]
+                or (
+                    isinstance(capture, dict)
+                    and capture.get("teardown_state") == "confirmed"
+                )
+            )
+        )
+        suppressed_withdrawn_update = (
+            suppressed_nonterminal or suppressed_terminal_after_withdrawal
+        )
+        if expected_status is not None and previous_status != expected_status:
+            return MeetingStatusWrite(
+                row=dict(row),
+                disposition=("suppressed" if suppressed_withdrawn_update else "conflict"),
+                previous_status=previous_status,
+            )
+        if suppressed_withdrawn_update:
             status = row["status"] if row["status"] in _TERMINAL_STATUSES else "stopping"
+            disposition = "suppressed"
+        else:
+            disposition = classify_lifecycle_write(
+                previous_status,
+                status,
+                force_terminal=force_terminal,
+            )
+            if disposition != "applied":
+                return MeetingStatusWrite(
+                    row=dict(row),
+                    disposition=disposition,
+                    previous_status=previous_status,
+                )
         row["status"] = status
-        if completion_reason is not None and not suppressed_nonterminal:
+        if completion_reason is not None and not suppressed_withdrawn_update:
             row["data"]["completion_reason"] = completion_reason
-        if failure_stage is not None and not suppressed_nonterminal:
+        if failure_stage is not None and not suppressed_withdrawn_update:
             row["data"]["failure_stage"] = failure_stage
-        if not suppressed_nonterminal:
+        if not suppressed_withdrawn_update:
             for k, v in (data or {}).items():
                 row["data"][k] = v
-        return dict(row)
+        return MeetingStatusWrite(
+            row=dict(row),
+            disposition=disposition,
+            previous_status=previous_status,
+        )
+
+    async def list_terminal_meeting_ids(self, *, before_id=None, limit=100) -> list[int]:
+        rows = [
+            meeting_id
+            for meeting_id, meeting in self._meetings.items()
+            if meeting["status"] in _TERMINAL_STATUSES
+            and minutes_transcript_is_finalizable(meeting.get("data"))
+            and (before_id is None or meeting_id < before_id)
+        ]
+        return sorted(rows, reverse=True)[:limit]
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:
         return sum(
@@ -388,6 +495,7 @@ class FakeRuntimeClient:
         self._fail = fail
         self.specs: list[dict] = []  # every spawned spec, for assertions
         self.deleted: list[str] = []  # workload ids torn down (ROB3 compensation), for assertions
+        self.scrubbed: list[str] = []
         # Liveness map for the reconcile sweep: workload_id -> status dict ({"state": ...}). A workload
         # ABSENT from this map is treated as GONE (404 → None) by ``get_workload``. ``None`` defaults to
         # "every workload is alive and running" (back-compat for tests that don't care about liveness).
@@ -418,3 +526,10 @@ class FakeRuntimeClient:
         if self._workloads is None:
             return {"workloadId": workload_id, "state": "running"}
         return self._workloads.get(workload_id)
+
+    async def scrub_workload(self, workload_id: str) -> None:
+        if self._workloads is not None and workload_id not in self._workloads:
+            raise WorkloadUnknown(workload_id)
+        self.scrubbed.append(workload_id)
+        if self._workloads is not None:
+            self._workloads.pop(workload_id, None)

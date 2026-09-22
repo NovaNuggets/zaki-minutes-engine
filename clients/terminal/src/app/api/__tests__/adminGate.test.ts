@@ -143,4 +143,48 @@ describe("admin gate — verified allowlist, fail-closed", () => {
     expect((await probeRoute()).status).toBe(404);
     expect(calls2.some((c) => c.url.includes("/api/admin/probe"))).toBe(false);
   });
+
+  it("admin overview and probe cancel declared-oversized responses", async () => {
+    cookieJar = { "vexa-token": "admin-tok" };
+    let cancelled = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("/internal/validate")) {
+        return new Response(JSON.stringify({ user_id: 1, email: "dmitry@vexa.ai" }), { status: 200 });
+      }
+      return new Response(new ReadableStream({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode("private runtime state"));
+          controller.close();
+        },
+        cancel() { cancelled += 1; },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Content-Length": String(2 * 1024 * 1024 + 1) },
+      });
+    }));
+
+    const overview = await overviewRoute();
+    const probe = await probeRoute();
+
+    expect(overview.status).toBe(502);
+    expect(probe.status).toBe(502);
+    expect(await overview.json()).toEqual({ error: "agent-api response is too large" });
+    expect(await probe.json()).toEqual({ error: "agent-api response is too large" });
+    expect(cancelled).toBe(2);
+  });
+
+  it("admin proxy transport errors never reflect internal details", async () => {
+    cookieJar = { "vexa-token": "admin-tok" };
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("/internal/validate")) {
+        return new Response(JSON.stringify({ user_id: 1, email: "dmitry@vexa.ai" }), { status: 200 });
+      }
+      throw new Error("redis password and private agent URL");
+    }));
+
+    const overview = await overviewRoute();
+
+    expect(overview.status).toBe(502);
+    expect(await overview.json()).toEqual({ error: "agent-api unavailable" });
+  });
 });

@@ -300,7 +300,7 @@ def test_stop_after_adoption_reaches_the_real_container():
     rt.adopt()
     status = rt.stop("mtg-2-d93eee39")
     assert status.state is RuntimeState.stopped
-    assert containers["vexa-mtg-2-d93eee39"]["running"] is False      # actually stopped
+    assert "vexa-mtg-2-d93eee39" not in containers  # stopped workloads retain no launch secrets
     assert any(m == "POST" and "/stop" in p for m, p in fake.calls)
 
 
@@ -328,7 +328,7 @@ def test_stop_without_adoption_still_finds_the_container_via_find():
     rt = Runtime(backend=be, profiles={}, store=store, grace_sec=0.1)   # durable store, no handles
     status = rt.stop("mtg-2-d93eee39")
     assert status.state is RuntimeState.stopped
-    assert containers["vexa-mtg-2-d93eee39"]["running"] is False
+    assert "vexa-mtg-2-d93eee39" not in containers
 
 
 def test_adopt_preserves_records_a_durable_store_kept():

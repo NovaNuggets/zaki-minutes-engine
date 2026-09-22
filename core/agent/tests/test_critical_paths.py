@@ -101,33 +101,59 @@ def test_cp6_fold_dedups_refining_drafts_and_orders(monkeypatch):
     assert folded == "Jane: let's discuss pricing\nRaj: SSO first"
 
 
-def test_cp6_meeting_grounding_folds_live_transcript(monkeypatch):
-    """active=meeting → plain dispatch context (a chat turn, no serve), no tools, and the prompt is
-    grounded with the meeting's live transcript folded from its redis stream."""
+def test_cp6_fold_uses_a_finite_reverse_read_budget(monkeypatch):
+    """A chat turn over a long meeting must not materialize the entire Redis stream."""
+    import redis
+
+    class BoundedRedis:
+        count = None
+
+        def xrevrange(self, key, count=None):
+            assert key == "tc:meeting:41"
+            self.count = count
+            return [("999-0", {"payload": json.dumps({
+                "type": "transcription",
+                "segments": [{"segment_id": "latest", "speaker": "Jane", "text": "bounded"}],
+            })})]
+
+    fake = BoundedRedis()
+    monkeypatch.setattr(redis, "from_url", lambda *_a, **_k: fake)
+
+    folded = _fold_meeting_transcript("redis://fake", "41", limit=400)
+
+    assert folded == "Jane: bounded"
+    assert isinstance(fake.count, int) and 400 <= fake.count <= 1600
+
+
+def test_cp6_meeting_grounding_does_not_copy_live_transcript_to_durable_chat(monkeypatch):
+    """Meeting content must travel only through the dedicated bounded Minutes path, never through
+    the generic chat prompt/stream/session durability path."""
     r = _seed_transcript_stream(
-        "abc-defg-hij",
+        "41",
         {"type": "transcription", "segments": [{"segment_id": "s1", "speaker": "Jane", "text": "ship it Friday"}]},
     )
     url = _fake_url(r, monkeypatch)
     ctx, tools, prompt = _meeting_grounding(
-        {"kind": "meeting", "meeting": {"platform": "google_meet", "native_id": "abc-defg-hij"}},
+        {"kind": "meeting", "meeting": {
+            "meeting_id": "41", "platform": "google_meet", "native_id": "abc-defg-hij",
+        }},
         session="main", prompt="who spoke last?", redis_url=url)
     assert ctx == {"kind": "none", "session": "main"} and tools == []
-    assert "Jane: ship it Friday" in prompt
-    assert prompt.startswith("You are assisting in a live meeting (google_meet/abc-defg-hij).")
+    assert "Jane: ship it Friday" not in prompt
+    assert "dedicated, bounded Minutes read path" in prompt
     assert prompt.endswith("who spoke last?")
 
 
-def test_cp6_meeting_with_no_transcript_says_so(monkeypatch):
-    """active=meeting but the stream is empty → the agent is told no transcript has been captured yet
-    (so it never claims the meeting 'hasn't been processed' off a missing notes file)."""
-    r = _seed_transcript_stream("empty-mtg")  # no entries
+def test_cp6_meeting_without_safe_read_path_says_so(monkeypatch):
+    """Without the privacy-safe path, the agent must say the content is unavailable and never infer
+    that a Redis carrier is empty or reconstruct meeting content."""
+    r = _seed_transcript_stream("42")  # no entries
     url = _fake_url(r, monkeypatch)
     _ctx, tools, prompt = _meeting_grounding(
-        {"kind": "meeting", "meeting": {"native_id": "empty-mtg"}},
+        {"kind": "meeting", "meeting": {"meeting_id": "42", "native_id": "empty-mtg"}},
         session="main", prompt="summary?", redis_url=url)
     assert tools == []
-    assert "no transcript has been captured yet" in prompt
+    assert "cannot be read safely from this chat" in prompt
 
 
 def test_cp6_no_active_meeting_is_plain_chat():

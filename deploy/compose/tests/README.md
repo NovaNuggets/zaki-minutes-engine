@@ -4,6 +4,14 @@
 is ready to run the vexa bot, and tears it all down (`down -v`) in a guaranteed finally — the
 "fully tested / proven ready" deliverable, run via `make -C deploy/compose stack-test`.
 
+`minutes-config-contract.sh` is a no-stack render check: it proves policy-owning APIs are hard-pinned
+Minutes-off, the bundled Agent receives only forced-false gates and no URL/credential, intent reaches
+the code-78 startup guard, operator overrides cannot activate meeting/admin, and `.env.example`
+contains no Hub/read/erasure credential value. It also proves the dedicated Gateway identity proof
+reaches only Gateway + Agent, runtime cannot broker it into workers, and Redis has authenticated,
+bounded, no-eviction memory semantics. Its optional previous key is independently proven
+verifier-only on Agent; Gateway and all other services never receive it.
+
 The `stack` session fixture (`conftest.py`) owns the whole lifecycle: `docker compose up -d --build`
 under an isolated project name, a bounded wait for every service `healthy`, then `down -v` on exit.
 Everything polls with bounded timeouts — never sleep-and-hope. Absent docker → the module self-skips
@@ -13,7 +21,7 @@ Everything polls with bounded timeouts — never sleep-and-hope. Absent docker �
 
 | step | proof | always-on? |
 |------|-------|------------|
-| 1  | `/health` 200 on gateway·meeting-api·runtime·admin-api | yes |
+| 1  | `/health` 200 on gateway·meeting-api·runtime·admin-api; Redis refuses anonymous `PING` with `NOAUTH` and accepts the operator-authenticated probe | yes |
 | 2  | admin-api mints a scoped token; gateway accepts it (200), rejects missing/invalid (401) + out-of-scope (403); a proxied call reaches meeting-api | yes |
 | 4  | XADD golden segments → the collector consumer stores them (live segment hash) + publishes `tc:meeting:{id}:mutable` → a `/ws` client (through the gateway) receives the live frame | yes |
 | 5  | upload a chunk via the bot's `/internal/recordings/upload` → the object lands in minio; finalize → a master is assembled in minio | yes |
@@ -49,12 +57,9 @@ bot, deterministically, so they are the always-on `gate:compose`. The bot-spawn 
 The three carve gaps that once blocked a live `COMPOSE_BOT=1` bot spawn are all fixed; a `POST /bots`
 on the live stack now spawns a real `vexa-mtg-…` container (verified end-to-end):
 
-1. **meeting-api `ADMIN_TOKEN`** — fixed. `../docker-compose.yml` sets `ADMIN_TOKEN` on the meeting-api
-   service, and `__main__.py` resolves `token_secret = os.getenv("ADMIN_TOKEN")` with a fail-fast
-   `_require_config(("ADMIN_TOKEN",))` that refuses to boot without it, so `POST /bots` returns `201`
-   (no more 500 on mint). (`bot_spawn` still relies on the `ADMIN_TOKEN` env fallback inside
-   `mint_meeting_token` rather than an explicitly-threaded `token_secret`, but the fail-fast guarantees
-   it is present.)
+1. **meeting-api `MEETING_TOKEN_SECRET`** — fixed and separated. `../docker-compose.yml` projects the
+   dedicated signer only into meeting-api; `ADMIN_TOKEN` is absent there. Startup refuses a missing or
+   reused signer, so `POST /bots` can mint a scoped MeetingToken without sharing administrative auth.
 2. **`updated_at` tz mismatch** — fixed. The repo writes tz-naive (`datetime.now(timezone.utc).replace(tzinfo=None)`)
    and the column uses a server-side `onupdate=func.now()`, so there is no offset-aware/naive subtraction.
 3. **runtime image `docker` CLI** — fixed (was a misdiagnosis). The `DockerBackend` talks to

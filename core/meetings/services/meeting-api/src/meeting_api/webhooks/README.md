@@ -18,12 +18,29 @@ webhooks.py}`, reimplemented clean. The wire shape is sealed in `meetings/contra
   (billing/analytics) bypasses it.
 - **Retry** (`retry.py`) — a `RetryQueue` over a Redis list (`webhook:retry_queue`); a 5xx/429/
   transport-error enqueues; `drain_retry_queue` is one worker sweep (exponential `BACKOFF_SCHEDULE`
-  = 1m·5m·30m·2h, 24h max-age). The eval drives the clock forward — no real sleeps.
+  = 1m·5m·30m·2h, 24h max-age). Direct and retry POSTs first acquire a content-free,
+  meeting-scoped Redis delivery claim behind the permanent erasure cancel fence. Erasure installs
+  that fence, purges queued/DLQ payloads, and waits for already-claimed transports to release;
+  therefore no delivery can begin or finish after erasure reports completion. The eval drives the
+  retry clock forward — no real sleeps.
+- **Minutes platform finalization** (`platform_finalized.py`) — a separate default-off,
+  operator-owned `minutes-finalized.v1` sink plus Redis outbox. It never enters the user's
+  `webhook.v1` delivery path. Finalization intent is durable before the transcript
+  finalizer runs; finalizer/delivery failure remains pending across callback replay and process
+  restart. The drain performs a bounded, newest-first terminal-row backfill before processing the
+  Redis queue, closing the crash window between the terminal PostgreSQL commit and Redis enqueue;
+  repeated startup scans and lifecycle replays are harmless because a successful delivery leaves
+  only a compact content-free completion tombstone. Redis contains no transcript, user-webhook
+  payload, URL, secret, or signing-key binding. Each attempt signs with the current process-local
+  operator key, so a pending envelope survives safe key rotation. The URL and signing secret stay
+  in the process-local sink, and this path never uses `RetryQueue` (whose per-user compatibility
+  entries include their own user webhook secret).
 
 The HTTP transport is **injected** (`transport(url, body, headers) -> resp`), so the eval supplies a
 fake in-memory receiver — no httpx, no network, no live receiver.
 
 ## Evals
-`tests/test_webhook_signing.py` · `test_webhook_delivery.py` · `test_webhook_ssrf.py`. Ride
-`gate:python`. `webhook.v1` goldens conform via `gate:schema` (the contract is UNSEALED — sealing is
-the human `lane:contract` step).
+`tests/test_webhook_signing.py` · `test_webhook_delivery.py` · `test_webhook_ssrf.py` ·
+`test_minutes_platform_finalized.py`. Ride
+`gate:python`. `webhook.v1` remains byte-for-byte isolated from the platform event;
+`minutes-finalized.v1` envelope/header goldens conform via `gate:schema`.

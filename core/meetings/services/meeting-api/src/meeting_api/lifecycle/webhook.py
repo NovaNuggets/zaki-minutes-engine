@@ -28,6 +28,7 @@ import jsonschema
 from referencing import Registry, Resource
 
 from .machine import BotStatus, StatusChange
+from ..public_status import public_meeting_status
 
 WEBHOOK_API_VERSION = "2026-03-01"
 
@@ -86,12 +87,17 @@ def build_status_change_envelope(
         or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "data": {
             "meeting": meeting,
-            "status_change": change.to_webhook_payload(),
+            "status_change": {
+                **change.to_webhook_payload(),
+                "old_status": public_meeting_status(
+                    change.old_status.value if change.old_status is not None else None
+                ),
+                "new_status": public_meeting_status(change.new_status.value),
+            },
         },
     }
     _conforms(envelope, "Envelope")
     return envelope
-
 
 def _minimal_meeting_projection(change: StatusChange) -> Dict[str, Any]:
     """The DB-free meeting block: `{connection_id, status, completion_reason, failure_stage, data}`
@@ -99,7 +105,7 @@ def _minimal_meeting_projection(change: StatusChange) -> Dict[str, Any]:
     rec = change.record
     return {
         "connection_id": rec.connection_id,
-        "status": rec.status.value if rec.status is not None else None,
+        "status": public_meeting_status(rec.status.value if rec.status is not None else None),
         "completion_reason": (
             rec.completion_reason.value if rec.completion_reason is not None else None
         ),
@@ -149,8 +155,10 @@ def build_typed_envelope(
     data: Dict[str, Any] = {"meeting": meeting}
     if event_type != "meeting.completed":
         data["status_change"] = {
-            "from": change.old_status.value if change.old_status is not None else None,
-            "to": change.new_status.value,
+            "from": public_meeting_status(
+                change.old_status.value if change.old_status is not None else None
+            ),
+            "to": public_meeting_status(change.new_status.value),
             "reason": change.reason,
             "timestamp": ts,
             "transition_source": change.transition_source.value,

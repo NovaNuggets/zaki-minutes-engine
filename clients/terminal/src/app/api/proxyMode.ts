@@ -13,6 +13,12 @@ import { meetingsOnly } from "../mode";
  *  (/user/webhook, /user/calendar) — same authenticated edge, admin-api behind it. */
 export const MEETINGS_DOMAIN = /^(meetings|transcripts|bots|user)(\/|$)/;
 
+/** Managed Minutes is an external-Hub surface. A browser user key must never be treated as the
+ * dedicated Hub credential, so the reference Terminal refuses these paths before proxy auth/I/O. */
+export function isManagedMinutesPath(path: string): boolean {
+  return /^minutes(\/|$)/.test(path);
+}
+
 /** true when this /api/<path> must be refused (meetings mode + a non-meeting-domain path). */
 export function refusedInMeetingsMode(path: string): boolean {
   return meetingsOnly() && !MEETINGS_DOMAIN.test(path);

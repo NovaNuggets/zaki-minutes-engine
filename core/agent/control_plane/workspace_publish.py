@@ -8,16 +8,14 @@ already HAS a home; publishing it is refused so the flow never shadows the user'
 Credential discipline (P15 — mirrors ``POST /api/workspace/swap``): the GitHub token arrives PER
 CALL in the request body, is used server-side for exactly two operations (the repo-creation API call
 and the authenticated push), and is NEVER stored. The push itself goes through the shared
-token-scrubbed remote mechanic (``shared.adapters.push_with_token``): a dedicated remote so the
-workspace's ``origin`` is never clobbered, token on the remote URL only for the push's duration,
-then scrubbed. Every error surfaced from here is token-redacted.
+    shared ``push_with_token`` mechanic: a dedicated token-free remote plus an ephemeral exact-origin
+    askpass credential, so the workspace's ``origin`` is never clobbered. Every error is redacted.
 
 Re-publish is idempotent-ish: the same remote means a plain (fast-forward) push. NEVER a force push
 — divergence surfaces as a clear, token-free error instead of rewriting the remote.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 import subprocess
@@ -29,6 +27,13 @@ from typing import Callable, Optional
 
 from shared.adapters import GitPushError, push_with_token
 from shared.gitenv import scrubbed_git_env
+from shared.git_auth import require_github_https_remote
+from shared.http import (
+    MAX_INTERNAL_JSON_BYTES,
+    encode_json_bounded,
+    open_no_redirect,
+    read_json_bounded,
+)
 
 from control_plane.workspace_attach import SEED_SLOT, _safe_subject_dir, attached_workspaces
 
@@ -39,6 +44,7 @@ GITHUB_API = "https://api.github.com"
 # ``vexa-vcs`` remote, so neither flow ever clobbers the other's URL.
 PUBLISH_REMOTE = "vexa-publish"
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_GITHUB_ORG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 
 
 class PublishError(RuntimeError):
@@ -75,8 +81,10 @@ def _github_create_repo(repo_name: str, private: bool, token: str, org: Optional
     ``shared.adapters.RuntimeHttpClient``). Returns the token-free https clone URL. All failures
     raise ``PublishError`` with the token redacted (P15); a 422 name collision raises the sharper
     ``RepoExistsError`` so the API can answer 409 with a clear, token-free message."""
+    if org and not _GITHUB_ORG_RE.fullmatch(org):
+        raise ValueError("invalid GitHub org")
     url = f"{GITHUB_API}/orgs/{org}/repos" if org else f"{GITHUB_API}/user/repos"
-    body = json.dumps({"name": repo_name, "private": bool(private)}).encode()
+    body = encode_json_bounded({"name": repo_name, "private": bool(private)})
     req = urllib.request.Request(
         url, data=body, method="POST",
         headers={
@@ -87,14 +95,14 @@ def _github_create_repo(repo_name: str, private: bool, token: str, org: Optional
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
+        with open_no_redirect(req, timeout=15) as r:
+            data = read_json_bounded(r)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
-            payload = json.loads(exc.read() or b"{}")
+            payload = read_json_bounded(exc)
             detail = str(payload.get("message") or "")
-        except (ValueError, OSError):
+        except (AttributeError, TypeError, ValueError, OSError):
             pass
         detail = _redacted(detail, token)
         if exc.code == 422:
@@ -110,10 +118,17 @@ def _github_create_repo(repo_name: str, private: bool, token: str, org: Optional
         raise PublishError(f"GitHub repo creation failed (HTTP {exc.code}): {detail}".strip()) from None
     except urllib.error.URLError as exc:
         raise PublishError(f"GitHub unreachable: {_redacted(str(exc.reason), token)}") from None
+    except ValueError:
+        raise PublishError("GitHub repo creation returned an invalid or oversized response") from None
+    if not isinstance(data, dict):
+        raise PublishError("GitHub repo creation returned an invalid response")
     clone_url = data.get("clone_url") or data.get("html_url")
-    if not clone_url:
+    if not isinstance(clone_url, str) or not clone_url:
         raise PublishError("GitHub repo creation returned no clone URL")
-    return clone_url
+    try:
+        return require_github_https_remote(clone_url)
+    except ValueError:
+        raise PublishError("GitHub repo creation returned an invalid clone URL") from None
 
 
 def _git_out(ws: Path, *args: str, token: Optional[str] = None) -> str:
@@ -215,9 +230,12 @@ def publish_workspace(
             raise ValueError(  # bad input (API → 400)
                 "invalid repo_name — use 1-100 characters of letters, digits, '.', '_' or '-'"
             )
+        normalized_org = (org or "").strip() or None
+        if normalized_org and not _GITHUB_ORG_RE.fullmatch(normalized_org):
+            raise ValueError("invalid GitHub org")
         # Resolved at call time (not def time) so tests can monkeypatch the module seam too.
         creator = create_repo or _github_create_repo
-        remote_url = creator(name, private, token, (org or "").strip() or None)
+        remote_url = creator(name, private, token, normalized_org)
         created = True
 
     try:

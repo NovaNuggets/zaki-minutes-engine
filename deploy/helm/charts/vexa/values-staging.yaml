@@ -5,13 +5,29 @@
 # in this file); transcription reuses the funded staging tx-gateway across namespaces.
 #
 #   kubectl --context lke590708-ctx create namespace vexa-v012-staging
+#   kubectl --context lke590708-ctx create namespace vexa-v012-staging-workloads
+#   kubectl --context lke590708-ctx label namespace vexa-v012-staging-workloads \
+#     pod-security.kubernetes.io/enforce=restricted \
+#     pod-security.kubernetes.io/enforce-version=latest --overwrite
+#   KUBE_CONTEXT=lke590708-ctx deploy/helm/bin/verify-workload-namespace.sh \
+#     vexa-v012-staging-workloads
 #   # create the vexa-v012-secrets Secret (ADMIN_API_TOKEN, INTERNAL_API_SECRET,
-#   #   TRANSCRIPTION_SERVICE_TOKEN, VEXA_DISPATCH_SIGNING_KEY) from vexa-secrets (sops, in-memory)
+#   #   RUNTIME_CONTROL_SECRET, RUNTIME_CALLBACK_SECRET, MEETING_TOKEN_SECRET,
+#   #   GATEWAY_IDENTITY_SECRET, REDIS_URL,
+#   #   REDIS_PASSWORD, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, TRANSCRIPTION_SERVICE_TOKEN,
+#   #   VEXA_DISPATCH_SIGNING_KEY, NEXTAUTH_SECRET,
+#   #   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET; add ZAKI_READ_TOKEN_MINUTES before enabling
+#   #   minutes.readEnabled) from vexa-secrets (sops, in-memory)
+#   # create vexa-v012-postgres-credentials separately with POSTGRES_DB, POSTGRES_USER, and a
+#   # non-default POSTGRES_PASSWORD (also from sops, in-memory)
 #   helm --kube-context lke590708-ctx upgrade --install vexa deploy/helm/charts/vexa \
 #     -n vexa-v012-staging -f deploy/helm/charts/vexa/values-staging.yaml --wait
 
 global:
-  imageTag: "0.12-staging"     # pinned immutable tag pushed to DockerHub (build-once)
+  deploymentProfile: "staging"
+  # Intentionally non-deployable placeholder. Infra replaces it with a build-once
+  # YYMMDD-<git-sha> tag or supplies per-image sha256 digests before rendering.
+  imageTag: "REPLACE_WITH_IMMUTABLE_TAG"
   imagePullPolicy: Always
   # LKE node pools are tainted vexa.ai/pool; staging workloads run on the `temp` pool (mirrors the
   # live 0.11 staging). Pin there + tolerate the taint, else pods stay Pending (no schedulable node).
@@ -26,9 +42,27 @@ global:
 # Credentials live in a pre-created Secret (sops-decrypted in-memory), not in values.
 secrets:
   existingSecretName: "vexa-v012-secrets"
+  # Bump whenever the external Secret data changes so Deployments roll without exposing Secret
+  # contents to Helm. Infra owns this revision alongside the Secret.
+  existingSecretRevision: "REPLACE_WITH_SECRET_REVISION"
+
+# Staging carries all Minutes plumbing but does not activate it. Any activation requires bundled
+# agentApi off, the complete TTL/erasure key boundary, and an explicit external Nullalis erasure URL.
+# zaki-infra separately projects the read token and Agent receipt signer to that Nullalis deployment.
+minutes:
+  captureEnabled: false
+  readEnabled: false
+  readBaseUrl: ""
+  nullalisErasureBaseUrl: ""
+  ttl:
+    enabled: false
+    intervalSeconds: 60
+    batchSize: 100
 
 runtime:
   backend: "k8s"               # real cloud spawn path (SA + RBAC + kubectl)
+  # Pre-create this namespace with no Secrets/PVCs except explicitly audited workload-only claims.
+  workloadNamespace: "vexa-v012-staging-workloads"
 
 # Modest single-replica footprint on the shared staging cluster (raise for load tests).
 gateway:
@@ -45,13 +79,16 @@ agentApi:
     size: 2Gi
 
 terminal:
-  replicaCount: 1
-  # Served at the staging dashboard hostname (caddy swap). NEXTAUTH_URL/TERMINAL_URL must match the
-  # external https origin for cookie security + login redirects.
-  publicUrl: "https://dashboard.staging.vexa.ai"
+  enabled: false                # external launch BFF/UI owns the user edge and OAuth configuration
+
+migrations:
+  enabled: true
 
 # LKE block storage (default SC is linode-block-storage-retain; leave SC unset to use it).
 postgres:
+  createCredentialsSecret: false
+  credentialsSecretName: "vexa-v012-postgres-credentials"
+  credentialsSecretRevision: "REPLACE_WITH_DATABASE_SECRET_REVISION"
   persistence:
     size: 5Gi
 redis:
@@ -64,6 +101,34 @@ minio:
 ingress:
   enabled: false               # reach via port-forward for the first proof; add ingress/LB next
 
+# The funded staging STT service is private and cross-namespace, so default-deny needs the exact
+# Service backing-Pod selector on both the platform and spawned-bot egress paths.
+networkPolicy:
+  platformAdditionalEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vexa-staging
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: vexa-platform
+              app.kubernetes.io/component: transcription-gateway
+      ports:
+        - protocol: TCP
+          port: 8084
+  workloadAdditionalEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vexa-staging
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: vexa-platform
+              app.kubernetes.io/component: transcription-gateway
+      ports:
+        - protocol: TCP
+          port: 8084
+
 # Single replica ⇒ no PDBs.
 podDisruptionBudgets:
   gateway:
@@ -75,4 +140,6 @@ podDisruptionBudgets:
   runtime:
     enabled: false
   agentApi:
+    enabled: false
+  terminal:
     enabled: false

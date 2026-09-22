@@ -26,18 +26,30 @@ import { loadInvocation, InvocationError, type Invocation } from './config.js';
 import type { Act, LifecycleEvent } from './contracts.js';
 import { createOrchestrator } from './orchestrator.js';
 import { createHttpLifecycleSink } from './adapters/lifecycle-http.js';
-import { createRedisTranscriptSink, redisClientFrom } from './adapters/transcript-redis.js';
-import { createRedisActsSource, redisActsClientFrom } from './adapters/acts-redis.js';
+import {
+  createRedisTranscriptSink,
+  fenceAllMeetingCarriers,
+  redisClientFrom,
+  type LiveRedisTranscriptClient,
+  type RedisCarrierFenceClient,
+  type RevocableTranscriptSink,
+} from './adapters/transcript-redis.js';
+import {
+  createRedisActsSource,
+  redisActsClientFrom,
+  type LiveRedisActsClient,
+} from './adapters/acts-redis.js';
+import { createHttpTranscriptSink } from './adapters/transcript-http.js';
 import { createBrowserJoinDriver } from './join-driver.js';
 import { createBotPipeline, type BotPipeline } from './pipeline.js';
 import { createBotRecordingSink } from './recording.js';
 import { launchBrowser, startCaptureBridge, startRecording, createSpeakController, type BrowserSession, type SpeakController } from './capture-bridge.js';
 import { installSignalHandlers } from './signals.js';
+import { armCaptureDeadline } from './retention-deadline.js';
 import type {
   JoinDriver,
   Pipeline,
   LifecycleSink,
-  TranscriptSink,
   ActsSource,
   RecordingSink,
 } from './ports.js';
@@ -64,6 +76,12 @@ function noBrowserJoinDriver(reason: string): JoinDriver {
  *  it satisfies the port so the orchestrator can teardown cleanly; it never captures. */
 function noBrowserPipeline(): Pipeline {
   return { async start() { /* */ }, async stop() { /* */ } };
+}
+
+/** Managed invocation.v2 deliberately has no Redis command subscription. Commands for managed
+ *  bots need their own session-bound HTTP contract before they can be enabled safely. */
+function noManagedActsSource(): ActsSource {
+  return { subscribe() { return () => { /* no managed command transport */ }; } };
 }
 
 /** The meeting id that keys the redis transcript/acts channels (0.11 control-plane convention:
@@ -146,18 +164,38 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // lifecycle.v1: HTTP POST to meeting-api when a callback URL is configured; console-only for
   // self-host (no callback). The HTTP sink retries/backs off and never throws out of emit.
   const lifecycle: LifecycleSink = inv.meetingApiCallbackUrl
-    ? createHttpLifecycleSink({ callbackUrl: inv.meetingApiCallbackUrl, internalSecret: inv.internalSecret })
+    ? createHttpLifecycleSink({ callbackUrl: inv.meetingApiCallbackUrl, token: inv.token })
     : consoleLifecycleSink();
 
-  // transcript.v1 + acts.v1: redis. Connect LAZILY — constructing the clients does NOT dial
-  // redis, so an unreachable broker doesn't crash the composition root; the first publish/
-  // subscribe surfaces the error and the orchestrator drives to a clean terminal `failed`.
-  const transcriptClient = redisClientFrom(inv.redisUrl);
-  const actsClient = redisActsClientFrom(inv.redisUrl);
-  const transcript: TranscriptSink = createRedisTranscriptSink({
-    client: transcriptClient, meetingId, nativeMeetingId: inv.nativeMeetingId,
-  });
-  const liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  // Managed invocation.v2 is a hostile-workload boundary: the browser-facing bot receives only a
+  // short-lived MeetingToken and writes through meeting-api complete mediation. It never receives
+  // Redis authority. Ordinary invocation.v1 keeps the upstream Redis adapters unchanged.
+  let transcriptClient: LiveRedisTranscriptClient | undefined;
+  let actsClient: LiveRedisActsClient | undefined;
+  let transcript: RevocableTranscriptSink;
+  let carrierFencer: RedisCarrierFenceClient;
+  let liveActs: ActsSource;
+  if (inv.contractVersion === 'invocation.v2') {
+    const managed = createHttpTranscriptSink({
+      transcriptIngestUrl: inv.transcriptIngestUrl!,
+      retentionFenceUrl: inv.retentionFenceUrl!,
+      token: inv.token!,
+      connectionId: inv.connectionId!,
+    });
+    transcript = managed;
+    carrierFencer = managed;
+    liveActs = noManagedActsSource();
+  } else {
+    if (!inv.redisUrl) throw new InvocationError('invocation.v1: redisUrl is required');
+    transcriptClient = redisClientFrom(inv.redisUrl);
+    actsClient = redisActsClientFrom(inv.redisUrl);
+    transcript = createRedisTranscriptSink({
+      client: transcriptClient, meetingId, nativeMeetingId: inv.nativeMeetingId,
+      captureExpiresAt: inv.captureExpiresAt,
+    });
+    carrierFencer = transcriptClient;
+    liveActs = createRedisActsSource({ client: actsClient, meetingId });
+  }
 
   // ── 2b: launch the browser + wire join / capture / recording / speak (L4-gated). ──
   // Browser-launch failure must NOT crash the root: fall back to the no-browser drivers so the
@@ -238,10 +276,26 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
   // a wedged teardown can never ride a `docker stop` all the way to a silent 137 (the incident's
   // exit code on BOTH orphaned bots). Wire before run(); release the listeners after.
   const releaseSignals = installSignalHandlers({ stop: (reason) => orchestrator.stop(reason) });
+  const releaseCaptureDeadline = inv.captureExpiresAt
+    ? armCaptureDeadline({
+      expiresAt: inv.captureExpiresAt,
+      // This one-way local latch is synchronous: even if Redis is down and the permanent fence
+      // times out, pipeline.stop() cannot flush content when the connection later recovers.
+      revoke: () => { transcript.revoke(); recording?.revoke(); },
+      fence: () => fenceAllMeetingCarriers(carrierFencer, meetingId),
+      // The runtime's per-workload maxLifetimeSec is the authoritative hard-stop backstop. This
+      // graceful path runs first so both Redis scopes are permanent before pipeline.stop() flushes.
+      stop: () => orchestrator.stop('max_bot_time_exceeded'),
+      onFenceFailure: (error) => {
+        console.error(`[bot] retention deadline fence failed (${error.name})`);
+      },
+    })
+    : () => {};
   try {
     const result = await orchestrator.run({ maxActiveMs: deriveMaxActiveMs(inv) });
     return result.exitCode;
   } finally {
+    releaseCaptureDeadline();
     releaseSignals();
     // Tear down the capture bridge + browser (best-effort — a teardown failure must not change
     // the exit code). The orchestrator already stopped the pipeline + left the meeting.
@@ -250,8 +304,8 @@ export async function main(env: NodeJS.ProcessEnv = process.env): Promise<number
     if (session) await session.close().catch(() => { /* best-effort */ });
     // Quit the redis connections on teardown (best-effort — a quit failure must not change the
     // exit code; they may never have connected if redis was unreachable).
-    await transcriptClient.quit().catch(() => { /* best-effort */ });
-    await actsClient.quit().catch(() => { /* best-effort */ });
+    await transcriptClient?.quit().catch(() => { /* best-effort */ });
+    await actsClient?.quit().catch(() => { /* best-effort */ });
   }
 }
 

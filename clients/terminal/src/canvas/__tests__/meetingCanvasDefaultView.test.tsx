@@ -37,8 +37,8 @@ const LINE = { speaker: "Jane", text: "so um we agreed to ship friday", t: 1 };
 
 function meetingRow(live: boolean) {
   return {
-    id: "abc-defg-hij", native_id: "abc-defg-hij",
-    session_uid: live ? "abc-defg-hij" : undefined,
+    id: "41", native_id: "abc-defg-hij",
+    session_uid: live ? "41" : undefined,
     title: "Google Meet · abc-defg-hij", when: "", status: live ? "live" : "past",
     platform: "Google Meet", participants: [], mentioned: [], actions: [], transcript: [], insights: [],
   };
@@ -67,7 +67,7 @@ async function renderCanvas() {
   await act(async () => {
     root.render(
       <ServicesProvider container={container2}>
-        <MeetingCanvasView meetingId="abc-defg-hij" />
+        <MeetingCanvasView meetingId="41" />
       </ServicesProvider>,
     );
   });
@@ -148,5 +148,50 @@ describe("MeetingCanvasView — default view + toggle semantics", () => {
     expect(toggleButton().getAttribute("aria-pressed")).toBe("true");
     expect(toggleButton().textContent).toContain("Processing on");
     expect(processCalls()).toBe(1);
+    const processRequest = fetchMock.mock.calls.find(([url]) => String(url).includes("/api/meeting/process"));
+    expect(JSON.parse(String((processRequest?.[1] as RequestInit)?.body))).toEqual({
+      meeting_id: "41", native_id: "abc-defg-hij", on: true,
+    });
+  });
+
+  it("LIVE meeting toggle changes only after the consent endpoint confirms it", async () => {
+    meetingsState = [meetingRow(true)];
+    durableState.lines = [];
+    durableState.notes = [];
+    let confirmResponse!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      confirmResponse = resolve;
+    }));
+    await renderCanvas();
+
+    await act(async () => {
+      toggleButton().dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(toggleButton().getAttribute("aria-pressed")).toBe("false");
+    expect(toggleButton().disabled).toBe(true);
+
+    await act(async () => { confirmResponse(new Response("{}", { status: 202 })); });
+    expect(toggleButton().getAttribute("aria-pressed")).toBe("true");
+    expect(toggleButton().disabled).toBe(false);
+  });
+
+  it("LIVE meeting toggle rolls back and surfaces a stable error when OFF is not confirmed", async () => {
+    meetingsState = [meetingRow(true)];
+    durableState.lines = [];
+    durableState.notes = [];
+    await renderCanvas();
+
+    // First turn processing on successfully.
+    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 202 }));
+    await act(async () => { toggleButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    expect(toggleButton().getAttribute("aria-pressed")).toBe("true");
+
+    // The OFF request fails: the visual state must remain ON, matching the unconfirmed authority state.
+    fetchMock.mockResolvedValueOnce(new Response("private upstream detail", { status: 503 }));
+    await act(async () => { toggleButton().dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    expect(toggleButton().getAttribute("aria-pressed")).toBe("true");
+    const alert = container.querySelector('[role="alert"]');
+    expect(alert?.textContent).toContain("Couldn’t change meeting processing");
+    expect(alert?.textContent).not.toContain("private upstream detail");
   });
 });

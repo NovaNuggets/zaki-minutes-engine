@@ -1,8 +1,8 @@
 "use client";
 /** SetupGate — the ADMIN first-run wizard (first-run onboarding design, 2026-07-09). Sits inside
  *  AuthGate: once the bootstrap-claimed admin signs in, this walks the two things a meeting needs
- *  — the agent model and the transcription backend — each SMOKE-TESTED inline against the real
- *  backend (the same /api/{models,transcription}/test edges Settings → Models ships), writing the
+ *  — the agent model and the transcription backend — saving the operator-owned GLOBAL platform
+ *  settings without claiming that this configuration-only flow probes or spends credentials. The
  *  GLOBAL platform settings (this is the instance-wide admin flow; per-user overrides stay in
  *  Settings). Durable state lives in the platform-settings "setup" key, so the wizard shows once
  *  per INSTANCE, never per browser. Non-admins (the setup probe 404s → null) fall straight
@@ -12,7 +12,7 @@
  *  recorded so Settings can nudge later. */
 import { useEffect, useState, type CSSProperties } from "react";
 import {
-  getGlobalSetting, setGlobalSetting, testModels, testTranscription,
+  getGlobalSetting, setGlobalSetting, testModels,
   type ConfigTestResult, type GlobalSetting,
 } from "../surfaces/settingsApi";
 
@@ -29,7 +29,7 @@ const card: CSSProperties = {
   border: "1px solid var(--line2)", borderRadius: 10, padding: "13px 15px",
   display: "flex", flexDirection: "column", gap: 6, cursor: "pointer",
 };
-const cardSel: CSSProperties = { ...card, borderColor: "var(--accent)", background: "var(--panel2)" };
+const cardSel: CSSProperties = { ...card, border: "1px solid var(--accent)", background: "var(--panel2)" };
 const field: CSSProperties = {
   width: "100%", boxSizing: "border-box", fontSize: 12.5, padding: "8px 10px", borderRadius: 7,
   border: "1px solid var(--line2)", background: "var(--panel2)", color: "var(--t1)", outline: "none",
@@ -47,7 +47,7 @@ const label: CSSProperties = {
 };
 
 function TestLine({ res, err, busy }: { res: ConfigTestResult | null; err: string | null; busy: boolean }) {
-  if (busy) return <span style={{ fontSize: 11.5, color: "var(--t3)" }}>Testing…</span>;
+  if (busy) return <span style={{ fontSize: 11.5, color: "var(--t3)" }}>Saving…</span>;
   if (err) return <span role="alert" style={{ fontSize: 11.5, color: "var(--danger)" }}>⚠ {err}</span>;
   if (!res) return null;
   return (
@@ -57,7 +57,7 @@ function TestLine({ res, err, busy }: { res: ConfigTestResult | null; err: strin
   );
 }
 
-/** Step 1 — agent model: Claude subscription on this machine (detect via the real test edge) or a
+/** Step 1 — agent model: Claude subscription reported by managed status or a
  *  custom OpenRouter/OpenAI-compatible endpoint. */
 function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
   const [choice, setChoice] = useState<"subscription" | "custom">("subscription");
@@ -77,9 +77,12 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
   };
   useEffect(recheck, []);
 
-  const detected = !detecting && detect?.ok === true;
+  const configured = !detecting
+    && detect?.ok === true
+    && detect.source === "operator"
+    && detect.managed === true;
 
-  const saveAndTest = async () => {
+  const saveConfiguration = async () => {
     setBusy(true); setErr(null); setRes(null);
     try {
       if (choice === "custom") {
@@ -89,7 +92,7 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
       } else {
         await setGlobalSetting("models", { mode: "subscription" });
       }
-      setRes(await testModels());
+      setRes({ ok: true, summary: "Operator model configuration saved.", source: "operator", managed: true });
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -97,7 +100,7 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
     }
   };
 
-  const canContinue = (choice === "subscription" && detected) || res?.ok === true;
+  const canContinue = (choice === "subscription" && configured) || res?.ok === true;
 
   return (
     <>
@@ -107,20 +110,20 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
         Settings → Models.
       </div>
 
-      <div style={choice === "subscription" ? cardSel : card} onClick={() => setChoice("subscription")}>
+      <div style={choice === "subscription" ? cardSel : card} onClick={() => { setChoice("subscription"); setRes(null); }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: "var(--t1)" }}>
           <Radio on={choice === "subscription"} /> Claude subscription on this machine
           {detecting
-            ? <Badge tone="muted">checking…</Badge>
-            : detected ? <Badge tone="ok">detected</Badge> : <Badge tone="warn">not detected</Badge>}
+            ? <Badge tone="muted">checking configuration…</Badge>
+            : configured ? <Badge tone="ok">configured</Badge> : <Badge tone="warn">not configured</Badge>}
         </div>
         <div style={{ fontSize: 11.5, color: "var(--t3)", lineHeight: 1.5, marginLeft: 22 }}>
           Uses the Claude Code credentials already on this computer. No API key needed.
         </div>
-        {!detecting && !detected && (
+        {!detecting && !configured && (
           <div style={{ marginLeft: 22, display: "flex", flexDirection: "column", gap: 7 }}>
             <div style={{ fontSize: 11.5, color: "var(--t2)", lineHeight: 1.5 }}>
-              No Claude credentials detected in the deployment environment. Set up a model
+              No managed model configuration is currently reported. Set up a model
               provider via <code style={{ fontSize: 11, fontFamily: "var(--mono)", background: "var(--panel2)", padding: "1px 4px", borderRadius: 3 }}>HOST_CLAUDE_CREDENTIALS</code>{" "}
               in deployment settings or select the "OpenRouter or custom endpoint" option above
               — see the <a href="https://docs.vexa.ai/configuration" target="_blank" rel="noreferrer" style={{ color: "var(--t2)", textDecoration: "underline" }}>configuration docs</a>{" "}
@@ -128,16 +131,16 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
             </div>
             {detect && !detect.ok && <TestLine res={detect} err={null} busy={false} />}
             <button style={{ ...quietBtn, alignSelf: "flex-start" }} onClick={(e) => { e.stopPropagation(); recheck(); }}>
-              Re-check
+              Refresh status
             </button>
           </div>
         )}
-        {detected && choice === "subscription" && (
+        {configured && choice === "subscription" && (
           <div style={{ marginLeft: 22 }}><TestLine res={detect} err={null} busy={false} /></div>
         )}
       </div>
 
-      <div style={choice === "custom" ? cardSel : card} onClick={() => setChoice("custom")}>
+      <div style={choice === "custom" ? cardSel : card} onClick={() => { setChoice("custom"); setRes(null); }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: "var(--t1)" }}>
           <Radio on={choice === "custom"} /> OpenRouter or custom endpoint
         </div>
@@ -154,12 +157,10 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 24 }}>
-        {choice === "custom" && (
-          <button style={{ ...quietBtn, opacity: busy || !baseUrl.trim() ? 0.5 : 1 }} disabled={busy || !baseUrl.trim()}
-            onClick={() => void saveAndTest()}>
-            {busy ? "Testing…" : "Save & test"}
-          </button>
-        )}
+        <button style={{ ...quietBtn, opacity: busy || (choice === "custom" && !baseUrl.trim()) ? 0.5 : 1 }} disabled={busy || (choice === "custom" && !baseUrl.trim())}
+          onClick={() => void saveConfiguration()}>
+          {busy ? "Saving…" : "Save configuration"}
+        </button>
         <TestLine res={res} err={err} busy={false} />
       </div>
 
@@ -167,13 +168,7 @@ function ModelsStep({ onNext }: { onNext: (state: StepState) => void }) {
         onSkip={() => onNext("skipped")}
         next={
           <button style={{ ...primaryBtn, opacity: canContinue ? 1 : 0.5 }} disabled={!canContinue}
-            onClick={async () => {
-              // Subscription path: persist the explicit choice so the instance default is declared.
-              if (choice === "subscription" && !res) {
-                try { await setGlobalSetting("models", { mode: "subscription" }); } catch { /* declarative only */ }
-              }
-              onNext("done");
-            }}>
+            onClick={() => onNext("done")}>
             Continue
           </button>
         }
@@ -192,13 +187,7 @@ function TranscriptionStep({ onNext }: { onNext: (state: StepState) => void }) {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // The deployment env may already carry a working backend (e.g. hosted Vexa baked into .env) —
-  // surface that: a green pre-test means "you can just continue".
-  useEffect(() => {
-    testTranscription().then(setRes).catch(() => undefined);
-  }, []);
-
-  const saveAndTest = async () => {
+  const saveConfiguration = async () => {
     setBusy(true); setErr(null);
     try {
       if (choice === "vexa") {
@@ -206,7 +195,7 @@ function TranscriptionStep({ onNext }: { onNext: (state: StepState) => void }) {
       } else {
         await setGlobalSetting("transcription", { url: url.trim(), token: customToken.trim() });
       }
-      setRes(await testTranscription());
+      setRes({ ok: true, summary: "Operator transcription configuration saved.", source: "operator", managed: true });
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -257,8 +246,8 @@ function TranscriptionStep({ onNext }: { onNext: (state: StepState) => void }) {
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 24 }}>
         <button style={{ ...quietBtn, opacity: busy || !dirty ? 0.5 : 1 }} disabled={busy || !dirty}
-          onClick={() => void saveAndTest()}>
-          {busy ? "Testing…" : "Save & test"}
+          onClick={() => void saveConfiguration()}>
+          {busy ? "Saving…" : "Save configuration"}
         </button>
         <TestLine res={res} err={err} busy={busy} />
       </div>
@@ -381,15 +370,15 @@ export function SetupGate({ children }: { children: React.ReactNode }) {
             <div style={{ fontSize: 19, fontWeight: 650, color: "var(--t1)" }}>You&rsquo;re set ✓</div>
             <div style={{ fontSize: 12.5, color: "var(--t2)", lineHeight: 1.8 }}>
               <div style={{ color: states.models === "done" ? "var(--green)" : "var(--t3)" }}>
-                {states.models === "done" ? "✓ Agent model configured and tested" : "○ Agent model skipped — finish it in Settings → Models"}
+                {states.models === "done" ? "✓ Agent model configuration saved" : "○ Agent model skipped — finish it in Settings → Models"}
               </div>
               <div style={{ color: states.transcription === "done" ? "var(--green)" : "var(--t3)" }}>
-                {states.transcription === "done" ? "✓ Transcription configured and tested" : "○ Transcription skipped — finish it in Settings → Models"}
+                {states.transcription === "done" ? "✓ Transcription configuration saved" : "○ Transcription skipped — finish it in Settings → Models"}
               </div>
             </div>
             <div style={{ fontSize: 12, color: "var(--t3)", lineHeight: 1.5 }}>
-              Everything a meeting needs is wired up. Next: get a meeting in front of a bot — connect
-              your calendar, plan a meeting, or drop a bot on a running Meet.
+              Your setup choices are saved. Next: connect your calendar or plan a meeting here.
+              Managed capture controls are available in the ZAKI Hub.
             </div>
             <div>
               <button style={primaryBtn} onClick={finish}>Go to Meetings</button>

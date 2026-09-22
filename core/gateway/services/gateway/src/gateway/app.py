@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import urllib.parse
 from typing import Dict, List, Optional, Set, Tuple
 
 import httpx  # the downstream adapter's transport errors are mapped to 502/504 (not leaked as a 500)
@@ -36,7 +37,14 @@ from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
 from .obs import TRACE_HEADER, TraceMiddleware, get_trace_id, log_event, set_user_id
-from .ports import Authorizer, DownstreamClient, RedisBus
+from .identity_proof import GatewayIdentitySigner, canonical_query
+from .ports import (
+    DEFAULT_MAX_BUFFERED_BODY_BYTES,
+    Authorizer,
+    DownstreamBodyTooLarge,
+    DownstreamClient,
+    RedisBus,
+)
 
 # Route-prefix → required scope set. Mirrors main.py ROUTE_SCOPES (main.py:59-65) for the CORE
 # surface the gateway lane carves; multi-scope tokens pass for any of their domains.
@@ -61,6 +69,46 @@ _DEFAULT_AGENT_API_URL = "http://agent-api"
 # (writes to user.data JSONB — the same blob /internal/validate reads the webhook config from).
 _DEFAULT_ADMIN_API_URL = "http://admin-api"
 
+# The buffered proxy carries JSON, multipart workspace uploads, and transcript responses. Keep the
+# cap above the agent's 25 MiB upload budget while making memory use finite. Recording media has a
+# separate streaming path and is intentionally not subject to this aggregate byte cap.
+MAX_PROXY_BODY_BYTES = DEFAULT_MAX_BUFFERED_BODY_BYTES
+MAX_STREAM_ERROR_BYTES = 64 * 1024
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+async def _read_request_body_bounded(request: Request, limit: int) -> bytes:
+    """Read a caller body at most ``limit`` bytes, including chunked requests."""
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        try:
+            if int(declared_length) > limit:
+                raise _RequestBodyTooLarge
+        except ValueError:
+            # Starlette/httpx will handle malformed framing; the streamed byte counter remains the
+            # authoritative memory bound even when Content-Length is absent or unusable.
+            pass
+
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.stream():
+        received += len(chunk)
+        if received > limit:
+            raise _RequestBodyTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _request_too_large_response() -> Response:
+    return Response(
+        content=json.dumps({"detail": "request body too large"}),
+        status_code=413,
+        media_type="application/json",
+    )
+
 
 def _required_scopes(path: str) -> Optional[Set[str]]:
     for prefix, scopes in ROUTE_SCOPES.items():
@@ -78,6 +126,7 @@ def create_app(
     agent_api_url: str = _DEFAULT_AGENT_API_URL,
     admin_api_url: str = _DEFAULT_ADMIN_API_URL,
     rate_limiter=None,
+    gateway_identity_secret: str = "",
 ) -> FastAPI:
     """Build the gateway FastAPI app over the injected ports.
 
@@ -87,8 +136,24 @@ def create_app(
     ``redis``       — pub/sub bus for the ``/ws`` fan-in.
     """
     app = FastAPI(title="Vexa API Gateway (v0.12)")
+    gateway_identity_signer = (
+        GatewayIdentitySigner(gateway_identity_secret)
+        if gateway_identity_secret
+        else None
+    )
     # The edge: mint/read X-Trace-Id and bind it for the request (logevent.v1 trace_id).
     app.add_middleware(TraceMiddleware)
+
+    @app.middleware("http")
+    async def _sensitive_responses_are_never_stored(request: Request, call_next):
+        """The gateway carries transcripts, recordings, model output, and user configuration.
+
+        ``no-cache`` still permits storage followed by revalidation; force ``no-store`` at the
+        public edge for every HTTP outcome so a route cannot accidentally omit the privacy policy.
+        """
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     # --- liveness probe (gate:health): the edge is up. No auth (mirrors a real LB health
     # check), no downstream call. 200 + {status:"ok", service:"gateway"} = process is up.
@@ -121,7 +186,12 @@ def create_app(
     # (agent chat SSE). Returns (downstream_headers, None) on success, or (None, error_Response) when
     # the caller is rejected (fail-closed). This is the ONE place the key → user resolution and the
     # anti-spoof identity injection live, so REST and SSE scope a request identically.
-    async def _authorize(method: str, request: Request):
+    async def _authorize(
+        method: str,
+        request: Request,
+        *,
+        agent_target: bool = False,
+    ):
         client_key = request.headers.get("x-api-key")
         # Fail-closed: a client route with no key is rejected before any downstream call.
         if not client_key:
@@ -154,12 +224,9 @@ def create_app(
                 headers={"Retry-After": "1"},
             )
 
-        # Scope enforcement (main.py:341-351).
-        # Stage 3 SCAFFOLD (not delivered): the agent domain (/api/*) carries NO scope today, so a valid
-        # key reaches any agent route. When Stage 3 lands, add agent-route scopes here (or a canAccess
-        # default-deny resolved per (user_id, resource owner)) so a key can read ONLY its owner's
-        # workspace/sessions/routines — see core/agent canAccess + the capability-token seam.
-        required = _required_scopes(request.url.path)
+        # Scope enforcement (main.py:341-351). Every route targeting agent-api requires the explicit
+        # agent capability, including the two SSE routes that bypass the buffered proxy helper.
+        required = {"agent"} if agent_target else _required_scopes(request.url.path)
         if required is not None:
             user_scopes = set(user_data.get("scopes", []))
             if not user_scopes & required:
@@ -186,45 +253,115 @@ def create_app(
             fields={"method": method, "path": request.url.path},
         )
 
-        # Inject identity headers + forward the SAME trace_id downstream (main.py:322-326, 365).
-        # Strip any client-supplied identity headers first (anti-spoofing, main.py:294-296).
-        excluded = {"host", "content-length", "transfer-encoding"}
-        headers = {k.lower(): v for k, v in request.headers.items() if k.lower() not in excluded}
-        for h in ("x-user-id", "x-user-email", "x-user-scopes", "x-user-limits", "x-user-workspaces",
-                  "x-user-webhook-url", "x-user-webhook-secret", "x-user-webhook-events"):
-            headers.pop(h, None)
-        headers["x-api-key"] = client_key
-        headers["x-user-id"] = str(user_id)
-        # The RESOLVED verified email (never client-declared; /internal/validate returns it). agent-api's
-        # membership redeem (Lane M) checks it for RESTRICTED invites (allowed_emails).
-        if user_data.get("email"):
-            headers["x-user-email"] = str(user_data["email"])
-        headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
-        headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
-        # Lane A: the RESOLVED shared-workspace membership ids (never client-declared; /internal/validate
-        # returns them). meeting-api authorizes a member's live-transcript subscribe against this set.
-        if user_data.get("workspaces"):
-            headers["x-user-workspaces"] = ",".join(str(w) for w in user_data["workspaces"])
-        # Per-user webhook config (identity owns it; /internal/validate returns it from user.data).
-        # Forwarded so bot_spawn persists it into meeting.data → the lifecycle callback delivers from
-        # there, with NO cross-domain users-table read (the carve's principled path; main read the user
-        # row inline as a monolith).
-        if user_data.get("webhook_url"):
-            headers["x-user-webhook-url"] = str(user_data["webhook_url"])
-            if user_data.get("webhook_secret"):
-                headers["x-user-webhook-secret"] = str(user_data["webhook_secret"])
-            if user_data.get("webhook_events"):
-                headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
+        if agent_target:
+            if gateway_identity_signer is None:
+                return None, Response(
+                    content=json.dumps({"detail": "Agent identity boundary is unavailable"}),
+                    status_code=503,
+                    media_type="application/json",
+                )
+            # Agent receives only headers it actually consumes. The caller API key, meeting
+            # membership/webhook metadata, and arbitrary client headers stop at Gateway.
+            headers: dict[str, str] = {}
+            for name in ("accept", "content-type", "last-event-id"):
+                values = request.headers.getlist(name)
+                if len(values) > 1:
+                    return None, Response(
+                        content=json.dumps({"detail": "Ambiguous Agent request header"}),
+                        status_code=400,
+                        media_type="application/json",
+                    )
+                if values:
+                    headers[name] = values[0]
+            headers["x-user-id"] = str(user_id)
+            if user_data.get("email"):
+                headers["x-user-email"] = str(user_data["email"])
+        else:
+            # Non-Agent spokes retain the established forwarding contract.
+            excluded = {"host", "content-length", "transfer-encoding"}
+            headers = {k.lower(): v for k, v in request.headers.items() if k.lower() not in excluded}
+            for h in (
+                "x-user-id", "x-user-email", "x-user-scopes", "x-user-limits",
+                "x-user-workspaces", "x-gateway-verified", "x-gateway-key-id",
+                "x-gateway-timestamp", "x-gateway-nonce", "x-gateway-content-sha256",
+                "x-gateway-signature", "x-user-webhook-url", "x-user-webhook-secret",
+                "x-user-webhook-events",
+            ):
+                headers.pop(h, None)
+            headers["x-api-key"] = client_key
+            headers["x-user-id"] = str(user_id)
+            if user_data.get("email"):
+                headers["x-user-email"] = str(user_data["email"])
+            headers["x-user-scopes"] = ",".join(user_data.get("scopes", []))
+            headers["x-user-limits"] = str(user_data.get("max_concurrent", 3))
+            if user_data.get("workspaces"):
+                headers["x-user-workspaces"] = ",".join(str(w) for w in user_data["workspaces"])
+            if user_data.get("webhook_url"):
+                headers["x-user-webhook-url"] = str(user_data["webhook_url"])
+                if user_data.get("webhook_secret"):
+                    headers["x-user-webhook-secret"] = str(user_data["webhook_secret"])
+                if user_data.get("webhook_events"):
+                    headers["x-user-webhook-events"] = json.dumps(user_data["webhook_events"])
         headers[TRACE_HEADER] = get_trace_id() or ""
         return headers, None
 
+    def _bind_agent_identity(
+        headers: dict[str, str], *, method: str, path: str, query: str, body: bytes,
+    ):
+        """Mint at the downstream boundary, after any potentially slow request-body read."""
+        assert gateway_identity_signer is not None
+        try:
+            headers.update(gateway_identity_signer.headers(
+                method=method,
+                path=path,
+                user_id=headers["x-user-id"],
+                query=query,
+                body=body,
+                identity_headers=headers,
+            ))
+        except (KeyError, ValueError):
+            return Response(
+                content=json.dumps({"detail": "Agent identity boundary is unavailable"}),
+                status_code=503,
+                media_type="application/json",
+            )
+        return None
+
     # --- the REST proxy: faithful carve of main.forward_request for client (non-admin) routes.
-    async def _forward(method: str, url: str, request: Request) -> Response:
-        headers, error = await _authorize(method, request)
+    async def _forward(
+        method: str, url: str, request: Request, *, agent_target: bool = False
+    ) -> Response:
+        headers, error = await _authorize(
+            method,
+            request,
+            agent_target=agent_target,
+        )
         if error is not None:
             return error
 
-        content = await request.body()
+        try:
+            agent_query = canonical_query(request.url.query) if agent_target else ""
+        except ValueError:
+            return Response(
+                content=json.dumps({"detail": "Invalid Agent query"}),
+                status_code=400,
+                media_type="application/json",
+            )
+
+        try:
+            content = await _read_request_body_bounded(request, MAX_PROXY_BODY_BYTES)
+        except _RequestBodyTooLarge:
+            return _request_too_large_response()
+        if agent_target:
+            error = _bind_agent_identity(
+                headers,
+                method=method,
+                path=urllib.parse.urlsplit(url).path,
+                query=agent_query,
+                body=content,
+            )
+            if error is not None:
+                return error
         # A public gateway must not LEAK its own 500 for an UPSTREAM fault: map a slow upstream → 504 and
         # an unreachable/transport-failed upstream → 502, so a client can tell "backend down" from
         # "gateway broke" (and get a retryable signal). Timeout is a subclass of RequestError → catch it first.
@@ -233,8 +370,14 @@ def create_app(
                 method,
                 url,
                 headers=headers,
-                params=dict(request.query_params) or None,
+                params=(agent_query or None) if agent_target else (dict(request.query_params) or None),
                 content=content,
+            )
+        except DownstreamBodyTooLarge:
+            return Response(
+                content=json.dumps({"detail": "upstream response too large"}),
+                status_code=502,
+                media_type="application/json",
             )
         except httpx.TimeoutException:
             return Response(content=json.dumps({"detail": "upstream timeout"}),
@@ -242,6 +385,13 @@ def create_app(
         except httpx.RequestError as e:
             return Response(content=json.dumps({"detail": f"upstream unreachable: {type(e).__name__}"}),
                             status_code=502, media_type="application/json")
+
+        if len(resp.content) > MAX_PROXY_BODY_BYTES:
+            return Response(
+                content=json.dumps({"detail": "upstream response too large"}),
+                status_code=502,
+                media_type="application/json",
+            )
 
         # SYSTEM/debug event: the proxy hop completed.
         log_event(
@@ -255,14 +405,85 @@ def create_app(
         # Return downstream body + status VERBATIM (drop hop-by-hop headers; main.py:367).
         resp_headers = resp.headers
         media_type = "application/json"
+        response_headers = {}
         try:
             media_type = resp_headers.get("content-type", "application/json")
+            if agent_target and resp_headers.get("retry-after"):
+                response_headers["Retry-After"] = resp_headers["retry-after"]
         except Exception:
             pass
-        return Response(content=resp.content, status_code=resp.status_code, media_type=media_type)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=media_type,
+            headers=response_headers,
+        )
 
     def _meeting(path: str) -> str:
         return f"{meeting_api_url}{path}"
+
+    async def _forward_media(method: str, url: str, request: Request) -> Response:
+        """Authenticated byte relay for recording media, including HTTP Range metadata."""
+        headers, error = await _authorize(method, request)
+        if error is not None:
+            return error
+        # Range offsets describe the representation's exact bytes. Ask for identity encoding and
+        # still relay httpx's raw iterator so transparent decompression can never invalidate the
+        # upstream Content-Length/Content-Range metadata.
+        headers["accept-encoding"] = "identity"
+        try:
+            content = await _read_request_body_bounded(request, MAX_PROXY_BODY_BYTES)
+        except _RequestBodyTooLarge:
+            return _request_too_large_response()
+
+        try:
+            resp = await downstream.open_stream(
+                method,
+                url,
+                headers=headers,
+                params=dict(request.query_params) or None,
+                content=content,
+            )
+        except httpx.TimeoutException:
+            return Response(
+                content=json.dumps({"detail": "upstream timeout"}),
+                status_code=504,
+                media_type="application/json",
+            )
+        except httpx.RequestError as exc:
+            return Response(
+                content=json.dumps({"detail": f"upstream unreachable: {type(exc).__name__}"}),
+                status_code=502,
+                media_type="application/json",
+            )
+
+        allowed = {
+            "accept-ranges",
+            "content-encoding",
+            "content-disposition",
+            "content-length",
+            "content-range",
+            "content-type",
+            "etag",
+            "last-modified",
+        }
+        response_headers = {
+            name: value for name, value in resp.headers.items() if name.lower() in allowed
+        }
+        response_headers["Cache-Control"] = "no-store"
+
+        async def body():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+
+        return StreamingResponse(
+            body(),
+            status_code=resp.status_code,
+            headers=response_headers,
+        )
 
     # ---- CORE routes (each forwards to the matching downstream path, per main's route table) ----
     @app.get("/bots")
@@ -323,7 +544,7 @@ def create_app(
     # The master byte stream the recording player loads (the master metadata's raw_url points here).
     @app.get("/recordings/{recording_id}/media/{media_file_id}/raw")
     async def get_recording_media_raw(recording_id: int, media_file_id: int, request: Request):
-        return await _forward(
+        return await _forward_media(
             "GET", _meeting(f"/recordings/{recording_id}/media/{media_file_id}/raw"), request
         )
 
@@ -366,6 +587,31 @@ def create_app(
     async def set_meeting_intent(platform: str, native_meeting_id: str, request: Request):
         return await _forward(
             "PUT", _meeting(f"/meetings/{platform}/{native_meeting_id}/intent"), request
+        )
+
+    # ---- managed Minutes capture lifecycle (meeting-api owns runtime state). ----
+    @app.post("/minutes/captures")
+    async def create_minutes_capture(request: Request):
+        return await _forward("POST", _meeting("/minutes/captures"), request)
+
+    @app.delete("/minutes/captures/{platform}/{native_meeting_id}")
+    async def withdraw_minutes_capture(
+        platform: str, native_meeting_id: str, request: Request
+    ):
+        return await _forward(
+            "DELETE",
+            _meeting(f"/minutes/captures/{platform}/{native_meeting_id}"),
+            request,
+        )
+
+    @app.delete("/minutes/meetings/{row_id}")
+    async def erase_minutes_meeting(row_id: int, request: Request):
+        return await _forward("DELETE", _meeting(f"/minutes/meetings/{row_id}"), request)
+
+    @app.get("/minutes/meetings/{row_id}/status")
+    async def get_minutes_meeting_status(row_id: int, request: Request):
+        return await _forward(
+            "GET", _meeting(f"/minutes/meetings/{row_id}/status"), request
         )
 
     # ---- user self-serve webhook config (main.py:1080 set_user_webhook_proxy) ----
@@ -425,6 +671,15 @@ def create_app(
     async def get_user_transcription(request: Request):
         return await _forward("GET", _admin("/user/transcription"), request)
 
+    # ---- user self-serve Minutes consent + retention settings (identity owns them). ----
+    @app.get("/user/minutes")
+    async def get_user_minutes(request: Request):
+        return await _forward("GET", _admin("/user/minutes"), request)
+
+    @app.put("/user/minutes")
+    async def set_user_minutes(request: Request):
+        return await _forward("PUT", _admin("/user/minutes"), request)
+
     # ---- the AGENT domain (P20·Stage 2): the gateway fronts agent-api under the canonical /agent/*
     # prefix so the SAME edge resolves key → user and injects X-User-Id; agent-api derives `subject`
     # from it (never the client). The terminal therefore talks ONLY to the gateway (one authenticated
@@ -435,20 +690,106 @@ def create_app(
     # The agent SSE routes (chat turn · live meeting feed) must be STREAMED, not buffered like the JSON
     # routes — so they get their own forward, declared BEFORE the catch-all so they win. Identity is
     # injected by the SAME _authorize the buffered proxy uses (so the streamed turn is scoped identically).
-    SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    SSE_HEADERS = {"Content-Type": "text/event-stream", "Cache-Control": "no-store", "X-Accel-Buffering": "no"}
 
     async def _forward_stream(method: str, url: str, request: Request) -> Response:
-        headers, error = await _authorize(method, request)
+        headers, error = await _authorize(
+            method,
+            request,
+            agent_target=True,
+        )
         if error is not None:
             return error
-        content = await request.body()
-        params = dict(request.query_params) or None
+        try:
+            agent_query = canonical_query(request.url.query)
+        except ValueError:
+            return Response(
+                content=json.dumps({"detail": "Invalid Agent query"}),
+                status_code=400,
+                media_type="application/json",
+            )
+        try:
+            content = await _read_request_body_bounded(request, MAX_PROXY_BODY_BYTES)
+        except _RequestBodyTooLarge:
+            return _request_too_large_response()
+        error = _bind_agent_identity(
+            headers,
+            method=method,
+            path=urllib.parse.urlsplit(url).path,
+            query=agent_query,
+            body=content,
+        )
+        if error is not None:
+            return error
+        params = agent_query or None
+        try:
+            resp = await downstream.open_stream(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                content=content,
+            )
+        except httpx.TimeoutException:
+            return Response(
+                content=json.dumps({"detail": "upstream timeout"}),
+                status_code=504,
+                media_type="application/json",
+            )
+        except httpx.RequestError as exc:
+            return Response(
+                content=json.dumps({"detail": f"upstream unreachable: {type(exc).__name__}"}),
+                status_code=502,
+                media_type="application/json",
+            )
+
+        if not 200 <= resp.status_code < 300:
+            chunks: list[bytes] = []
+            received = 0
+            oversized = False
+            failed = False
+            try:
+                async for chunk in resp.aiter_raw():
+                    received += len(chunk)
+                    if received > MAX_STREAM_ERROR_BYTES:
+                        oversized = True
+                        break
+                    chunks.append(chunk)
+            except Exception:
+                failed = True
+            finally:
+                await resp.aclose()
+            if oversized or failed:
+                return Response(
+                    content=json.dumps({"detail": "upstream error response is invalid"}),
+                    status_code=502,
+                    media_type="application/json",
+                )
+            response_headers = {"Cache-Control": "no-store"}
+            retry_after = resp.headers.get("retry-after")
+            if retry_after:
+                response_headers["Retry-After"] = retry_after
+            media_type = resp.headers.get("content-type", "application/json")
+            return Response(
+                content=b"".join(chunks),
+                status_code=resp.status_code,
+                headers=response_headers,
+                media_type=media_type,
+            )
 
         async def body():
-            async for chunk in downstream.stream(method, url, headers=headers, params=params, content=content):
-                yield chunk
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
 
-        return StreamingResponse(body(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return StreamingResponse(
+            body(),
+            status_code=resp.status_code,
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
 
     # The agent domain lives under the canonical /agent/* prefix (peer to the meetings domain). The SSE
     # routes (chat turn · live meeting feed) are STREAMED and declared BEFORE the catch-all so they win;
@@ -465,7 +806,7 @@ def create_app(
 
     @app.api_route("/agent/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def agent_proxy(path: str, request: Request):
-        return await _forward(request.method, _agent(path), request)
+        return await _forward(request.method, _agent(path), request, agent_target=True)
 
     # ---- the /ws multiplex (carve of main.websocket_multiplex, main.py:2165-2340) ----
     @app.websocket("/ws")

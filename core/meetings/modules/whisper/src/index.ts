@@ -7,7 +7,15 @@
  * buffer, which calls THIS via the injected `transcribe(pcm, prompt)` fn — so
  * whisper has no knowledge of topology, naming, or confirmation.
  */
-export { TranscriptionClient, TranscriptionError } from './transcription-client.js';
+export {
+  TranscriptionClient,
+  TranscriptionError,
+  MAX_TRANSCRIPTION_AUDIO_SECONDS,
+  MAX_TRANSCRIPTION_PROMPT_CHARS,
+  MAX_TRANSCRIPTION_RESPONSE_BYTES,
+  canonicalTranscriptionEndpoint,
+  validTranscriptionResponse,
+} from './transcription-client.js';
 export type {
   TranscriptionWord,
   TranscriptionSegment,

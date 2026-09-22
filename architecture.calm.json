@@ -93,6 +93,43 @@
       ]
     },
     {
+      "unique-id": "hub-api",
+      "node-type": "service",
+      "name": "Minutes Hub BFF",
+      "description": "external launch-gated authenticated BFF for managed Minutes user actions and content-free finalized events; injects tenant identity only after verifying the browser session",
+      "interfaces": [
+        {
+          "unique-id": "hub-api-rest",
+          "type": "api"
+        }
+      ],
+      "metadata": [
+        {
+          "stage": "launch-gated",
+          "external": true
+        }
+      ]
+    },
+    {
+      "unique-id": "nullalis-agent",
+      "node-type": "service",
+      "name": "Canonical Nullalis Agent",
+      "description": "external launch-gated consumer of zaki-read.v1; owns every governed Brain write and purges Minutes-derived Agent records before Minutes deletes source content",
+      "interfaces": [
+        {
+          "unique-id": "nullalis-agent-rest",
+          "type": "api"
+        }
+      ],
+      "metadata": [
+        {
+          "stage": "launch-gated",
+          "external": true,
+          "repository": "nullalis"
+        }
+      ]
+    },
+    {
       "unique-id": "conformance",
       "node-type": "service",
       "name": "conformance",
@@ -541,6 +578,30 @@
       ]
     },
     {
+      "unique-id": "identity.v2",
+      "node-type": "contract",
+      "name": "identity.v2",
+      "description": "identity.v2 — capability-negotiated Agent audience and scope contract",
+      "metadata": [
+        {
+          "path": "core/identity/contracts/identity.v2",
+          "domain": "identity"
+        }
+      ]
+    },
+    {
+      "unique-id": "agent-control.v1",
+      "node-type": "contract",
+      "name": "agent-control.v1",
+      "description": "agent-control.v1 — candidate Meetings-owned exact-row owner/doc control contract",
+      "metadata": [
+        {
+          "path": "core/meetings/contracts/agent-control.v1",
+          "domain": "meetings"
+        }
+      ]
+    },
+    {
       "unique-id": "acts.v1",
       "node-type": "contract",
       "name": "acts.v1",
@@ -577,6 +638,18 @@
       ]
     },
     {
+      "unique-id": "erasure.v1",
+      "node-type": "contract",
+      "name": "erasure.v1",
+      "description": "erasure.v1 — candidate cross-spoke content-free signed deletion receipt",
+      "metadata": [
+        {
+          "path": "core/meetings/contracts/erasure.v1",
+          "domain": "meetings"
+        }
+      ]
+    },
+    {
       "unique-id": "invocation.v1",
       "node-type": "contract",
       "name": "invocation.v1",
@@ -589,6 +662,18 @@
       ]
     },
     {
+      "unique-id": "invocation.v2",
+      "node-type": "contract",
+      "name": "invocation.v2",
+      "description": "invocation.v2 — negotiated managed-capture invocation with retention deadline",
+      "metadata": [
+        {
+          "path": "core/meetings/contracts/invocation.v2",
+          "domain": "meetings"
+        }
+      ]
+    },
+    {
       "unique-id": "lifecycle.v1",
       "node-type": "contract",
       "name": "lifecycle.v1",
@@ -596,6 +681,30 @@
       "metadata": [
         {
           "path": "core/meetings/contracts/lifecycle.v1",
+          "domain": "meetings"
+        }
+      ]
+    },
+    {
+      "unique-id": "minutes-api.v1",
+      "node-type": "contract",
+      "name": "minutes-api.v1",
+      "description": "minutes-api.v1 — candidate exact managed Minutes public API shapes",
+      "metadata": [
+        {
+          "path": "core/meetings/contracts/minutes-api.v1",
+          "domain": "meetings"
+        }
+      ]
+    },
+    {
+      "unique-id": "minutes-finalized.v1",
+      "node-type": "contract",
+      "name": "minutes-finalized.v1",
+      "description": "minutes-finalized.v1 — exact content-free operator Hub notification",
+      "metadata": [
+        {
+          "path": "core/meetings/contracts/minutes-finalized.v1",
           "domain": "meetings"
         }
       ]
@@ -628,7 +737,7 @@
       "unique-id": "zaki-read.v1",
       "node-type": "contract",
       "name": "zaki-read.v1",
-      "description": "zaki-read.v1 — unsealed bounded read-only Minutes profile",
+      "description": "zaki-read.v1 — sealed bounded read-only Minutes profile",
       "metadata": [
         {
           "path": "core/meetings/contracts/zaki-read.v1",
@@ -1227,6 +1336,7 @@
           "nodes": [
             "admin-api",
             "identity.v1",
+            "identity.v2",
             "identity-db"
           ]
         }
@@ -1256,11 +1366,16 @@
             "teams-capture",
             "whisper",
             "zoom-capture",
+            "agent-control.v1",
             "acts.v1",
             "captured-signal.v1",
+            "erasure.v1",
             "flagged-issue.v1",
             "invocation.v1",
+            "invocation.v2",
             "lifecycle.v1",
+            "minutes-api.v1",
+            "minutes-finalized.v1",
             "transcript.v1",
             "webhook.v1",
             "zaki-read.v1",
@@ -1754,6 +1869,89 @@
       "protocol": "HTTPS"
     },
     {
+      "unique-id": "ma-hub-finalized",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "meeting-api"
+          },
+          "destination": {
+            "node": "hub-api",
+            "interface": "hub-api-rest"
+          }
+        }
+      },
+      "description": "default-off content-free transcript.finalized platform event after durable finalization",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "minutes-finalized.v1",
+          "access": "write"
+        }
+      ],
+      "controls": {
+        "data-egress": {
+          "description": "Only the content-free transcript.finalized envelope may leave Minutes for the external ZAKI Hub BFF; raw audio, transcript text, summaries, attendees, and storage identifiers are forbidden.",
+          "requirements": [
+            {
+              "requirement-url": "https://vexa.ai/calm/controls/no-egress.requirement.json",
+              "config": {
+                "dataClass": "content-free meeting metadata",
+                "destination": "ZAKI Hub BFF",
+                "egressApproved": true
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "unique-id": "hub-ma-managed",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "hub-api",
+            "interface": "hub-api-rest"
+          },
+          "destination": {
+            "node": "meeting-api",
+            "interface": "meeting-api-rest"
+          }
+        }
+      },
+      "description": "authenticated capture, status, consent withdrawal, and meeting erasure; dedicated Hub credential is verified before trusted user identity or request parsing",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "minutes-api.v1",
+          "access": "write",
+          "authentication": "X-Zaki-Minutes-Token"
+        }
+      ]
+    },
+    {
+      "unique-id": "ma-nullalis-erasure",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "meeting-api"
+          },
+          "destination": {
+            "node": "nullalis-agent",
+            "interface": "nullalis-agent-rest"
+          }
+        }
+      },
+      "description": "idempotently tombstone and purge Agent-owned workspace and Brain derivatives before deleting Minutes-owned transcript, summary, recording, and meeting carriers",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "erasure.v1",
+          "access": "write"
+        }
+      ]
+    },
+    {
       "unique-id": "aa-watch",
       "relationship-type": {
         "connects": {
@@ -1769,6 +1967,27 @@
       "metadata": [
         {
           "access": "read"
+        }
+      ]
+    },
+    {
+      "unique-id": "aa-ma-control",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agent-api"
+          },
+          "destination": {
+            "node": "meeting-api",
+            "interface": "meeting-api-rest"
+          }
+        }
+      },
+      "description": "exact-row owner resolution + canonical generated-doc attachment",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "agent-control.v1"
         }
       ]
     },
@@ -1803,6 +2022,51 @@
       "description": "SSE relay (/api/chat, /api/meeting/stream)",
       "metadata": [
         {
+          "access": "read"
+        }
+      ]
+    },
+    {
+      "unique-id": "aa-ma-read-reference",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "agent-api"
+          },
+          "destination": {
+            "node": "meeting-api",
+            "interface": "meeting-api-rest"
+          }
+        }
+      },
+      "description": "default-off in-repo reference consumer; managed launch excludes the bundled Agent service and uses canonical Nullalis",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "zaki-read.v1",
+          "access": "read"
+        }
+      ]
+    },
+    {
+      "unique-id": "nullalis-ma-read",
+      "relationship-type": {
+        "connects": {
+          "source": {
+            "node": "nullalis-agent",
+            "interface": "nullalis-agent-rest"
+          },
+          "destination": {
+            "node": "meeting-api",
+            "interface": "meeting-api-rest"
+          }
+        }
+      },
+      "description": "minutes_read consumes bounded owner-scoped meeting, transcript, and summary items; Nullalis alone writes governed meeting distillates to Brain",
+      "protocol": "HTTPS",
+      "metadata": [
+        {
+          "contract": "zaki-read.v1",
           "access": "read"
         }
       ]

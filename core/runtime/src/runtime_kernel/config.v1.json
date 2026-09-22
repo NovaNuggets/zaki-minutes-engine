@@ -43,6 +43,38 @@
    "description": "backing for the durable schedule.v1 cron store; unset ⇒ no scheduler is constructed"
   },
   {
+   "key": "RUNTIME_CALLBACK_SECRET",
+   "class": "required-explicit",
+   "secret": true,
+   "description": "dedicated service credential injected as X-Runtime-Callback-Secret only for the exact meeting-api callback origin; never persisted or projected into workloads",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
+  },
+  {
+   "key": "RUNTIME_CONTROL_SECRET",
+   "class": "required-explicit",
+   "secret": true,
+   "description": "dedicated caller credential required on every privileged /workloads and /schedule operation; never projected into spawned workloads",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
+  },
+  {
+   "key": "RUNTIME_CALLBACK_TRUSTED_ORIGINS",
+   "class": "required-explicit",
+   "description": "the single exact meeting-api origin eligible to receive the dedicated runtime callback credential",
+   "targets": [
+    "compose",
+    "helm",
+    "lite"
+   ]
+  },
+  {
    "key": "SCHED_TICK_SEC",
    "class": "defaulted",
    "default": "5",
@@ -53,7 +85,160 @@
    "key": "POD_NAMESPACE",
    "class": "defaulted",
    "default": "(unset — kubectl's current namespace)",
-   "description": "k8s backend namespace, injected via the downward API",
+   "description": "k8s workload namespace; hardened Helm profiles inject a distinct pre-created secret-free namespace",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_NODE_SELECTOR_JSON",
+   "class": "defaulted",
+   "default": "{}",
+   "description": "operator-owned JSON object copied from Helm global.nodeSelector onto every spawned Pod; empty leaves placement unconstrained",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_TOLERATIONS_JSON",
+   "class": "defaulted",
+   "default": "[]",
+   "description": "operator-owned JSON array copied from Helm global.tolerations onto every spawned Pod; empty adds no tolerations",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_AFFINITY_JSON",
+   "class": "defaulted",
+   "default": "{}",
+   "description": "operator-owned JSON object copied from Helm global.affinity onto every spawned Pod; empty adds no affinity policy",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_IMAGE_PULL_SECRETS_JSON",
+   "class": "defaulted",
+   "default": "[]",
+   "description": "operator-owned JSON array copied from Helm global.imagePullSecrets onto every spawned Pod; empty uses no registry secret",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_IMAGE_PULL_POLICY",
+   "class": "defaulted",
+   "default": "Always (Helm global.imagePullPolicy; unset outside Helm delegates to Kubernetes)",
+   "description": "operator-owned image pull policy applied to every spawned workload container; accepted values are Always, IfNotPresent, or Never",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_RUN_AS_USER",
+   "class": "defaulted",
+   "default": "10003 (legacy bot fallback; Helm runtime.spawnedPods.botIdentity.runAsUser)",
+   "description": "legacy positive non-root bot UID retained for non-Helm compatibility; profile-specific identity keys take precedence",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_BOT_RUN_AS_USER",
+   "class": "defaulted",
+   "default": "10003",
+   "description": "operator-owned positive UID for meeting-bot and meeting-bot-v2 Pods",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_BOT_RUN_AS_GROUP",
+   "class": "defaulted",
+   "default": "10003",
+   "description": "operator-owned positive primary GID for meeting-bot and meeting-bot-v2 Pods",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_BOT_FS_GROUP",
+   "class": "defaulted",
+   "default": "10003",
+   "description": "operator-owned positive filesystem GID for meeting-bot and meeting-bot-v2 writable volumes",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_AGENT_RUN_AS_USER",
+   "class": "defaulted",
+   "default": "10007",
+   "description": "operator-owned positive UID dedicated to spawned Agent workers",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_AGENT_RUN_AS_GROUP",
+   "class": "defaulted",
+   "default": "10007",
+   "description": "operator-owned positive primary GID dedicated to spawned Agent workers",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_AGENT_FS_GROUP",
+   "class": "defaulted",
+   "default": "10007",
+   "description": "operator-owned positive filesystem GID for spawned Agent worker workspace and scratch volumes",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_DEFAULT_CPU",
+   "class": "defaulted",
+   "default": "1",
+   "description": "positive CPU request used when a workload omits resources.cpu; sourced from Helm runtime.spawnedPods.defaultCpu",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_DEFAULT_MEMORY_MB",
+   "class": "defaulted",
+   "default": "1024",
+   "description": "positive memory request in MiB used when a workload omits resources.memoryMb; sourced from Helm runtime.spawnedPods.defaultMemoryMb",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_MAX_CPU",
+   "class": "defaulted",
+   "default": "4",
+   "description": "positive operator CPU ceiling and container CPU limit for every spawned workload; sourced from Helm runtime.spawnedPods.maxCpu",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_MAX_MEMORY_MB",
+   "class": "defaulted",
+   "default": "4096",
+   "description": "positive operator memory ceiling and container memory limit in MiB for every spawned workload; sourced from Helm runtime.spawnedPods.maxMemoryMb",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
+   "key": "RUNTIME_K8S_MAX_GPU",
+   "class": "defaulted",
+   "default": "0",
+   "description": "non-negative operator GPU ceiling for spawned workloads; zero disables GPU requests and is sourced from Helm runtime.spawnedPods.maxGpu",
    "targets": [
     "helm"
    ]
@@ -90,10 +275,29 @@
    "targets": []
   },
   {
+   "key": "RUNTIME_AGENT_PROFILE_ENABLED",
+   "class": "defaulted",
+   "default": "true",
+   "description": "whether runtime exposes the bundled Vexa Agent profile; managed Minutes sets false so external Nullalis receives only bounded HTTP read authority",
+   "targets": [
+    "helm"
+   ]
+  },
+  {
    "key": "BROWSER_IMAGE",
    "class": "capability",
    "capability": "bot_spawn",
    "description": "the meeting-bot image the `meeting-bot` profile spawns (vexaai/vexa-bot:v012)"
+  },
+  {
+   "key": "MINUTES_BROWSER_IMAGE",
+   "class": "capability",
+   "capability": "minutes_bot_v2",
+   "description": "explicit v2-capable image for the isolated `meeting-bot-v2` profile; unset means managed invocation.v2 cannot spawn",
+   "targets": [
+    "compose",
+    "helm"
+   ]
   },
   {
    "key": "AGENT_IMAGE",
@@ -119,6 +323,13 @@
    "targets": [
     "lite"
    ]
+  },
+  {
+   "key": "MINUTES_BOT_COMMAND",
+   "class": "defaulted",
+   "default": "(unset — the v2 image entrypoint runs)",
+   "description": "process-backend override for the independently enabled meeting-bot-v2 profile",
+   "targets": []
   },
   {
    "key": "AGENT_WORKER_COMMAND",
@@ -259,6 +470,11 @@
   }
  ],
  "capabilities": {
+  "minutes_bot_v2": {
+   "description": "the separately selected invocation.v2 managed Minutes bot profile can spawn",
+   "mode": "all",
+   "when_unconfigured": "runtime rejects profile=meeting-bot-v2; ordinary profile=meeting-bot remains invocation.v1"
+  },
   "scheduler": {
    "description": "the durable schedule.v1 cron (routine jobs, join-retry re-arms) is live",
    "mode": "all",
@@ -292,8 +508,180 @@
  },
  "surface_only": [
   {
+   "key": "ZAKI_MINUTES_CAPTURE_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone owns Minutes capture"
+  },
+  {
+   "key": "ZAKI_MINUTES_INVOCATION_V2_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone owns Minutes invocation"
+  },
+  {
+   "key": "ZAKI_MINUTES_READ_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; the external Agent consumer owns Minutes reads"
+  },
+  {
+   "key": "ZAKI_MINUTES_AUTO_JOIN_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone owns managed auto-join"
+  },
+  {
+   "key": "ZAKI_MINUTES_MANAGED_ONLY",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone enforces managed capture"
+  },
+  {
+   "key": "ZAKI_MINUTES_READ_BASE_URL",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; the external Agent consumer alone owns the read origin"
+  },
+  {
+   "key": "ZAKI_MINUTES_HUB_TOKEN",
+   "reason": "explicitly cleared on runtime; only meeting-api accepts the dedicated external Hub credential"
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone owns finalization delivery"
+  },
+  {
+   "key": "MINUTES_TTL_ENABLED",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone runs retention cleanup"
+  },
+  {
+   "key": "MINUTES_TTL_INTERVAL_S",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone runs retention cleanup"
+  },
+  {
+   "key": "MINUTES_TTL_BATCH_SIZE",
+   "reason": "explicitly cleared on runtime to prevent shared Compose env_file inheritance; meeting-api alone runs retention cleanup"
+  },
+  {
+   "key": "ADMIN_TOKEN",
+   "reason": "explicitly cleared on runtime to prevent unrelated shared Compose credentials from reaching this service"
+  },
+  {
+   "key": "MEETING_TOKEN_SECRET",
+   "reason": "explicitly cleared on runtime to prevent unrelated shared Compose credentials from reaching this service"
+  },
+  {
+   "key": "REDIS_PASSWORD",
+   "reason": "explicitly cleared on runtime because its scoped Redis URL is the sole supported Redis credential surface"
+  },
+  {
+   "key": "VEXA_DISPATCH_SIGNING_KEY",
+   "reason": "explicitly cleared on runtime to prevent unrelated shared Compose credentials from reaching this service"
+  },
+  {
+   "key": "NEXTAUTH_SECRET",
+   "reason": "explicitly cleared on runtime to prevent Terminal credentials from reaching this service"
+  },
+  {
+   "key": "DB_PASSWORD",
+   "reason": "explicitly cleared on runtime to prevent database credentials from reaching this service"
+  },
+  {
+   "key": "MINIO_ROOT_USER",
+   "reason": "explicitly cleared on runtime to prevent object-store credentials from reaching this service"
+  },
+  {
+   "key": "MINIO_ROOT_PASSWORD",
+   "reason": "explicitly cleared on runtime to prevent object-store credentials from reaching this service"
+  },
+  {
+   "key": "MINIO_ACCESS_KEY",
+   "reason": "explicitly cleared on runtime to prevent object-store credentials from reaching this service"
+  },
+  {
+   "key": "MINIO_SECRET_KEY",
+   "reason": "explicitly cleared on runtime to prevent object-store credentials from reaching this service"
+  },
+  {
+   "key": "TRANSCRIPTION_SERVICE_TOKEN",
+   "reason": "explicitly cleared on runtime to prevent transcription credentials from reaching this service"
+  },
+  {
+   "key": "GOOGLE_CLIENT_SECRET",
+   "reason": "explicitly cleared on runtime to prevent calendar credentials from reaching this service"
+  },
+  {
+   "key": "MICROSOFT_CLIENT_SECRET",
+   "reason": "explicitly cleared on runtime to prevent calendar credentials from reaching this service"
+  },
+  {
+   "key": "VEXA_BOT_API_KEY",
+   "reason": "explicitly cleared on runtime to prevent bot credentials from reaching this service"
+  },
+  {
+   "key": "VEXA_API_KEY",
+   "reason": "explicitly cleared on runtime to prevent legacy API credentials from reaching this service"
+  },
+  {
+   "key": "CLAUDE_CODE_OAUTH_TOKEN",
+   "reason": "explicitly cleared on runtime; model credentials are brokered only into isolated workers when the Agent profile is enabled"
+  },
+  {
    "key": "INTERNAL_API_SECRET",
-   "reason": "set on the runtime by compose/helm/lite but never read by runtime code (the internal-call secret is a gateway↔admin-api↔meeting-api concern) — documented drift surfaced by gate:config-contract; candidate for a deploy-surface cleanup"
+   "reason": "explicitly cleared on runtime because the shared Compose env_file is used only for provider credentials; runtime does not consume the platform-internal credential"
+  },
+  {
+   "key": "GATEWAY_IDENTITY_SECRET",
+   "reason": "explicitly cleared on runtime because Gateway and agent-api alone own the dedicated injected-identity proof"
+  },
+  {
+   "key": "GATEWAY_IDENTITY_PREVIOUS_SECRET",
+   "reason": "explicitly cleared on runtime because the verifier-only previous Gateway proof key belongs to agent-api alone"
+  },
+  {
+   "key": "ZAKI_READ_TOKEN_MINUTES",
+   "reason": "explicitly cleared on runtime; agent-api and meeting-api alone own the cross-spoke Minutes read credential"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_SIGNING_KEY_ID",
+   "reason": "explicitly cleared on runtime; agent-api alone owns the Agent erasure signer identity"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_SIGNING_SECRET",
+   "reason": "explicitly cleared on runtime; agent-api alone owns the Agent erasure signer secret"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the Agent erasure verifier identity"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_VERIFICATION_SECRET",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the Agent erasure verifier secret"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+   "reason": "explicitly cleared on runtime; only agent-api and meeting-api verify durable Agent receipts across one-key rotation overlap"
+  },
+  {
+   "key": "ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+   "reason": "explicitly cleared on runtime; only agent-api and meeting-api verify durable Agent receipts across one-key rotation overlap"
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the Minutes erasure signer identity"
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_SIGNING_SECRET",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the Minutes erasure signer secret"
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the rotating Minutes verifier identity"
+  },
+  {
+   "key": "ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the rotating Minutes verifier secret"
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_URL",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns platform finalization delivery"
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_KEY_ID",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns the platform finalization signer identity"
+  },
+  {
+   "key": "ZAKI_MINUTES_FINALIZED_SECRET",
+   "reason": "explicitly cleared on runtime; meeting-api alone owns platform finalization signing material"
   }
  ]
 }

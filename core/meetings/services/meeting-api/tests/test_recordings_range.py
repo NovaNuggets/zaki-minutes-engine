@@ -13,6 +13,12 @@ from fastapi.testclient import TestClient
 
 from meeting_api.recordings import build_router
 from meeting_api.recordings.fakes import InMemoryRecordingRepo, InMemoryStorage
+from meeting_api.recordings.router import (
+    DEFAULT_RECORDING_FINALIZE_CONCURRENCY,
+    DEFAULT_RECORDING_MEMORY_BUDGET_BYTES,
+    DEFAULT_RECORDING_RANGE_MAX_BYTES,
+)
+from meeting_api.recordings.service import DEFAULT_RECORDING_MAX_TOTAL_BYTES
 
 USER = 7
 MEETING_ID = 1
@@ -42,6 +48,7 @@ def _client():
                     "type": "audio",
                     "format": "wav",
                     "is_final": True,
+                    "finalized_by": "recording_finalizer.master",
                     "storage_path": STORAGE_PATH,
                 }
             ],
@@ -118,3 +125,80 @@ def test_end_past_eof_is_clamped():
     assert r.status_code == 206, r.text
     assert r.headers["content-range"] == f"bytes 200-{total - 1}/{total}"
     assert r.content == MASTER[200:]
+
+
+def test_over_limit_master_is_rejected_before_fetching_its_body(monkeypatch):
+    body_reads = 0
+    original_get = InMemoryStorage.get
+
+    async def tracking_get(self, key):
+        nonlocal body_reads
+        body_reads += 1
+        return await original_get(self, key)
+
+    monkeypatch.setenv("RECORDING_MAX_TOTAL_BYTES", "128")
+    monkeypatch.setattr(InMemoryStorage, "get", tracking_get)
+    client = _client()
+
+    response = client.get(_URL, headers=_HDRS)
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Recording exceeds configured limits"}
+    assert body_reads == 0
+
+
+def test_default_recording_budget_fits_below_the_one_gibibyte_pod_limit():
+    # Finalization currently holds the source chunks plus the assembled master and may transiently
+    # hand a third representation to the object-store adapter. Keep the configured concurrent
+    # working sets inside the explicit process budget rather than relying on the pod OOM killer.
+    estimated_finalize_bytes = (
+        DEFAULT_RECORDING_MAX_TOTAL_BYTES * 3 * DEFAULT_RECORDING_FINALIZE_CONCURRENCY
+    )
+    assert DEFAULT_RECORDING_MAX_TOTAL_BYTES <= 64 * 1024 * 1024
+    assert DEFAULT_RECORDING_RANGE_MAX_BYTES <= 8 * 1024 * 1024
+    assert estimated_finalize_bytes < DEFAULT_RECORDING_MEMORY_BUDGET_BYTES
+    assert DEFAULT_RECORDING_MEMORY_BUDGET_BYTES < 1024 * 1024 * 1024
+
+
+def test_range_larger_than_the_bounded_window_is_rejected_before_storage_read(monkeypatch):
+    body_reads = 0
+    range_reads = 0
+    original_get = InMemoryStorage.get
+    original_get_range = InMemoryStorage.get_range
+
+    async def tracking_get(self, key):
+        nonlocal body_reads
+        body_reads += 1
+        return await original_get(self, key)
+
+    async def tracking_get_range(self, key, start, end):
+        nonlocal range_reads
+        range_reads += 1
+        return await original_get_range(self, key, start, end)
+
+    monkeypatch.setenv("RECORDING_RANGE_MAX_BYTES", "32")
+    monkeypatch.setattr(InMemoryStorage, "get", tracking_get)
+    monkeypatch.setattr(InMemoryStorage, "get_range", tracking_get_range)
+    client = _client()
+
+    response = client.get(_URL, headers={**_HDRS, "Range": "bytes=0-63"})
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Requested recording range exceeds the window limit"}
+    assert body_reads == 0
+    assert range_reads == 0
+
+
+def test_unsafe_recording_memory_configuration_fails_at_router_build(monkeypatch):
+    monkeypatch.setenv("RECORDING_MAX_TOTAL_BYTES", str(512 * 1024 * 1024))
+    monkeypatch.setenv("RECORDING_FINALIZE_CONCURRENCY", "2")
+    monkeypatch.setenv("RECORDING_MEMORY_BUDGET_BYTES", str(512 * 1024 * 1024))
+
+    repo = InMemoryRecordingRepo()
+    storage = InMemoryStorage()
+    try:
+        build_router(repo, storage)
+    except RuntimeError as error:
+        assert "recording memory budget" in str(error)
+    else:
+        raise AssertionError("unsafe recording memory configuration was accepted")

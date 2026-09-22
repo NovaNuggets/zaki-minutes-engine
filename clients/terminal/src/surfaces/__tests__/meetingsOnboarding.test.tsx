@@ -29,9 +29,9 @@ function stubCalendarApi(opts: { connected: boolean; syncCounts?: { created?: nu
       }
       if (String(url).includes("/api/user/calendar")) {
         if (init?.method === "PUT") {
-          return new Response(JSON.stringify({ ics_url_set: true, ics_url_masked: "calendar.google.com/…d3f1", auto_join: true }), { status: 200 });
+          return new Response(JSON.stringify({ ics_url_set: true, ics_url_masked: "calendar.google.com/…d3f1", auto_join_available: false, auto_join: false }), { status: 200 });
         }
-        return new Response(JSON.stringify({ ics_url_set: opts.connected, ics_url_masked: null, auto_join: true }), { status: 200 });
+        return new Response(JSON.stringify({ ics_url_set: opts.connected, ics_url_masked: null, auto_join_available: false, auto_join: false }), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }),
@@ -55,39 +55,50 @@ describe("connectOutcome", () => {
 });
 
 describe("slim — the standing affordances on a populated Meetings page", () => {
+  it("does not offer managed capture without the Hub credential and names the supported surface", async () => {
+    const calls = stubCalendarApi({ connected: true });
+    render(<MeetingsOnboarding variant="slim" />);
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/user/calendar"))).toBe(true));
+
+    expect(screen.queryByRole("button", { name: /send zaki notetaker/i })).toBeNull();
+    expect(screen.getByText(/capture controls are available in the ZAKI Hub/i)).toBeTruthy();
+    expect(calls.some((call) => call.url === "/api/minutes/captures")).toBe(false);
+  });
   it("calendar card renders while NO calendar is connected", async () => {
     stubCalendarApi({ connected: false });
     render(<MeetingsOnboarding variant="slim" />);
     await waitFor(() => expect(screen.getByText(/No calendar connected/)).toBeTruthy());
   });
 
-  it("calendar card disappears once connected — plan + drop-bot STAY", async () => {
+  it("calendar card disappears once connected — planning and the Hub handoff stay", async () => {
     const calls = stubCalendarApi({ connected: true });
     const { container } = render(<MeetingsOnboarding variant="slim" />);
     await waitFor(() => expect(calls.some((c) => c.url.includes("/api/user/calendar"))).toBe(true));
     expect(container.textContent).not.toContain("No calendar connected");
     expect(screen.getByText("+ Plan a meeting")).toBeTruthy();
-    expect(screen.getByPlaceholderText(/Paste a meeting link/)).toBeTruthy();
+    expect(screen.getByText(/capture controls are available in the ZAKI Hub/i)).toBeTruthy();
   });
 
-  it("plan + drop-bot are there in the disconnected state too", async () => {
+  it("planning and the Hub handoff are there in the disconnected state too", async () => {
     stubCalendarApi({ connected: false });
     render(<MeetingsOnboarding variant="slim" />);
     await waitFor(() => expect(screen.getByText("+ Plan a meeting")).toBeTruthy());
-    expect(screen.getByPlaceholderText(/Paste a meeting link/)).toBeTruthy();
+    expect(screen.getByText(/capture controls are available in the ZAKI Hub/i)).toBeTruthy();
   });
 });
 
-describe("full — the three-path empty state", () => {
-  it("shows all three paths, calendar first, when nothing is connected", async () => {
+describe("full — the reference Terminal empty state", () => {
+  it("shows calendar and planning, with managed capture delegated to Hub", async () => {
     stubCalendarApi({ connected: false });
     render(<MeetingsOnboarding variant="full" />);
     await waitFor(() => expect(screen.getByText("Connect your calendar")).toBeTruthy());
     expect(screen.getByText("Plan a meeting")).toBeTruthy();
-    expect(screen.getByText("Drop a bot in now")).toBeTruthy();
+    expect(screen.queryByText("Send ZAKI Notetaker now")).toBeNull();
+    expect(screen.getByText(/capture controls are available in the ZAKI Hub/i)).toBeTruthy();
+    expect(screen.queryByText(/auto-join/i)).toBeNull();
   });
 
-  it("calendar card retires once connected; plan/drop remain", async () => {
+  it("calendar card retires once connected; planning and Hub handoff remain", async () => {
     const calls = stubCalendarApi({ connected: true });
     render(<MeetingsOnboarding variant="full" />);
     await waitFor(() => expect(calls.some((c) => c.url.includes("/api/user/calendar"))).toBe(true));

@@ -148,6 +148,8 @@ def test_illegal_nonterminal_transition_is_409(frm, to):
     ev = {"connection_id": "sess-uid", "status": to}
     if to in ("completed", "failed"):
         ev["exit_code"] = 0 if to == "completed" else 1
+        if to == "completed":
+            ev["completion_reason"] = "stopped"
     r = _post(client, **ev)
     assert r.status_code == 409, r.text
     body = r.json()
@@ -169,6 +171,8 @@ def test_transition_off_terminal_is_409_unless_same(frm, to):
     _drive_to(client, frm, connection_id="sess-uid")
 
     ev = {"connection_id": "sess-uid", "status": to, "exit_code": 1}
+    if to == "completed":
+        ev["completion_reason"] = "stopped"
     r = _post(client, **ev)
     assert r.status_code == 409, r.text
     body = r.json()
@@ -183,6 +187,8 @@ def test_first_event_other_than_joining_is_409():
         _seed(repo, status="requested")
         client = TestClient(create_app(meeting_repo=repo))
         ev = {"connection_id": "sess-uid", "status": to, "exit_code": 1}
+        if to == "completed":
+            ev["completion_reason"] = "stopped"
         r = _post(client, **ev)
         assert r.status_code == 409, f"{to}: {r.text}"
         assert r.json()["from"] is None
@@ -292,20 +298,20 @@ def test_rehydration_requested_then_skip_joining_is_409():
     assert r.json()["from"] is None and r.json()["to"] == "active"
 
 
-def test_rehydration_in_memory_record_wins_over_stale_db():
-    """A live in-process record (already advanced) must NOT be overwritten by a staler DB read:
-    drive joining→active in-process, then flip the DB BACK to `joining`; the next `completed` must
-    still succeed (the in-memory ACTIVE is the source of truth, not the stale DB `joining`)."""
+def test_durable_status_wins_over_a_stale_process_record():
+    """Process memory is only a projection; it may never advance past a contradictory DB status."""
     repo = InMemoryMeetingRepo()
     m = _seed(repo, status="requested")
     client = TestClient(create_app(meeting_repo=repo))
     assert _post(client, connection_id="sess-uid", status="joining").status_code == 200
     assert _post(client, connection_id="sess-uid", status="active").status_code == 200
-    # Simulate a stale DB read regressing to joining (it shouldn't reseed the live record).
+    # Simulate an external durable correction back to joining. The callback must reconcile to it;
+    # trusting this process's stale ACTIVE record would bypass the cross-replica CAS invariant.
     repo.set_status(m["id"], "joining")
     r = _post(client, connection_id="sess-uid", status="completed", exit_code=0, completion_reason="stopped")
-    assert r.status_code == 200, r.text
-    assert r.json()["meeting_status"] == "completed"
+    assert r.status_code == 409, r.text
+    assert r.json()["from"] == "joining"
+    assert repo._meetings[m["id"]]["status"] == "joining"
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
@@ -336,15 +342,13 @@ def test_bad_status_enum_is_422():
     assert r.status_code == 422, r.text
 
 
-def test_unknown_connection_id_joining_is_accepted_but_not_persisted():
-    """An UNKNOWN connection_id (no session row) with a legal first event: the FSM creates an
-    in-memory record and returns 200, but the DB persist no-ops (unknown session). This DOCUMENTS
-    the current behaviour — the callback does not 404 an unknown session."""
+def test_unknown_connection_id_joining_is_retryable_until_the_session_exists():
+    """An ACK is a durability promise; an unknown session cannot be acknowledged as committed."""
     repo = InMemoryMeetingRepo()  # no meeting/session seeded
     client = TestClient(create_app(meeting_repo=repo))
     r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "joining"})
-    assert r.status_code == 200, r.text
-    assert r.json()["meeting_status"] == "joining"
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"] == "lifecycle state was not committed; retry"
     # Nothing persisted (no such session) — get_status_by_session stays None.
     assert asyncio.run(repo.get_status_by_session(session_uid="ghost")) is None
 
@@ -355,7 +359,12 @@ def test_unknown_connection_id_terminal_is_409():
     session the control plane never saw."""
     repo = InMemoryMeetingRepo()
     client = TestClient(create_app(meeting_repo=repo))
-    r = client.post(ENDPOINT, json={"connection_id": "ghost", "status": "completed", "exit_code": 0})
+    r = client.post(ENDPOINT, json={
+        "connection_id": "ghost",
+        "status": "completed",
+        "exit_code": 0,
+        "completion_reason": "stopped",
+    })
     assert r.status_code == 409, r.text
     assert r.json()["from"] is None and r.json()["to"] == "completed"
 
@@ -983,7 +992,10 @@ def test_bot_callback_mid_window_cancels_escalation():
 # it via synthesize_terminal_for_dead_workload, driven through the bot's OWN lifecycle callback (POST
 # to /bots/internal/callback/lifecycle — exercised in-process here, like _run_general_sweep_rt).
 
-from meeting_api.lifecycle.reconcile import synthesize_terminal_for_dead_workload  # noqa: E402
+from meeting_api.lifecycle.reconcile import (  # noqa: E402
+    RuntimeCallbackProcessingError,
+    synthesize_terminal_for_dead_workload,
+)
 
 
 def _consume_runtime_terminal(client, repo, workload_id, state):
@@ -998,6 +1010,62 @@ def _consume_runtime_terminal(client, repo, workload_id, state):
     return asyncio.run(synthesize_terminal_for_dead_workload(
         repo, workload_id, state, _drive, log=logging.getLogger("test.runtime-cb"),
     ))
+
+
+def test_runtime_terminal_lookup_failure_redacts_exception_and_chain(caplog):
+    marker = "private-native-id-and-credential"
+
+    class Repo:
+        async def find_by_container(self, **_kwargs):
+            raise RuntimeError(marker)
+
+    async def drive(_body):
+        raise AssertionError("lookup failure reached lifecycle writer")
+
+    import logging
+
+    with pytest.raises(RuntimeCallbackProcessingError, match="meeting lookup failed") as raised:
+        asyncio.run(synthesize_terminal_for_dead_workload(
+            Repo(), "workload-1", "destroyed", drive,
+            log=logging.getLogger("test.runtime-cb.redaction"),
+            raise_on_transient=True,
+        ))
+
+    assert marker not in caplog.text
+    assert raised.value.__cause__ is None
+
+
+def test_runtime_terminal_non_success_does_not_render_arbitrary_result():
+    marker = "private-result-repr"
+
+    class Repo:
+        async def find_by_container(self, **_kwargs):
+            return {
+                "session_uid": "session-1",
+                "status": "active",
+                "meeting_id": 1,
+            }
+
+    class Result:
+        def __repr__(self):
+            return marker
+
+    async def drive(_body):
+        return Result()
+
+    import logging
+
+    with pytest.raises(
+        RuntimeCallbackProcessingError,
+        match="synthetic lifecycle write was not accepted",
+    ) as raised:
+        asyncio.run(synthesize_terminal_for_dead_workload(
+            Repo(), "workload-1", "destroyed", drive,
+            log=logging.getLogger("test.runtime-cb.result"),
+            raise_on_transient=True,
+        ))
+
+    assert marker not in str(raised.value)
 
 
 def test_runtime_destroyed_completes_stopping_meeting_and_stops_reaper():

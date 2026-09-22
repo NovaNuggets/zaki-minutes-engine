@@ -1,0 +1,28 @@
+{
+  "contractVersion": "invocation.v2",
+  "platform": "google_meet",
+  "meetingUrl": "https://meet.google.com/xxx-xxxx-xxx",
+  "botName": "ZAKI Notetaker",
+  "nativeMeetingId": "xxx-xxxx-xxx",
+  "token": "MEETING_TOKEN_PLACEHOLDER",
+  "connectionId": "sess-uid",
+  "meeting_id": "9223372036854775807",
+  "transcriptIngestUrl": "http://meeting-api:8080/bots/internal/transcripts/ingest",
+  "retentionFenceUrl": "http://meeting-api:8080/bots/internal/transcripts/fence",
+  "meetingApiCallbackUrl": "http://meeting-api:8080/bots/internal/callback/lifecycle",
+  "transcribeEnabled": true,
+  "transcriptionServiceUrl": "https://stt.example/v1",
+  "transcriptionServiceToken": "STT_TOKEN_PLACEHOLDER",
+  "recordingEnabled": true,
+  "recordingUploadUrl": "http://meeting-api:8080/internal/recordings/upload",
+  "captureModes": ["audio", "video"],
+  "captureExpiresAt": "2026-07-17T12:00:00Z",
+  "managedRetention": {
+    "policyVersion": "minutes-capture.v1",
+    "scopeExpiresAt": {
+      "audio": "2026-07-17T12:00:00Z",
+      "transcript": "2026-08-15T12:00:00Z",
+      "summary": "2026-08-15T12:00:00Z"
+    }
+  }
+}

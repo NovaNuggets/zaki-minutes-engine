@@ -20,9 +20,24 @@ spec:
       labels:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: redis
+      annotations:
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
     spec:
+      securityContext:
+        fsGroup: {{ .Values.redis.fsGroup }}
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: {{ .Values.redis.runAsGroup }}
+        runAsNonRoot: true
+        runAsUser: {{ .Values.redis.runAsUser }}
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.global.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- else }}
       # v0.10.5 Pack I.s — stateful-pod anti-affinity (#272 iter-5).
-      # See deployment-minio.yaml header for the full rationale.
+      # See deployment-minio.yaml header for the full rationale. An explicit global.affinity
+      # replaces this safe default, matching every other chart workload without duplicate keys.
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -34,21 +49,36 @@ spec:
                       operator: In
                       values: [postgres, minio, tts-service]
                 topologyKey: kubernetes.io/hostname
+      {{- end }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: redis
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+            runAsGroup: {{ .Values.redis.runAsGroup }}
+            runAsNonRoot: true
+            runAsUser: {{ .Values.redis.runAsUser }}
           image: "{{ .Values.redis.image }}"
           imagePullPolicy: IfNotPresent
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: REDIS_PASSWORD
           {{- /* v0.10.5 Pack C.5 — paired-durability invariant guard */}}
           {{- include "vexa.validateRedisDurability" . }}
           args:
             - "--appendonly"
             - {{ .Values.redis.durability.appendonly | default "yes" | quote }}
             - "--appendfsync"
-            - {{ .Values.redis.durability.appendfsync | default "everysec" | quote }}
+            - {{ .Values.redis.durability.appendfsync | default "always" | quote }}
             - "--stop-writes-on-bgsave-error"
             - {{ .Values.redis.durability.stopWritesOnBgsaveError | default "no" | quote }}
             {{- with .Values.redis.maxmemory }}
@@ -59,20 +89,33 @@ spec:
             - "--maxmemory-policy"
             - {{ . | quote }}
             {{- end }}
+            - "--requirepass"
+            - "$(REDIS_PASSWORD)"
           ports:
             - name: redis
               containerPort: 6379
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
           readinessProbe:
-            tcpSocket:
-              port: redis
+            exec:
+              command:
+                - sh
+                - -ec
+                - |
+                  unauth="$(redis-cli ping 2>&1 || true)"
+                  case "$unauth" in NOAUTH*) ;; *) exit 1 ;; esac
+                  REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -qx PONG
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket:
-              port: redis
+            exec:
+              command:
+                - sh
+                - -ec
+                - 'REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli ping | grep -qx PONG'
             initialDelaySeconds: 15
             periodSeconds: 20
           resources:
@@ -85,6 +128,8 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+        - name: tmp
+          emptyDir: {}
       {{- /* v0.10.5 Pack A.1 — restore tolerations/nodeSelector/affinity dropped in 0.10.4 (#272 issue 2). On any cluster with NoSchedule taints, redis pod stays Pending forever without these. */}}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
@@ -92,10 +137,6 @@ spec:
       {{- end }}
       {{- with .Values.global.tolerations }}
       tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.global.affinity }}
-      affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 {{- end }}

@@ -43,9 +43,9 @@ SECRET = "test-admin-token"
 
 @pytest.fixture(autouse=True)
 def _admin_token(monkeypatch):
-    """POST /bots mints a MeetingToken signed with ADMIN_TOKEN; without it the spawn raises and the
+    """POST /bots mints a MeetingToken signed with MEETING_TOKEN_SECRET; without it the spawn raises and the
     request 500s. Every test that does not specifically probe the misconfig path wants it set."""
-    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("MEETING_TOKEN_SECRET", SECRET)
 
 
 def _seeded_store():
@@ -423,18 +423,18 @@ def test_post_bots_no_transcription_spawns_without_stt(monkeypatch):
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
-#  POST /bots — server misconfiguration robustness (no ADMIN_TOKEN → MeetingToken mint fails)
+#  POST /bots — server misconfiguration robustness (no MEETING_TOKEN_SECRET → MeetingToken mint fails)
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 
 
 def test_post_bots_without_admin_token_500s_on_valid_request(monkeypatch):
-    """ROBUSTNESS NOTE: with ADMIN_TOKEN unset the MeetingToken mint raises ValueError mid-flow →
+    """ROBUSTNESS NOTE: with MEETING_TOKEN_SECRET unset the MeetingToken mint raises ValueError mid-flow →
     an UNHANDLED 500 on an otherwise-valid request. This is why the PRODUCTION boot now fails fast
-    (A4): ``__main__._require_config`` refuses to build the app at all when ADMIN_TOKEN is unset, so a
+    (A4): ``__main__._require_config`` refuses to build the app at all when MEETING_TOKEN_SECRET is unset, so a
     real deploy never reaches this state (see test_startup_requires_admin_token in
     test_robustness_seam). This test still pins the per-request blast radius for the create_app path
     (which is intentionally NOT gated, so the offline harness can stand the app up without secrets)."""
-    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.delenv("MEETING_TOKEN_SECRET", raising=False)
     c = _client()
     with pytest.raises(Exception):
         # TestClient re-raises server exceptions by default → proves it is an unhandled 500, not a

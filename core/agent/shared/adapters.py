@@ -1,13 +1,13 @@
 """Real adapters for the workspace seams (O-AG-2).
 
 These fill the ``WorkspacePort`` / ``VcsPort`` holes with real ``git`` against a LOCAL directory —
-derived from the parent ``agent/workspace.py`` (git clone/add/commit + token-in-remote push),
+derived from the parent ``agent/workspace.py`` (git clone/add/commit + authenticated push),
 reimplemented clean against the v0.12 ports. No network is required: ``clone`` takes a local repo
 path (``file://`` or a directory), and the GitHub push targets a bare local repo in the eval.
 
 Discipline (P15): the per-user GitHub token is a BROKERED secret (identity ``SecretsPort``). It is
-``reveal()``-ed ONLY to assemble the authenticated remote URL for a single push, and is NEVER
-logged, never written into the repo's persisted remote (we strip it afterward, as the parent does).
+``reveal()``-ed only inside an ephemeral askpass context for one exact-origin push, and is never
+logged, placed in argv, or written into a persisted remote.
 """
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Protocol
@@ -29,6 +30,8 @@ from typing import Protocol
 import yaml
 
 from shared.gitenv import scrubbed_git_env
+from shared.git_auth import git_credential_env
+from shared.http import encode_json_bounded, open_no_redirect, read_json_bounded
 from shared.models import WorkspaceWrite
 from shared.ports import IdentityPort, RuntimePort, SchedulerPort, StreamReader, VcsPort, WorkspacePort
 
@@ -56,16 +59,15 @@ def parse_entity(text: str) -> tuple[dict, str]:
 
 # ── git helpers ──────────────────────────────────────────────────────────────
 
-def _git(cwd: Path, *args: str, token: str | None = None) -> str:
-    """Run a git command in ``cwd``; return trimmed stdout. ``token`` (if given) is passed via env
-    for the duration of the call only and is NEVER placed on the argv (which can leak via ps).
+def _git(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    """Run a git command in ``cwd``; return trimmed stdout.
+
     Always runs on a scrubbed env — a hook-exported GIT_DIR must never re-point the workspace op
     at the hook's repo (see shared/gitenv.py)."""
-    env = scrubbed_git_env(GIT_ASKPASS="true") if token is not None else scrubbed_git_env()
     proc = subprocess.run(
         ["git", *args],
         cwd=str(cwd),
-        env=env,
+        env=env or scrubbed_git_env(),
         capture_output=True,
         text=True,
     )
@@ -135,37 +137,29 @@ class GitPushError(RuntimeError):
 def push_with_token(work_dir: str | Path, remote_url: str, ref: str, token: str | None,
                     *, remote: str = _PUSH_REMOTE) -> str:
     """THE shared governed-push mechanic: push ``ref`` to ``remote_url`` over a DEDICATED remote so
-    the repo's ``origin`` is never clobbered. The token (if any) rides on the remote URL for the
-    push's duration ONLY, then the persisted remote is scrubbed back to the token-free URL (P15).
+    the repo's ``origin`` is never clobbered. A GitHub token (if any) is exposed only through an
+    ephemeral askpass helper; argv and every persisted remote remain token-free (P15).
     Returns the pushed HEAD sha. NEVER forces — a non-fast-forward push fails loud. Failures raise
     ``GitPushError`` with the token redacted from the message.
 
     Both credential flows converge here: ``GitHubVcs.push`` (brokered secret store) and the
     per-call-token workspace publish (``control_plane.workspace_publish``)."""
     work = Path(work_dir)
-    if token and "://" in remote_url:
-        proto, rest = remote_url.split("://", 1)
-        auth_url = f"{proto}://{token}@{rest}"
-    else:
-        auth_url = remote_url
-
     def redact(text: str) -> str:
         return text.replace(token, "***") if token else text
 
     try:
-        # (Re-)point the dedicated remote at the authenticated URL — `set-url` on a re-publish,
-        # `add` the first time (either may be the one that fails, hence the fallback order).
-        try:
-            _git(work, "remote", "set-url", remote, auth_url, token=token)
-        except RuntimeError:
-            _git(work, "remote", "add", remote, auth_url, token=token)
-        try:
-            _git(work, "push", remote, ref, token=token)
-            return _git(work, "rev-parse", "HEAD", token=token)
-        finally:
-            # Strip the token from the persisted remote so it can't leak to the repo/object store.
-            _git(work, "remote", "set-url", remote, remote_url, token=token)
-    except RuntimeError as exc:
+        # Constructing the credential environment validates the origin before any repo config changes.
+        with git_credential_env(remote_url, token) as auth_env:
+            # (Re-)point the dedicated remote at the token-free URL — `set-url` on a re-publish,
+            # `add` the first time (either may fail, hence the fallback order).
+            try:
+                _git(work, "remote", "set-url", remote, remote_url)
+            except RuntimeError:
+                _git(work, "remote", "add", remote, remote_url)
+            _git(work, "push", remote, ref, env=dict(auth_env))
+        return _git(work, "rev-parse", "HEAD")
+    except (RuntimeError, ValueError) as exc:
         raise GitPushError(redact(str(exc))) from None
 
 
@@ -253,9 +247,8 @@ class GitHubVcs(VcsPort):
     """``VcsPort`` that pushes a user's workspace to their own GitHub repo over a BROKERED token.
 
     The token is fetched from identity's ``SecretsPort`` as a ``BrokeredSecret`` (redacted repr) and
-    ``reveal()``-ed ONLY to build the authenticated remote URL for one push. We log metadata only,
-    and — as the parent does after clone — reset the persisted remote to the token-free URL so the
-    credential never lands in the repo config or the synced object store (P15).
+    ``reveal()``-ed ONLY inside the ephemeral askpass context for one push. We log metadata only;
+    the credential never lands in argv, repo config, or the synced object store (P15).
     """
 
     def __init__(
@@ -281,9 +274,8 @@ class GitHubVcs(VcsPort):
             "github push subject=%s remote=%s ref=%s token=%r",
             self._subject, remote_url, ref, brokered,  # %r → BrokeredSecret redacts itself
         )
-        # The one shared governed-push mechanic (push_with_token): dedicated remote so the clone's
-        # ``origin`` is never clobbered, token on the remote URL only for the push's duration, then
-        # scrubbed back to the token-free URL; failure messages token-redacted (P15).
+        # The one shared governed-push mechanic: a dedicated token-free remote plus an ephemeral,
+        # exact-origin askpass credential; failure messages remain token-redacted (P15).
         return push_with_token(work, remote_url, ref, brokered.reveal(), remote=_PUSH_REMOTE)
 
 
@@ -293,25 +285,83 @@ class RuntimeHttpClient(RuntimePort):
     ``agent`` workload. Uses stdlib urllib (no extra dep); the spec body is the runtime.v1 WorkloadSpec.
     """
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 10.0,
+        control_secret: str = "",
+    ) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
+        self._control_secret = control_secret
+
+    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        if self._control_secret:
+            headers["X-Runtime-Control-Secret"] = self._control_secret
+        return headers
 
     def spawn(self, workload_id: str, profile: str, env: dict[str, str]) -> str:
-        body = json.dumps({"workloadId": workload_id, "profile": profile, "env": env}).encode()
+        body = encode_json_bounded({"workloadId": workload_id, "profile": profile, "env": env})
         req = urllib.request.Request(
             f"{self._base}/workloads", data=body,
-            headers={"Content-Type": "application/json"}, method="POST",
+            headers=self._headers(json_body=True), method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
-            status = json.loads(r.read())
-        return status.get("workloadId", workload_id)
+        with open_no_redirect(req, timeout=self._timeout) as r:
+            status = read_json_bounded(r)
+        if not isinstance(status, dict):
+            raise ValueError("invalid runtime response")
+        returned_id = status.get("workloadId", workload_id)
+        if not isinstance(returned_id, str) or not returned_id or len(returned_id) > 512:
+            raise ValueError("invalid runtime response")
+        return returned_id
 
     def await_done(self, workload_id: str, timeout_sec: float = 0.0) -> str:
-        req = urllib.request.Request(f"{self._base}/workloads/{workload_id}", method="GET")
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
-            status = json.loads(r.read())
-        return status.get("state", "unknown")
+        encoded_id = urllib.parse.quote(str(workload_id), safe="")
+        req = urllib.request.Request(
+            f"{self._base}/workloads/{encoded_id}",
+            headers=self._headers(),
+            method="GET",
+        )
+        with open_no_redirect(req, timeout=self._timeout) as r:
+            status = read_json_bounded(r)
+        if not isinstance(status, dict):
+            raise ValueError("invalid runtime response")
+        state = status.get("state", "unknown")
+        if not isinstance(state, str) or len(state) > 128:
+            raise ValueError("invalid runtime response")
+        return state
+
+    def stop(self, workload_id: str) -> str:
+        """POST runtime.v1 stop without redirecting a control request to another origin.
+
+        A 404 means the workload is already absent and therefore satisfies the desired stopped state.
+        Other transport/status failures remain errors so the consent endpoint never reports a confirmed
+        stop when the runtime authority could not be reached.
+        """
+        import urllib.error
+
+        body = b'{"reason":"stopped"}'
+        encoded_id = urllib.parse.quote(str(workload_id), safe="")
+        req = urllib.request.Request(
+            f"{self._base}/workloads/{encoded_id}/stop",
+            data=body,
+            headers=self._headers(json_body=True),
+            method="POST",
+        )
+        try:
+            with open_no_redirect(req, timeout=self._timeout) as response:
+                status = read_json_bounded(response)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return "absent"
+            raise
+        if not isinstance(status, dict):
+            raise ValueError("invalid runtime response")
+        return str(status.get("state") or "stopped")
 
 
 def _b64u(raw: bytes) -> str:
@@ -415,30 +465,62 @@ class SchedulerHttpClient(SchedulerPort):
     """A ``SchedulerPort`` over the runtime's ``/schedule`` surface (schedule.v1) — the control-plane→cron
     edge. agent-api authors routine jobs here; the runtime owns the durable cron. Stdlib urllib, no dep."""
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 10.0,
+        control_secret: str = "",
+    ) -> None:
         self._base = base_url.rstrip("/")
         self._timeout = timeout
+        self._control_secret = control_secret
+
+    def _headers(self, *, json_body: bool = False) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if json_body:
+            headers["Content-Type"] = "application/json"
+        if self._control_secret:
+            headers["X-Runtime-Control-Secret"] = self._control_secret
+        return headers
 
     def schedule(self, job: dict) -> dict:
-        body = json.dumps(job).encode()
+        body = encode_json_bounded(job)
         req = urllib.request.Request(
             f"{self._base}/schedule", data=body,
-            headers={"Content-Type": "application/json"}, method="POST",
+            headers=self._headers(json_body=True), method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
-            return json.loads(r.read())
+        with open_no_redirect(req, timeout=self._timeout) as r:
+            result = read_json_bounded(r)
+        if not isinstance(result, dict):
+            raise ValueError("invalid scheduler response")
+        return result
 
     def list_jobs(self, *, status: str | None = None, limit: int = 50) -> list[dict]:
         q = f"?limit={limit}" + (f"&status={status}" if status else "")
-        req = urllib.request.Request(f"{self._base}/schedule{q}", method="GET")
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
-            return json.loads(r.read())
+        req = urllib.request.Request(
+            f"{self._base}/schedule{q}",
+            headers=self._headers(),
+            method="GET",
+        )
+        with open_no_redirect(req, timeout=self._timeout) as r:
+            result = read_json_bounded(r)
+        if not isinstance(result, list):
+            raise ValueError("invalid scheduler response")
+        return result
 
     def cancel_job(self, job_id: str) -> dict | None:
-        req = urllib.request.Request(f"{self._base}/schedule/{job_id}", method="DELETE")
+        req = urllib.request.Request(
+            f"{self._base}/schedule/{job_id}",
+            headers=self._headers(),
+            method="DELETE",
+        )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
-                return json.loads(r.read())
+            with open_no_redirect(req, timeout=self._timeout) as r:
+                result = read_json_bounded(r)
+            if not isinstance(result, dict):
+                raise ValueError("invalid scheduler response")
+            return result
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
@@ -467,12 +549,12 @@ class AdminApiMembershipIndex:
         return h
 
     def add(self, subject: str, workspace_id: str, role: str, added_at: str) -> None:
-        body = json.dumps({"workspace_id": workspace_id, "role": role, "added_at": added_at}).encode()
+        body = encode_json_bounded({"workspace_id": workspace_id, "role": role, "added_at": added_at})
         req = urllib.request.Request(
             f"{self._base}/internal/users/{subject}/memberships",
             data=body, headers=self._headers(), method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self._timeout):
+        with open_no_redirect(req, timeout=self._timeout):
             pass
 
     def remove(self, subject: str, workspace_id: str) -> None:
@@ -481,7 +563,7 @@ class AdminApiMembershipIndex:
             headers=self._headers(), method="DELETE",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout):
+            with open_no_redirect(req, timeout=self._timeout):
                 pass
         except urllib.error.HTTPError as e:
             if e.code != 404:
@@ -493,8 +575,8 @@ class AdminApiMembershipIndex:
             headers=self._headers(), method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
-                data = json.loads(r.read())
+            with open_no_redirect(req, timeout=self._timeout) as r:
+                data = read_json_bounded(r)
             return data.get("memberships", []) if isinstance(data, dict) else (data or [])
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -526,10 +608,41 @@ class AdminApiModelConfig:
             headers=headers, method="GET",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
-                data = json.loads(r.read())
+            with open_no_redirect(req, timeout=self._timeout) as r:
+                data = read_json_bounded(r)
             models = data.get("models") if isinstance(data, dict) else None
-            return models if isinstance(models, dict) else {}
+            credential_owner = data.get("credential_owner") if isinstance(data, dict) else None
+            if credential_owner not in (None, "user", "operator"):
+                raise ValueError("invalid model config response")
+            if models is None:
+                return {}
+            if not isinstance(models, dict):
+                raise ValueError("invalid model config response")
+
+            limits = {
+                "mode": 32,
+                "model": 512,
+                "meeting_model": 512,
+                "base_url": 4096,
+                "api_key": 16384,
+                "config_status": 32,
+                "validation_error": 1024,
+            }
+            if set(models) - (set(limits) | {"blocked"}):
+                raise ValueError("invalid model config response")
+            for field, limit in limits.items():
+                value = models.get(field)
+                if value is not None and (
+                    not isinstance(value, str)
+                    or len(value) > limit
+                    or any(control in value for control in ("\x00", "\r", "\n"))
+                ):
+                    raise ValueError("invalid model config response")
+            if "blocked" in models and type(models["blocked"]) is not bool:
+                raise ValueError("invalid model config response")
+            if credential_owner is not None:
+                models = {**models, "credential_owner": credential_owner}
+            return models
         except urllib.error.HTTPError as e:
             if e.code == 404:  # unknown subject (e.g. a dev default-subject) → env defaults
                 return {}

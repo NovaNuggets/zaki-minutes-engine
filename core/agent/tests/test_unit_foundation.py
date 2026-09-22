@@ -181,6 +181,10 @@ def test_dispatcher_worker_env_carries_numeric_meeting_id():
     settings = load_settings()
     rt = _FakeRuntime()
     d = dispatch.Dispatcher(settings, rt, _FakeIdentity())
+    from shared.meeting_retention import bind_processing_deadline
+
+    cutoff_ms = 2_541_488_400_000
+    processing_token = bind_processing_deadline("opaque-generation", cutoff_ms)
     inv = {
         **VALID_INV,
         "trigger": "transcription",
@@ -191,6 +195,8 @@ def test_dispatcher_worker_env_carries_numeric_meeting_id():
             "session_uid": "abc-defg-hij",
             "platform": "google_meet",
             "numeric_meeting_id": "17",
+            "processing_token": processing_token,
+            "processing_expires_at_ms": cutoff_ms,
         }},
     }
     d.dispatch(inv)  # would raise at the seam if the hint leaked into the contract check
@@ -201,6 +207,27 @@ def test_dispatcher_worker_env_carries_numeric_meeting_id():
     # a user's re-sends). The native id rides SEPARATELY as VEXA_MEETING_ID (the readable kg doc name).
     assert env["VEXA_TRANSCRIPT_STREAM"] == "tc:meeting:17"          # carrier keys on the ROW id
     assert env["VEXA_MEETING_ID"] == "abc-defg-hij"                 # native survives for display only
+    assert env["VEXA_MEETING_PROCESSING_FLAG_KEY"] == "proc:meeting:17:on"
+    assert env["VEXA_MEETING_PROCESSING_TOKEN"] == processing_token
+    assert env["VEXA_MEETING_PROCESSING_EXPIRES_AT_MS"] == str(cutoff_ms)
+
+
+def test_worker_accepts_only_the_deadline_bound_into_the_processing_generation():
+    from shared.meeting_retention import bind_processing_deadline
+    from worker.engine import _processing_deadline_env
+
+    cutoff_ms = 2_541_488_400_000
+    token = bind_processing_deadline("opaque-generation", cutoff_ms)
+
+    assert _processing_deadline_env(token, None) == cutoff_ms
+    assert _processing_deadline_env(token, str(cutoff_ms)) == cutoff_ms
+    assert _processing_deadline_env("ordinary-generation", None) is None
+    with pytest.raises(ValueError):
+        _processing_deadline_env(token, str(cutoff_ms + 1))
+    with pytest.raises(ValueError):
+        _processing_deadline_env("ordinary-generation", str(cutoff_ms))
+    with pytest.raises(ValueError):
+        _processing_deadline_env(token, "not-a-number")
 
 # ── model-auth passthrough: agent-api env → worker spec env (the k8s/helm credential seam) ────
 
@@ -380,6 +407,73 @@ def test_dispatcher_model_config_custom_mode_stamps_both_call_shapes():
     assert env["VEXA_LLM_BASE_URL"] == "https://gw.example.com"
     assert env["VEXA_LLM_API_KEY"] == "sk-user"
     assert env["VEXA_AGENT_MODEL"] == "qwen3"
+
+
+def test_dispatcher_custom_settings_endpoint_never_inherits_operator_env_keys(monkeypatch):
+    operator_secrets = {
+        "CLAUDE_CODE_OAUTH_TOKEN": "operator-oauth",
+        "ANTHROPIC_API_KEY": "operator-anthropic-key",
+        "ANTHROPIC_AUTH_TOKEN": "operator-auth-token",
+        "VEXA_LLM_API_KEY": "operator-llm-key",
+        "ANTHROPIC_BASE_URL": "https://operator-model.example",
+        "VEXA_LLM_BASE_URL": "https://operator-llm.example",
+    }
+    for key, value in operator_secrets.items():
+        monkeypatch.setenv(key, value)
+    rt = _FakeRuntime()
+    mc = _FakeModelConfig({"mode": "custom", "base_url": "https://user-model.example"})
+    dispatch.Dispatcher(load_settings(), rt, _FakeIdentity(), model_config=mc).dispatch(VALID_INV)
+    _, _profile, env = rt.spawned[0]
+
+    assert env["ANTHROPIC_BASE_URL"] == "https://user-model.example"
+    assert env["VEXA_LLM_BASE_URL"] == "https://user-model.example"
+    for key in (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "VEXA_LLM_API_KEY",
+    ):
+        assert not env.get(key), f"custom user endpoint inherited {key}"
+
+
+def test_dispatcher_refuses_blocked_personal_model_without_operator_fallback(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "operator-auth-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://operator-model.example")
+    runtime = _FakeRuntime()
+    blocked = _FakeModelConfig({
+        "mode": "custom",
+        "blocked": True,
+        "config_status": "blocked",
+        "validation_error": "Personal model endpoint is no longer operator-approved.",
+    })
+
+    with pytest.raises(ValueError, match="blocked"):
+        dispatch.Dispatcher(
+            load_settings(), runtime, _FakeIdentity(), model_config=blocked,
+        ).dispatch(VALID_INV)
+
+    assert runtime.spawned == []
+
+
+def test_dispatcher_incomplete_custom_tier_blocks_env_fallback_but_subscription_keeps_it(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "operator-auth-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://operator-model.example")
+
+    custom_rt = _FakeRuntime()
+    custom = _FakeModelConfig({"mode": "custom"})
+    dispatch.Dispatcher(load_settings(), custom_rt, _FakeIdentity(), model_config=custom).dispatch(VALID_INV)
+    custom_env = custom_rt.spawned[0][2]
+    assert not custom_env.get("ANTHROPIC_AUTH_TOKEN")
+    assert not custom_env.get("ANTHROPIC_BASE_URL")
+
+    subscription_rt = _FakeRuntime()
+    subscription = _FakeModelConfig({"mode": "subscription"})
+    dispatch.Dispatcher(
+        load_settings(), subscription_rt, _FakeIdentity(), model_config=subscription,
+    ).dispatch(VALID_INV)
+    subscription_env = subscription_rt.spawned[0][2]
+    assert subscription_env["ANTHROPIC_AUTH_TOKEN"] == "operator-auth-token"
+    assert subscription_env["ANTHROPIC_BASE_URL"] == "https://operator-model.example"
 
 
 def test_dispatcher_model_config_subscription_mode_keeps_deployment_credentials(monkeypatch):

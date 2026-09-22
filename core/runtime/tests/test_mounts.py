@@ -8,10 +8,15 @@ k8s uses native ``subPath`` + ``readOnly``. The whole-store bind is never emitte
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+
+import pytest
 
 from runtime_kernel.mounts import MountBind, k8s_volume_mounts, mount_set, workspace_binds
 from runtime_kernel.docker_backend import DockerBackend  # for the docker bind-string shape
-from runtime_kernel.k8s_backend import pod_overrides
+from runtime_kernel.backend import WorkloadHandle
+from runtime_kernel.k8s_backend import K8sBackend, pod_overrides
+from runtime_kernel.models import Resources
 from runtime_kernel.profiles import Runnable
 
 
@@ -161,8 +166,188 @@ def test_k8s_pod_overrides_carry_the_per_mount_spec():
     ]
 
 
-def test_k8s_pod_overrides_none_when_no_store_configured():
-    assert pod_overrides({}, container_name="x") is None
+def test_k8s_pod_overrides_harden_every_spawn_even_without_a_workspace(monkeypatch):
+    monkeypatch.setenv("RUNTIME_K8S_RUN_AS_USER", "10003")
+    ov = pod_overrides({}, container_name="x")
+    spec = ov["spec"]
+    assert spec["automountServiceAccountToken"] is False
+    assert spec["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 10003,
+        "runAsGroup": 10003,
+        "fsGroup": 10003,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    [container] = spec["containers"]
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "runAsNonRoot": True,
+        "runAsUser": 10003,
+        "runAsGroup": 10003,
+    }
+    assert container["resources"] == {
+        "requests": {"cpu": "1", "memory": "1024Mi"},
+        "limits": {"cpu": "4", "memory": "4096Mi"},
+    }
+
+
+def test_k8s_pod_overrides_preserve_the_kubectl_run_image():
+    ov = pod_overrides(
+        {},
+        container_name="x",
+        image="registry.example/minutes-bot@sha256:abc123",
+        command=["sleep", "30"],
+    )
+
+    assert ov["spec"]["containers"][0]["image"] == (
+        "registry.example/minutes-bot@sha256:abc123"
+    )
+    assert ov["spec"]["containers"][0]["command"] == ["sleep", "30"]
+
+
+def test_k8s_pod_overrides_inherit_operator_scheduling_and_pull_policy(monkeypatch):
+    monkeypatch.setenv("RUNTIME_K8S_NODE_SELECTOR_JSON", '{"vexa.ai/pool":"temp"}')
+    monkeypatch.setenv(
+        "RUNTIME_K8S_TOLERATIONS_JSON",
+        '[{"key":"vexa.ai/pool","operator":"Equal","value":"temp","effect":"NoSchedule"}]',
+    )
+    monkeypatch.setenv(
+        "RUNTIME_K8S_AFFINITY_JSON",
+        '{"nodeAffinity":{"preferredDuringSchedulingIgnoredDuringExecution":[]}}',
+    )
+    monkeypatch.setenv(
+        "RUNTIME_K8S_IMAGE_PULL_SECRETS_JSON", '[{"name":"private-registry"}]'
+    )
+
+    spec = pod_overrides({}, container_name="x")["spec"]
+
+    assert spec["nodeSelector"] == {"vexa.ai/pool": "temp"}
+    assert spec["tolerations"][0]["effect"] == "NoSchedule"
+    assert "nodeAffinity" in spec["affinity"]
+    assert spec["imagePullSecrets"] == [{"name": "private-registry"}]
+
+
+def test_k8s_pod_overrides_honor_bounded_workload_resources(monkeypatch):
+    monkeypatch.setenv("RUNTIME_K8S_MAX_CPU", "2")
+    monkeypatch.setenv("RUNTIME_K8S_MAX_MEMORY_MB", "2048")
+    spec = pod_overrides(
+        {},
+        container_name="x",
+        resources=Resources(cpu=0.5, memoryMb=768),
+    )["spec"]
+    assert spec["containers"][0]["resources"] == {
+        "requests": {"cpu": "0.5", "memory": "768Mi"},
+        "limits": {"cpu": "2", "memory": "2048Mi"},
+    }
+
+
+def test_k8s_gpu_request_and_limit_are_identical(monkeypatch):
+    """Extended resources cannot be overcommitted: Kubernetes requires GPU request == limit."""
+    monkeypatch.setenv("RUNTIME_K8S_MAX_GPU", "4")
+
+    resources = pod_overrides(
+        {},
+        container_name="x",
+        resources=Resources(gpu=2),
+    )["spec"]["containers"][0]["resources"]
+
+    assert resources["requests"]["nvidia.com/gpu"] == "2"
+    assert resources["limits"]["nvidia.com/gpu"] == "2"
+
+
+def test_k8s_agent_worker_has_dedicated_identity_and_only_declared_writable_paths(
+    monkeypatch,
+):
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_RUN_AS_USER", "10007")
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_RUN_AS_GROUP", "10008")
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_FS_GROUP", "10009")
+
+    spec = pod_overrides(
+        _env(source="vexa-agent-workspaces"),
+        container_name="vexa-worker-u1",
+        workload_profile="agent",
+    )["spec"]
+
+    assert spec["securityContext"] == {
+        "runAsNonRoot": True,
+        "runAsUser": 10007,
+        "runAsGroup": 10008,
+        "fsGroup": 10009,
+        "fsGroupChangePolicy": "OnRootMismatch",
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    [container] = spec["containers"]
+    assert container["securityContext"] == {
+        "allowPrivilegeEscalation": False,
+        "capabilities": {"drop": ["ALL"]},
+        "readOnlyRootFilesystem": True,
+        "runAsNonRoot": True,
+        "runAsUser": 10007,
+        "runAsGroup": 10008,
+    }
+    assert {mount["mountPath"] for mount in container["volumeMounts"]} == {
+        "/workspaces/u1",
+        "/tmp",
+        "/home/vexa",
+    }
+    assert {volume["name"] for volume in spec["volumes"]} == {
+        "workspace-store",
+        "tmp",
+        "agent-home",
+    }
+
+
+def test_k8s_bot_and_agent_profiles_do_not_share_runtime_identity(monkeypatch):
+    monkeypatch.setenv("RUNTIME_K8S_BOT_RUN_AS_USER", "10003")
+    monkeypatch.setenv("RUNTIME_K8S_BOT_RUN_AS_GROUP", "10003")
+    monkeypatch.setenv("RUNTIME_K8S_BOT_FS_GROUP", "10003")
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_RUN_AS_USER", "10007")
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_RUN_AS_GROUP", "10007")
+    monkeypatch.setenv("RUNTIME_K8S_AGENT_FS_GROUP", "10007")
+
+    bot = pod_overrides({}, container_name="bot", workload_profile="meeting-bot")["spec"]
+    agent = pod_overrides({}, container_name="worker", workload_profile="agent")["spec"]
+
+    assert bot["securityContext"]["runAsUser"] == 10003
+    assert agent["securityContext"]["runAsUser"] == 10007
+
+
+def test_k8s_pod_overrides_reject_resources_above_operator_caps(monkeypatch):
+    monkeypatch.setenv("RUNTIME_K8S_MAX_CPU", "2")
+    monkeypatch.setenv("RUNTIME_K8S_MAX_MEMORY_MB", "2048")
+    with pytest.raises(ValueError, match="cpu exceeds"):
+        pod_overrides({}, container_name="x", resources=Resources(cpu=3))
+    with pytest.raises(ValueError, match="memoryMb exceeds"):
+        pod_overrides({}, container_name="x", resources=Resources(memoryMb=4096))
+
+
+def test_k8s_cleanup_waits_for_deletion_and_confirms_the_pod_is_absent(monkeypatch):
+    calls: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_kubectl(*args: str, check: bool = True):
+        calls.append((args, check))
+        return SimpleNamespace(returncode=1 if args[0] == "get" else 0, stderr="")
+
+    monkeypatch.setattr("runtime_kernel.k8s_backend._kubectl", fake_kubectl)
+    K8sBackend(namespace="meetings").cleanup(WorkloadHandle(id="m-1", impl="vexa-m-1"))
+
+    delete_args, delete_check = calls[0]
+    assert delete_check is True
+    assert delete_args[:3] == ("delete", "pod", "vexa-m-1")
+    assert "--wait=true" in delete_args
+    assert "--timeout=60s" in delete_args
+    assert calls[-1][0][:3] == ("get", "pod", "vexa-m-1")
+
+
+def test_k8s_cleanup_fails_closed_if_the_pod_still_exists(monkeypatch):
+    def fake_kubectl(*args: str, check: bool = True):
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("runtime_kernel.k8s_backend._kubectl", fake_kubectl)
+    with pytest.raises(RuntimeError, match="still exists"):
+        K8sBackend().cleanup(WorkloadHandle(id="m-1", impl="vexa-m-1"))
 
 
 # ── process: shares the host FS — no binds, but N-mount aware (parity) ────────

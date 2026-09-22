@@ -25,6 +25,9 @@ from typing import Optional
 class Runnable:
     image: Optional[str] = None
     command: Optional[list[str]] = None
+    # Internal deployment authority, never caller-controlled through runtime.v1. Only the Agent
+    # profile may receive operator-owned model credentials/mounts from legacy runtime brokerage.
+    broker_model_credentials: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,17 +90,34 @@ def worker_image_for(agent_image: str) -> str:
     return f"{repo}{sep}{tag}"
 
 
+def agent_profile_enabled() -> bool:
+    """Whether this deployment exposes the bundled Vexa Agent workload profile.
+
+    Managed Minutes deliberately disables that profile: the external Nullalis Agent consumes the
+    bounded HTTP read plane and must never inherit Vexa's internal Redis authority.  The default is
+    true for backward-compatible ordinary Vexa deployments, while an invalid value fails boot
+    instead of accidentally restoring the privileged profile.
+    """
+    raw = os.environ.get("RUNTIME_AGENT_PROFILE_ENABLED", "true").strip().lower()
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise ValueError("RUNTIME_AGENT_PROFILE_ENABLED must be 'true' or 'false'")
+
+
 def default_registry() -> ProfileRegistry:
     """The real, deployment-shaped registry. Images come from env (no `:latest` fallback — a missing
     image surfaces as an empty string the backend rejects, matching 0.11's fail-visible stance)."""
     browser_image = os.environ.get("BROWSER_IMAGE", "")
+    minutes_browser_image = os.environ.get("MINUTES_BROWSER_IMAGE", "").strip()
+    minutes_bot_command = os.environ.get("MINUTES_BOT_COMMAND", "").strip()
     agent_image = os.environ.get("AGENT_IMAGE", "")
     # Workers run their OWN image (see worker_image_for — core/agent/worker/Dockerfile, not the
     # agent-api image). The Docker backend ensures it is present at startup, pulling it when absent
     # (build_production_app → DockerBackend.ensure_worker_image).
     agent_worker_image = worker_image_for(agent_image)
-    return ProfileRegistry(
-        {
+    profiles = {
             # Meeting bot — Playwright browser; lifetime managed by meeting-api, so no idle timeout.
             # The bot's whole config arrives as one env var VEXA_BOT_CONFIG (invocation.v1).
             "meeting-bot": Profile(
@@ -109,22 +129,37 @@ def default_registry() -> ProfileRegistry:
                 idle_timeout_sec=0,  # 0 ⇒ managed externally; enforcement skips it
                 base_env={},
             ),
-            # Claude Code agent — the in-container worker harness (worker): consumes the
-            # dispatch from env, runs the governed turn over the mounted workspace, XADDs UnitEvents to
-            # unit:<id>:out, serves unit:<id>:in until idle. Continuity is the session file in the
-            # workspace, so a reaped+respawned container resumes instantly.
-            "agent": Profile(
-                name="agent",
-                runnable=Runnable(
-                    image=agent_worker_image,
-                    command=["python", "-m", "worker"],
-                ),
-                idle_timeout_sec=300,
-                max_lifetime_sec=3600,
-                base_env={},
-            ),
         }
-    )
+    if agent_profile_enabled():
+        # Claude Code agent — the in-container worker harness (worker): consumes the dispatch from
+        # env, runs the governed turn over the mounted workspace, XADDs UnitEvents to unit:<id>:out,
+        # and serves unit:<id>:in until idle. Managed Minutes excludes this profile because its
+        # external Nullalis consumer receives only the dedicated HTTP read token, never Redis.
+        profiles["agent"] = Profile(
+            name="agent",
+            runnable=Runnable(
+                image=agent_worker_image,
+                command=["python", "-m", "worker"],
+                broker_model_credentials=True,
+            ),
+            idle_timeout_sec=300,
+            max_lifetime_sec=3600,
+            base_env={},
+        )
+    # Managed invocation.v2 is deliberately not an alias of meeting-bot. Merely shipping new
+    # parser bytes does not activate it: the operator must select a v2-capable image explicitly.
+    # Thus an old runtime can never resolve this profile and an old bot never receives a v2 payload.
+    if minutes_browser_image or minutes_bot_command:
+        profiles["meeting-bot-v2"] = Profile(
+            name="meeting-bot-v2",
+            runnable=Runnable(
+                image=minutes_browser_image or None,
+                command=["/app/vexa-bot/entrypoint.sh"],
+            ),
+            idle_timeout_sec=0,
+            base_env={"VEXA_INVOCATION_CONTRACT": "invocation.v2"},
+        )
+    return ProfileRegistry(profiles)
 
 
 # Per-deployment command overrides: env var → the profile whose Runnable.command it replaces. The
@@ -133,6 +168,7 @@ def default_registry() -> ProfileRegistry:
 # that wire the right venv/PYTHONPATH/cwd before exec'ing the same workload.
 _COMMAND_OVERRIDE_ENV = {
     "meeting-bot": "BOT_COMMAND",
+    "meeting-bot-v2": "MINUTES_BOT_COMMAND",
     "agent": "AGENT_WORKER_COMMAND",
 }
 

@@ -1,3 +1,37 @@
+{{- if and .Values.terminal.enabled .Values.terminal.sharedKeyMode }}
+{{- fail "terminal.sharedKeyMode requires a real loopback host bind and is unsupported behind a Kubernetes Service; use the loopback-published Compose/Lite profile" }}
+{{- end }}
+{{- if and .Values.terminal.enabled (gt (len (.Values.terminal.directLoginAllowedEmails | default (list))) 0) }}
+{{- fail "terminal.directLoginAllowedEmails requires a real loopback host bind and is unsupported behind a Kubernetes Service; use the loopback-published Compose/Lite profile" }}
+{{- end }}
+{{- $profile := lower (trim (toString (.Values.global.deploymentProfile | default "local"))) -}}
+{{- $loopbackOrigin := "^https?://(localhost|([A-Za-z0-9-]+\\.)*localhost|127\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}|\\[::1\\])(:[0-9]+)?(/.*)?$" -}}
+{{- $terminalUrl := trim (toString (.Values.terminal.publicUrl | default "")) -}}
+{{- $publicTerminal := and (ne $terminalUrl "") (not (regexMatch $loopbackOrigin $terminalUrl)) -}}
+{{- $hosted := and .Values.terminal.enabled (or .Values.ingress.enabled $publicTerminal (has $profile (list "staging" "production"))) -}}
+{{- $googleOAuth := .Values.terminal.oauth.google.enabled | default false -}}
+{{- $microsoftOAuth := .Values.terminal.oauth.microsoft.enabled | default false -}}
+{{- $reservedTerminalEnv := list
+  "NODE_ENV" "PORT" "HOST"
+  "GATEWAY_URL" "AGENT_API_URL" "VEXA_ADMIN_API_URL" "VEXA_API_URL"
+  "NEXTAUTH_URL" "TERMINAL_URL" "TRANSCRIPTION_SERVICE_URL"
+  "VEXA_ADMIN_API_KEY" "VEXA_INTERNAL_API_SECRET" "TRANSCRIPTION_SERVICE_TOKEN"
+  "VEXA_API_KEY" "VEXA_BOT_API_KEY" "NEXTAUTH_SECRET"
+  "GOOGLE_CLIENT_ID" "GOOGLE_CLIENT_SECRET"
+  "MICROSOFT_CLIENT_ID" "MICROSOFT_CLIENT_SECRET" "MICROSOFT_TENANT_ID"
+  "VEXA_TERMINAL_SHARED_KEY_MODE" "VEXA_DIRECT_LOGIN_ALLOWED_EMAILS" "VEXA_TERMINAL_HOST_BIND"
+-}}
+{{- if .Values.terminal.enabled -}}
+{{- range .Values.terminal.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if has $name $reservedTerminalEnv -}}
+  {{- fail (printf "terminal.extraEnv may not override reserved Terminal setting %s; use the chart field and operator Secret" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if and $hosted (not (or $googleOAuth $microsoftOAuth)) -}}
+{{- fail "public/staging Terminal requires terminal.oauth.google.enabled or terminal.oauth.microsoft.enabled; cluster direct-login and shared-key modes are intentionally unavailable" -}}
+{{- end -}}
 {{- if .Values.terminal.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +52,13 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: terminal
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml (mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.terminal.runAsUser) "fsGroupChangePolicy" "OnRootMismatch")) | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -29,8 +66,8 @@ spec:
       containers:
         - name: terminal
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.terminal.image.repository }}:{{ .Values.global.imageTag | default .Values.terminal.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.terminal.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.terminal.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.terminal.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -59,18 +96,67 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: ADMIN_API_TOKEN
-            - name: VEXA_BOT_API_KEY
+            - name: VEXA_INTERNAL_API_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: VEXA_BOT_API_KEY
-                  optional: true
+                  key: INTERNAL_API_SECRET
+            - name: TRANSCRIPTION_SERVICE_URL
+              value: {{ .Values.meetingApi.transcriptionServiceUrl | default "" | quote }}
+            - name: TRANSCRIPTION_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: TRANSCRIPTION_SERVICE_TOKEN
+            - name: VEXA_TERMINAL_SHARED_KEY_MODE
+              value: {{ ternary "true" "false" .Values.terminal.sharedKeyMode | quote }}
+            {{- with .Values.terminal.directLoginAllowedEmails }}
+            # Default-off local passwordless debug path. Exact matches only; never bootstrap admin.
+            - name: VEXA_DIRECT_LOGIN_ALLOWED_EMAILS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if .Values.terminal.sharedKeyMode }}
+            # Explicit, local-only zero-login identity. Never reuse the bot service credential.
+            - name: VEXA_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: TERMINAL_SHARED_API_KEY
+            {{- end }}
             # next-auth session signing secret.
             - name: NEXTAUTH_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: NEXTAUTH_SECRET
+            {{- if $googleOAuth }}
+            # Hosted login identity is operator-owned. Neither provider credential is exposed through
+            # the user settings API or stored as plaintext deployment env in the chart.
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GOOGLE_CLIENT_ID
+            - name: GOOGLE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GOOGLE_CLIENT_SECRET
+            {{- end }}
+            {{- if $microsoftOAuth }}
+            - name: MICROSOFT_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MICROSOFT_CLIENT_ID
+            - name: MICROSOFT_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: MICROSOFT_CLIENT_SECRET
+            - name: MICROSOFT_TENANT_ID
+              value: {{ .Values.terminal.oauth.microsoft.tenantId | default "common" | quote }}
+            {{- end }}
             {{- if .Values.terminal.publicUrl }}
             # External origin (set when ingress/LB fronts the terminal) — cookie security + OAuth callbacks.
             - name: NEXTAUTH_URL
@@ -81,6 +167,11 @@ spec:
             {{- with .Values.terminal.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: next-cache
+              mountPath: /app/.next/cache
           startupProbe:
             httpGet:
               path: /
@@ -101,6 +192,11 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.terminal.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: next-cache
+          emptyDir: {}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

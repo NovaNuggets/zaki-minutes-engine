@@ -26,6 +26,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY src ./src
 
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN groupadd --gid 10002 vexa && \
+    useradd --uid 10002 --gid 10002 --create-home --shell /usr/sbin/nologin vexa
+USER 10002:10002
+
 EXPOSE 8001
 # python -m admin_api → create_app() + DB-from-DB_* env + ensure_schema() on startup.
 CMD ["python", "-m", "admin_api"]

@@ -8,7 +8,7 @@ import { useMeeting } from "./useMeeting";
 import { formatElapsed, meetingHealth, STALE_MS, type MeetingHealthKind } from "./meetingHealth";
 
 // Live statuses (mirrors the meeting surface header) — a feed we should watch for staleness/drops.
-const LIVE_STATUSES = new Set(["active", "live", "requested", "joining", "awaiting_admission", "needs_help", "stopping"]);
+const LIVE_STATUSES = new Set(["active", "live", "requested", "joining", "awaiting_admission", "needs_human_help", "stopping"]);
 
 // Only a real error is LOUD (red). A reconnect or a quiet meeting (no new lines) is benign — often just
 // silence, not a failure — so those get a muted, informational tone instead of the alarming red box.

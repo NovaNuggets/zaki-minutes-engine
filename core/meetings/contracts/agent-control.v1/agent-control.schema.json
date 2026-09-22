@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/agent-control.v1",
+  "title": "agent-control.v1",
+  "description": "Meetings-owned exact-row owner and canonical document-link responses consumed by Agent.",
+  "$defs": {
+    "PositiveRowId": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "description": "Canonical PostgreSQL signed-bigint row id encoded as decimal text."
+    },
+    "OwnerResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "user_id"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "user_id": { "$ref": "#/$defs/PositiveRowId" }
+      }
+    },
+    "DocLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "path", "title", "kind"],
+      "properties": {
+        "workspace": { "$ref": "#/$defs/PositiveRowId" },
+        "path": {
+          "type": "string",
+          "pattern": "^kg/entities/meeting/[1-9][0-9]{0,18}\\.md$",
+          "maxLength": 42
+        },
+        "title": {
+          "type": "string",
+          "pattern": "^Meeting [1-9][0-9]{0,18}$",
+          "maxLength": 27
+        },
+        "kind": { "const": "meeting" }
+      }
+    },
+    "DocLinkResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meeting_id", "doc"],
+      "properties": {
+        "meeting_id": { "$ref": "#/$defs/PositiveRowId" },
+        "doc": { "$ref": "#/$defs/DocLink" }
+      }
+    }
+  }
+}

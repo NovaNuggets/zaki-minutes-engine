@@ -7,8 +7,8 @@ collaborators:
   * **object storage (MinIO/S3)** — each chunk is uploaded under a per-(recording, session, type)
     key; finalize concatenates the chunks into a master and uploads that. Expressed as a ``Storage``
     Protocol: ``upload(key, data, content_type)``, ``list(prefix)``, ``get(key)``.
-  * **the meeting store** — resolve the ``MeetingSession`` by ``session_uid`` (the upload arrives
-    with the bot's ``connectionId``), and read/modify-under-lock ``meeting.data['recordings']``.
+  * **the meeting store** — resolve the ``MeetingSession`` by ``(meeting_id, session_uid)`` (the
+    upload carries both), and read/modify-under-lock ``meeting.data['recordings']``.
     Expressed as a ``RecordingRepo`` Protocol.
 
 Each is a ``typing.Protocol`` so the app depends on BEHAVIOR, not a concrete client. ``adapters.py``
@@ -23,6 +23,7 @@ from typing import Optional, Protocol, runtime_checkable
 from ..meeting_writes import MEETING_WRITE_LOCK_NAMESPACE
 
 RECORDING_CHUNK_LOCK_NAMESPACE = 23116
+RECORDING_MANIFEST_LOCK_NAMESPACE = 23117
 
 
 class RecordingWriteRefused(RuntimeError):
@@ -62,9 +63,9 @@ class Storage(Protocol):
 class RecordingRepo(Protocol):
     """The DB side of recordings: resolve the session, read/modify ``meeting.data['recordings']``."""
 
-    async def find_session(self, session_uid: str) -> Optional[dict]:
-        """The ``MeetingSession`` for ``session_uid`` → ``{meeting_id, session_uid}`` (the bot's
-        ``connectionId``), or ``None`` when no session exists yet (upload before spawn)."""
+    async def find_session(self, *, meeting_id: int, session_uid: str) -> Optional[dict]:
+        """The exact ``MeetingSession`` for ``(meeting_id, session_uid)``, or ``None`` when that
+        meeting-scoped session does not exist yet (upload before spawn)."""
         ...
 
     def recording_write(self, meeting_id: int) -> AbstractAsyncContextManager[None]:
@@ -76,6 +77,17 @@ class RecordingRepo(Protocol):
 
     def chunk_write(self, key: str) -> AbstractAsyncContextManager[None]:
         """Serialize one deterministic chunk key across object write, JSONB fold and compensation."""
+        ...
+
+    def manifest_write(
+        self, recording_id: int, media_type: str
+    ) -> AbstractAsyncContextManager[None]:
+        """Serialize every chunk mutation and master finalization for one media manifest.
+
+        The lock is cross-process in production. It prevents a finalize-on-read from observing a
+        pre-final snapshot while a final chunk is being uploaded, and makes the stamped master
+        immutable with respect to later chunks.
+        """
         ...
 
     async def register_recording_prefix(self, meeting_id: int, prefix: str) -> None:
@@ -102,5 +114,9 @@ class RecordingRepo(Protocol):
         ...
 
     async def list_meeting_recordings(self, user_id: int) -> list[dict]:
-        """Every recording across the user's meetings (for ``GET /recordings``)."""
+        """The user's request-time audio-authorized recordings.
+
+        Past-expiry, withdrawn, erasing, or malformed retention authority is filtered here before
+        list/detail/master/raw routes can resolve an object key.
+        """
         ...

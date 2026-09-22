@@ -12,9 +12,40 @@ services:
   # ─── Infrastructure ───────────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    # Minutes consent/erasure fences are privacy state: never evict acknowledged keys and fsync
+    # every accepted AOF write. Capacity exhaustion must fail writes loudly (noeviction). The
+    # password stays in env; the command contains only a container-side variable reference.
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-vexa-redis-password}
+      - REDIS_MAXMEMORY=${REDIS_MAXMEMORY:-512mb}
+    command:
+      - sh
+      - -ec
+      - |
+        redis_password_length="$${#REDIS_PASSWORD}"
+        if [ "$$redis_password_length" -lt 16 ] || [ "$$redis_password_length" -gt 512 ]; then
+          echo "REDIS_PASSWORD must be 16..512 URI-userinfo-safe characters (A-Z a-z 0-9 . _ ~ -)" >&2
+          exit 64
+        fi
+        case "$$REDIS_PASSWORD" in
+          *[!A-Za-z0-9._~-]*)
+            echo "REDIS_PASSWORD must be 16..512 URI-userinfo-safe characters (A-Z a-z 0-9 . _ ~ -)" >&2
+            exit 64
+            ;;
+        esac
+        printf '%s\n' "$$REDIS_MAXMEMORY" | grep -Eq '^[1-9][0-9]*(b|kb|mb|gb)$$' || {
+          echo "REDIS_MAXMEMORY must be a positive b/kb/mb/gb quantity" >&2
+          exit 64
+        }
+        exec redis-server --appendonly yes --appendfsync always --maxmemory "$$REDIS_MAXMEMORY" --maxmemory-policy noeviction --requirepass "$$REDIS_PASSWORD"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Health means both that anonymous access is rejected and authenticated access succeeds.
+      test:
+        - CMD-SHELL
+        - |
+          unauth="$$(redis-cli ping 2>&1 || true)"
+          case "$$unauth" in NOAUTH*) ;; *) exit 1 ;; esac
+          REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -qx PONG
       interval: 5s
       timeout: 3s
       retries: 5
@@ -96,8 +127,17 @@ services:
       - DB_NAME=${DB_NAME:-vexa}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-postgres}
+      - DB_SSL_MODE=${DB_SSL_MODE:-disable}
       - ADMIN_API_TOKEN=${ADMIN_TOKEN:-changeme}
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
+      # This bundled topology has an unscoped Agent Redis connection and is therefore not a Minutes
+      # launch profile. Keep policy inert even when an operator accidentally exports Minutes flags.
+      - ZAKI_MINUTES_CAPTURE_ENABLED=false
+      - ZAKI_MINUTES_READ_ENABLED=false
+      - ZAKI_MINUTES_AUTO_JOIN_ENABLED=
+      - ZAKI_MINUTES_MANAGED_ONLY=
+      - VEXA_USER_MODEL_ALLOWED_HOSTS=${VEXA_USER_MODEL_ALLOWED_HOSTS:-}
+      - VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS=${VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health').status==200 else 1)"]
@@ -133,12 +173,15 @@ services:
         required: false
     environment:
       - BROWSER_IMAGE=${BROWSER_IMAGE:-vexaai/vexa-bot:v012}
+      # Separate image selection is the capability handshake for invocation.v2. Empty means the
+      # runtime has no meeting-bot-v2 profile, even if ordinary meeting-bot is installed.
+      - MINUTES_BROWSER_IMAGE=
       # The per-dispatch WORKER image the runtime spawns (control-plane ⊥ worker split). AGENT_WORKER_IMAGE
       # is set EXPLICITLY (no suffix derivation); AGENT_IMAGE now matches the built control-plane tag.
       - AGENT_IMAGE=${AGENT_IMAGE:-vexaai/v012-agent-api:${IMAGE_TAG:-dev}}
       - AGENT_WORKER_IMAGE=${AGENT_WORKER_IMAGE:-vexaai/v012-agent-worker:${IMAGE_TAG:-dev}}
       - VEXA_AGENT_SRC_MOUNT=${VEXA_AGENT_SRC_MOUNT:-}
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-vexa-redis-password}@redis:6379/0
       # The Runtime brokers model credentials into spawned agents. Subscription credentials may be
       # mounted from the host; API-style Anthropic/OpenRouter env is forwarded from this trusted service.
       - HOST_CLAUDE_CREDENTIALS=${HOST_CLAUDE_CREDENTIALS:-}
@@ -149,7 +192,59 @@ services:
       - ANTHROPIC_DEFAULT_OPUS_MODEL=${ANTHROPIC_DEFAULT_OPUS_MODEL:-}
       - ANTHROPIC_DEFAULT_SONNET_MODEL=${ANTHROPIC_DEFAULT_SONNET_MODEL:-}
       - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
-      - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
+      # The shared .env also carries the Minutes read bearer for agent-api. Runtime must never
+      # inherit it (and therefore can never forward it to a spawned workspace worker).
+      - ZAKI_MINUTES_CAPTURE_ENABLED=false
+      - ZAKI_MINUTES_INVOCATION_V2_ENABLED=false
+      - ZAKI_MINUTES_READ_ENABLED=false
+      - ZAKI_MINUTES_AUTO_JOIN_ENABLED=false
+      - ZAKI_MINUTES_MANAGED_ONLY=false
+      - ZAKI_MINUTES_READ_BASE_URL=
+      - ZAKI_READ_TOKEN_MINUTES=
+      - ZAKI_MINUTES_HUB_TOKEN=
+      - ZAKI_AGENT_ERASURE_SIGNING_KEY_ID=
+      - ZAKI_AGENT_ERASURE_SIGNING_SECRET=
+      - ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID=
+      - ZAKI_AGENT_ERASURE_VERIFICATION_SECRET=
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET=
+      - ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_SIGNING_SECRET=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET=
+      - ZAKI_MINUTES_FINALIZED_ENABLED=false
+      - ZAKI_MINUTES_FINALIZED_URL=
+      - ZAKI_MINUTES_FINALIZED_KEY_ID=
+      - ZAKI_MINUTES_FINALIZED_SECRET=
+      - MINUTES_TTL_ENABLED=false
+      - MINUTES_TTL_INTERVAL_S=60
+      - MINUTES_TTL_BATCH_SIZE=100
+      # .env is shared only to source the provider credentials runtime brokers into authenticated
+      # Agent workloads. Explicitly scrub every unrelated credential inherited through env_file.
+      - ADMIN_TOKEN=
+      - INTERNAL_API_SECRET=
+      - GATEWAY_IDENTITY_SECRET=
+      - GATEWAY_IDENTITY_PREVIOUS_SECRET=
+      - MEETING_TOKEN_SECRET=
+      - REDIS_PASSWORD=
+      - VEXA_DISPATCH_SIGNING_KEY=
+      - NEXTAUTH_SECRET=
+      - DB_PASSWORD=
+      - MINIO_ROOT_USER=
+      - MINIO_ROOT_PASSWORD=
+      - MINIO_ACCESS_KEY=
+      - MINIO_SECRET_KEY=
+      - TRANSCRIPTION_SERVICE_TOKEN=
+      - GOOGLE_CLIENT_SECRET=
+      - MICROSOFT_CLIENT_SECRET=
+      - VEXA_BOT_API_KEY=
+      - VEXA_API_KEY=
+      - CLAUDE_CODE_OAUTH_TOKEN=
+      - RUNTIME_CONTROL_SECRET=${RUNTIME_CONTROL_SECRET:-vexa-runtime-control-secret}
+      - RUNTIME_CALLBACK_SECRET=${RUNTIME_CALLBACK_SECRET:-vexa-runtime-callback-secret}
+      # Runtime injects its callback credential only for these exact service origins; arbitrary
+      # callback URLs never receive it. Meeting-api is the sole callback consumer.
+      - RUNTIME_CALLBACK_TRUSTED_ORIGINS=http://meeting-api:8080
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # Spawn the bot onto THIS compose network so it resolves meeting-api:8080 (lifecycle callback)
       # + redis. Must equal the project-prefixed network name (DockerBackend → HostConfig.NetworkMode).
@@ -207,6 +302,24 @@ services:
     environment:
       - VEXA_AGENT_API_PORT=8100
       - VEXA_RUNTIME_API_URL=http://runtime:8090
+      - VEXA_RUNTIME_CONTROL_SECRET=${RUNTIME_CONTROL_SECRET:-vexa-runtime-control-secret}
+      # The shared provider env_file also carries unrelated stack credentials. Agent keeps only
+      # its namespaced internal/runtime controls plus provider, STT, dispatch, and bot-service keys.
+      - ADMIN_TOKEN=
+      - INTERNAL_API_SECRET=
+      - RUNTIME_CONTROL_SECRET=
+      - RUNTIME_CALLBACK_SECRET=
+      - MEETING_TOKEN_SECRET=
+      - REDIS_PASSWORD=
+      - NEXTAUTH_SECRET=
+      - DB_PASSWORD=
+      - MINIO_ROOT_USER=
+      - MINIO_ROOT_PASSWORD=
+      - MINIO_ACCESS_KEY=
+      - MINIO_SECRET_KEY=
+      - GOOGLE_CLIENT_SECRET=
+      - MICROSOFT_CLIENT_SECRET=
+      - VEXA_API_KEY=
       # P0 SSE ownership: agent-api verifies meeting-row ownership before opening /api/meeting/stream (owner-scoped like /ws).
       - VEXA_MEETING_API_URL=http://meeting-api:8080
       # How the runtime's scheduler reaches this service's /invocations sink when a routine fires (MVP2).
@@ -217,11 +330,47 @@ services:
       # (policy/members.json in the workspace git repo stays authoritative; this is the listing cache).
       - VEXA_ADMIN_API_URL=http://admin-api:8001
       - VEXA_INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
-      # Identity (P20): agent-api derives the subject from the gateway-injected X-User-Id. Until the terminal
-      # routes through the gateway (Stage 4), it still reaches agent-api directly with no header, so this
-      # single-user fallback keeps the dev stack working (shared subject). Remove it once the gateway fronts
-      # agent-api and X-User-Id is always present — then a missing header fails closed (401).
-      - VEXA_AGENT_DEFAULT_SUBJECT=${VEXA_AGENT_DEFAULT_SUBJECT:-u_live}
+      - GATEWAY_IDENTITY_SECRET=${GATEWAY_IDENTITY_SECRET:-vexa-gateway-identity-secret-local-v1}
+      - GATEWAY_IDENTITY_PREVIOUS_SECRET=${GATEWAY_IDENTITY_PREVIOUS_SECRET:-}
+      - VEXA_REQUIRE_GATEWAY_IDENTITY=true
+      # The bundled Agent has an unscoped Redis URL, so it is not a valid Minutes consumer. Preserve
+      # the operator's intent only for the startup guard below; all application-facing Minutes
+      # boolean gates are forced false and credentials are shadowed empty (including env_file).
+      - VEXA_DEPLOY_MINUTES_CAPTURE_REQUESTED=${ZAKI_MINUTES_CAPTURE_ENABLED:-false}
+      - VEXA_DEPLOY_MINUTES_READ_REQUESTED=${ZAKI_MINUTES_READ_ENABLED:-false}
+      - ZAKI_MINUTES_CAPTURE_ENABLED=false
+      - ZAKI_MINUTES_INVOCATION_V2_ENABLED=false
+      - MINUTES_BROWSER_IMAGE=
+      - ZAKI_MINUTES_READ_ENABLED=false
+      - ZAKI_MINUTES_AUTO_JOIN_ENABLED=false
+      - ZAKI_MINUTES_MANAGED_ONLY=false
+      - ZAKI_MINUTES_READ_BASE_URL=
+      - ZAKI_READ_TOKEN_MINUTES=
+      - ZAKI_MINUTES_HUB_TOKEN=
+      - ZAKI_AGENT_ERASURE_SIGNING_KEY_ID=
+      - ZAKI_AGENT_ERASURE_SIGNING_SECRET=
+      # The shared env file also contains meeting-api-only projections. Explicitly clear them here.
+      - ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID=
+      - ZAKI_AGENT_ERASURE_VERIFICATION_SECRET=
+      # The previous Agent verifier is the exception: agent-api replays its own durable receipts,
+      # but it cannot use this pair to sign new ones and never forwards it to runtime/workers.
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=${ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID:-}
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET=${ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET:-}
+      - ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_SIGNING_SECRET=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET=
+      - ZAKI_MINUTES_FINALIZED_ENABLED=false
+      - ZAKI_MINUTES_FINALIZED_URL=
+      - ZAKI_MINUTES_FINALIZED_KEY_ID=
+      - ZAKI_MINUTES_FINALIZED_SECRET=
+      - MINUTES_TTL_ENABLED=false
+      - MINUTES_TTL_INTERVAL_S=60
+      - MINUTES_TTL_BATCH_SIZE=100
+      # Identity (P20): Terminal reaches agent-api through the gateway, which injects X-User-Id.
+      # Hosted/default topology has no shared owner fallback. A gateway-less single-user self-host may
+      # opt into one explicitly, but it must never be used for multi-tenant meeting attribution.
+      - VEXA_AGENT_DEFAULT_SUBJECT=${VEXA_AGENT_DEFAULT_SUBJECT:-}
       - VEXA_AGENT_MODEL=${VEXA_AGENT_MODEL:-}
       - VEXA_MEETING_MODEL=${VEXA_MEETING_MODEL:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -235,7 +384,7 @@ services:
       - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
       - VEXA_LOG_LEVEL=${LOG_LEVEL:-info}
       # Stream primitive — the per-dispatch redis Streams the control plane relays (unit:<id>:out → SSE).
-      - VEXA_REDIS_URL=redis://redis:6379/0
+      - VEXA_REDIS_URL=redis://:${REDIS_PASSWORD:-vexa-redis-password}@redis:6379/0
       # The backing the Runtime binds into the worker as the workspace store (the project-prefixed volume).
       - VEXA_WORKSPACE_MOUNT_SOURCE=${COMPOSE_PROJECT_NAME:-vexa-v012}_agent-workspaces
       # Three-tier mount stack (AMENDMENT 4): the platform-owned GLOBAL SYSTEM workspace (_global) mounted
@@ -248,6 +397,19 @@ services:
       # 'Add bot from URL' (terminal): agent-api forwards POST /api/meeting/bot → the gateway POST /bots.
       - VEXA_GATEWAY_URL=http://gateway:8000
       - VEXA_BOT_API_KEY=${VEXA_BOT_API_KEY:-}
+    command:
+      - sh
+      - -ec
+      - |
+        capture="$$(printf '%s' "$$VEXA_DEPLOY_MINUTES_CAPTURE_REQUESTED" | tr '[:upper:]' '[:lower:]')"
+        read="$$(printf '%s' "$$VEXA_DEPLOY_MINUTES_READ_REQUESTED" | tr '[:upper:]' '[:lower:]')"
+        case "$$capture,$$read" in
+          true,*|1,*|yes,*|on,*|*,true|*,1|*,yes|*,on)
+            echo "Minutes capture/read cannot use the bundled Compose Agent: use external Nullalis over the bounded HTTP erasure fan-out" >&2
+            exit 78
+            ;;
+        esac
+        exec uvicorn control_plane.api:app --host 0.0.0.0 --port 8100
     volumes:
       # The Workspace store backing (dev): the worker mounts the subject's subdir; agent-api reads the tree.
       - agent-workspaces:/workspaces
@@ -285,17 +447,46 @@ services:
       - DB_NAME=${DB_NAME:-vexa}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD:-postgres}
-      - REDIS_URL=redis://redis:6379/0
+      - DB_SSL_MODE=${DB_SSL_MODE:-disable}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-vexa-redis-password}@redis:6379/0
       - RUNTIME_API_URL=http://runtime:8090
+      - RUNTIME_CONTROL_SECRET=${RUNTIME_CONTROL_SECRET:-vexa-runtime-control-secret}
+      - RUNTIME_CALLBACK_SECRET=${RUNTIME_CALLBACK_SECRET:-vexa-runtime-callback-secret}
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
-      # The background sweeps' internal lookups: auto-join fetches per-user spawn context
-      # (/internal/users/{id}/bot-context) and calendar sync discovers connected ICS feeds
-      # (/internal/calendar-configs). Unset -> calendar sync no-ops, auto-join spawns uncapped.
+      # Calendar sync discovers connected ICS feeds over the internal Identity edge. Launch-v1
+      # calendar auto-join is not composed, so this URL never enables an ordinary spawn fallback.
       - ADMIN_API_URL=http://admin-api:8001
-      # MeetingToken is signed (mint) AND verified (recordings upload) with ADMIN_TOKEN — the SAME
-      # admin secret admin-api holds (admin-api gets ADMIN_API_TOKEN=${ADMIN_TOKEN}). Exactly like
-      # main (meeting-api ADMIN_TOKEN = admin-api ADMIN_API_TOKEN). __main__ passes token_secret=ADMIN_TOKEN.
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-changeme}
+      # The bundled Agent has an unscoped Redis connection, so Compose is deliberately not a
+      # Minutes launch topology. Every Minutes knob remains inert even if the host exports it.
+      - AGENT_API_URL=http://agent-api:8100
+      - ZAKI_MINUTES_CAPTURE_ENABLED=false
+      - ZAKI_MINUTES_INVOCATION_V2_ENABLED=false
+      - ZAKI_MINUTES_READ_ENABLED=false
+      # Launch v1 never calendar-spawns through the ordinary Vexa path. Enabling this reserved
+      # gate fails boot until managed authority is implemented. This non-Minutes reference stack
+      # keeps ordinary upstream POST /bots available.
+      - ZAKI_MINUTES_AUTO_JOIN_ENABLED=false
+      - ZAKI_MINUTES_MANAGED_ONLY=false
+      - ZAKI_READ_TOKEN_MINUTES=
+      - ZAKI_MINUTES_HUB_TOKEN=
+      - ZAKI_AGENT_ERASURE_VERIFICATION_KEY_ID=
+      - ZAKI_AGENT_ERASURE_VERIFICATION_SECRET=
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=${ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID:-}
+      - ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET=${ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET:-}
+      - ZAKI_MINUTES_ERASURE_SIGNING_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_SIGNING_SECRET=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_KEY_ID=
+      - ZAKI_MINUTES_ERASURE_PREVIOUS_VERIFICATION_SECRET=
+      - ZAKI_MINUTES_FINALIZED_ENABLED=false
+      - ZAKI_MINUTES_FINALIZED_URL=
+      - ZAKI_MINUTES_FINALIZED_KEY_ID=
+      - ZAKI_MINUTES_FINALIZED_SECRET=
+      - MINUTES_TTL_ENABLED=false
+      - MINUTES_TTL_INTERVAL_S=60
+      - MINUTES_TTL_BATCH_SIZE=100
+      # Dedicated per-spawn MeetingToken signer/verifier. Admin-api's ADMIN_TOKEN is deliberately
+      # absent: administrative auth and bot-scoped capability tokens are separate boundaries.
+      - MEETING_TOKEN_SECRET=${MEETING_TOKEN_SECRET:-vexa-meeting-token-secret}
       # STT the spawned bot transcribes with — bot_spawn threads these into the invocation (registry
       # `stt` resource; the funded internal@vexa.ai token). Unset → bot joins+captures but no transcript.
       - TRANSCRIPTION_SERVICE_URL=${TRANSCRIPTION_SERVICE_URL:-}
@@ -342,8 +533,9 @@ services:
     environment:
       - ADMIN_API_URL=http://admin-api:8001
       - MEETING_API_URL=http://meeting-api:8080
-      - REDIS_URL=redis://redis:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-vexa-redis-password}@redis:6379/0
       - INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
+      - GATEWAY_IDENTITY_SECRET=${GATEWAY_IDENTITY_SECRET:-vexa-gateway-identity-secret-local-v1}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.
       # ON by default with generous limits (owner ruling — protection that ships dark protects
@@ -443,7 +635,14 @@ services:
       - VEXA_ADMIN_API_URL=http://admin-api:8001
       - VEXA_API_URL=http://gateway:8000
       - VEXA_ADMIN_API_KEY=${ADMIN_TOKEN:-changeme}
-      - VEXA_BOT_API_KEY=${VEXA_BOT_API_KEY:-}
+      # Hosted/default mode is cookie-only. A zero-login key must be an explicit local opt-in;
+      # never pass the bot service credential to the browser-facing proxy.
+      - VEXA_TERMINAL_SHARED_KEY_MODE=${VEXA_TERMINAL_SHARED_KEY_MODE:-false}
+      # The compose publication above is fixed to 127.0.0.1; privileged local auth verifies this
+      # actual host-side bind in addition to the declared NEXTAUTH_URL.
+      - VEXA_TERMINAL_HOST_BIND=127.0.0.1
+      - VEXA_API_KEY=${VEXA_API_KEY:-}
+      - VEXA_DIRECT_LOGIN_ALLOWED_EMAILS=${VEXA_DIRECT_LOGIN_ALLOWED_EMAILS:-}
       # Hidden admin panel (/api/admin/*): comma-separated email allowlist — EMPTY = the panel is off
       # for everyone. Identity is VERIFIED against admin-api /internal/validate over the internal-tier
       # secret (never trusted from a cookie), and the same secret fronts agent-api's admin overview.
@@ -462,8 +661,9 @@ services:
       # Empty by default (localhost). Setting an https:// value also flips auth cookies to Secure.
       - NEXTAUTH_URL=${NEXTAUTH_URL:-}
       # OAuth login providers (NextAuth). Each provider self-gates on its creds: set BOTH the id and
-      # secret to expose that sign-in button on the login page; leave empty to hide it (the dev
-      # type-any-email login still works). Register the redirect URI in the provider console:
+      # secret to expose that sign-in button on the login page; leave empty to hide it. Direct email
+      # login is independently default-off and exact-allowlist/loopback-only. Register the redirect
+      # URI in the provider console:
       #   Google    → ${NEXTAUTH_URL}/api/auth/callback/google
       #   Microsoft → ${NEXTAUTH_URL}/api/auth/callback/microsoft
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}

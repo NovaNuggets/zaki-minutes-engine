@@ -27,6 +27,8 @@ flowchart LR
     postgres["postgres"]
     minio["minio"]
   end
+  hub_api["Minutes Hub BFF"]
+  nullalis_agent["Canonical Nullalis Agent"]
   slim["slim"]
   extension["extension"]
   terminal["terminal"]
@@ -35,7 +37,13 @@ flowchart LR
   meeting_api -->|"JDBC"| postgres
   meeting_api -->|"HTTPS"| minio
   meeting_api -->|"HTTPS"| runtime
+  meeting_api -->|"HTTPS"| hub_api
+  hub_api -->|"HTTPS"| meeting_api
+  meeting_api -->|"HTTPS"| nullalis_agent
+  agent_api -->|"HTTPS"| meeting_api
   agent_api -->|"HTTPS"| runtime
+  agent_api -->|"HTTPS"| meeting_api
+  nullalis_agent -->|"HTTPS"| meeting_api
   mcp -->|"HTTPS"| gateway
   gateway -->|"HTTPS"| meeting_api
   gateway -->|"HTTPS"| agent_api

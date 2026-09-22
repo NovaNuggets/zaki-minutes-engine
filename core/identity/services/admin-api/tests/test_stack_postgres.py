@@ -14,7 +14,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
 from admin_api.schema.models import (
-    APIToken, Base, Meeting, MeetingSession, Transcription, User,
+    APIToken, Base, Meeting, MeetingSession, MinutesErasureReceipt, Transcription, User,
 )
 from admin_api.schema.sync import ensure_schema_sync
 
@@ -22,8 +22,19 @@ from conftest import requires_docker
 
 pytestmark = requires_docker
 
-EXPECTED_TABLES = {"users", "api_tokens", "meetings", "transcriptions", "meeting_sessions"}
+EXPECTED_TABLES = {
+    "users", "api_tokens", "meetings", "transcriptions", "meeting_sessions",
+    "minutes_erasure_receipts",
+}
 DEAD_TABLES = {"recordings", "media_files"}
+BIGINT_COLUMNS = {
+    "users": ("id",),
+    "api_tokens": ("id", "user_id"),
+    "meetings": ("id", "user_id"),
+    "minutes_erasure_receipts": ("user_id", "meeting_id"),
+    "transcriptions": ("id", "meeting_id"),
+    "meeting_sessions": ("id", "meeting_id"),
+}
 
 
 @pytest.fixture()
@@ -62,6 +73,69 @@ def test_ensure_schema_is_idempotent(engine):
     ensure_schema_sync(engine, Base)   # third run = no-op
     after = set(inspect(engine).get_table_names())
     assert before == after
+
+
+def test_ensure_schema_widens_legacy_int4_ids_and_sequences(engine):
+    """The sealed Minutes wire accepts signed-bigint ids, so an existing v0.12 int4 database
+    must be upgraded in place before the service can truthfully serve that contract."""
+    with engine.begin() as conn:
+        for table, columns in reversed(tuple(BIGINT_COLUMNS.items())):
+            for column in columns:
+                conn.execute(text(
+                    f'ALTER TABLE "{table}" ALTER COLUMN "{column}" TYPE INTEGER'
+                ))
+        for table in ("users", "api_tokens", "meetings", "transcriptions", "meeting_sessions"):
+            conn.execute(text(f'ALTER SEQUENCE "{table}_id_seq" AS INTEGER'))
+
+    ensure_schema_sync(engine, Base)
+
+    inspector = inspect(engine)
+    for table, columns in BIGINT_COLUMNS.items():
+        actual = {column["name"]: type(column["type"]).__name__.upper()
+                  for column in inspector.get_columns(table)}
+        assert all(actual[column] == "BIGINT" for column in columns), (table, actual)
+    with engine.connect() as conn:
+        sequence_types = {
+            row[0]: row[1]
+            for row in conn.execute(text(
+                "SELECT sequence_name, data_type FROM information_schema.sequences "
+                "WHERE sequence_schema = current_schema()"
+            ))
+        }
+    for table in ("users", "api_tokens", "meetings", "transcriptions", "meeting_sessions"):
+        assert sequence_types[f"{table}_id_seq"] == "bigint"
+
+
+def test_signed_bigint_id_boundary_roundtrips_across_all_minutes_relations(engine):
+    maximum = 2**63 - 1
+    with Session(engine) as session:
+        session.add(User(id=maximum, email="bigint@vexa.ai", max_concurrent_bots=3))
+        session.add(APIToken(
+            id=maximum, token="vxa_bigint_boundary", user_id=maximum, scopes=["bot"],
+        ))
+        session.add(Meeting(
+            id=maximum, user_id=maximum, platform="google_meet",
+            platform_specific_id="bigint-boundary", status="completed",
+        ))
+        session.add(Transcription(
+            id=maximum, meeting_id=maximum, start_time=0.0, end_time=1.0, text="bounded",
+        ))
+        session.add(MeetingSession(
+            id=maximum, meeting_id=maximum, session_uid="bigint-boundary",
+        ))
+        session.add(MinutesErasureReceipt(
+            user_id=maximum, meeting_id=maximum,
+            erased_at="2026-07-15T12:00:00+00:00",
+            policy_version="minutes-capture.v1", receipt={"version": "erasure.v1"},
+        ))
+        session.commit()
+
+    with Session(engine) as session:
+        assert session.get(User, maximum).id == maximum
+        assert session.get(Meeting, maximum).user_id == maximum
+        assert session.get(Transcription, maximum).meeting_id == maximum
+        receipt = session.get(MinutesErasureReceipt, (maximum, maximum))
+        assert receipt.meeting_id == maximum
 
 
 def test_fk_orphan_token_rejected(engine):

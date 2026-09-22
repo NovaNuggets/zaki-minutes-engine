@@ -1,3 +1,19 @@
+{{- $reservedGatewayEnv := list
+  "ADMIN_API_URL" "MEETING_API_URL" "AGENT_API_URL" "REDIS_URL" "INTERNAL_API_SECRET"
+  "GATEWAY_IDENTITY_SECRET" "LOG_LEVEL"
+  "GUARD_ENABLED" "GUARD_WS_ENABLED" "GUARD_ENABLE_REDIS" "GUARD_RATE_LIMIT_RPM"
+  "GUARD_RATE_LIMIT_WINDOW" "GUARD_AUTO_BAN_THRESHOLD" "GUARD_AUTO_BAN_DURATION"
+  "GUARD_IP_WHITELIST" "GUARD_IP_BLACKLIST" "GUARD_TRUSTED_PROXIES"
+  "GUARD_TRUST_X_FORWARDED_PROTO"
+-}}
+{{- if .Values.gateway.enabled -}}
+{{- range .Values.gateway.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if has $name $reservedGatewayEnv -}}
+  {{- fail (printf "gateway.extraEnv may not override chart-owned setting %s" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.gateway.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +34,13 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml (mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.gateway.runAsUser) "fsGroupChangePolicy" "OnRootMismatch")) | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -29,8 +48,8 @@ spec:
       containers:
         - name: gateway
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.gateway.image.repository }}:{{ .Values.global.imageTag | default .Values.gateway.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.gateway.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.gateway.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.gateway.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -45,12 +64,20 @@ spec:
             - name: AGENT_API_URL
               value: "http://{{ include "vexa.componentName" (list . "agent-api") }}:{{ .Values.agentApi.service.port }}"
             - name: REDIS_URL
-              value: {{ include "vexa.redisUrl" . | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: REDIS_URL
             - name: INTERNAL_API_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
+            - name: GATEWAY_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: GATEWAY_IDENTITY_SECRET
             - name: LOG_LEVEL
               value: {{ .Values.gateway.logLevel | default "info" | quote }}
             # fastapi-guard edge layer (edge_guard.py): per-IP throttle + auto-ban at the edge.
@@ -84,6 +111,9 @@ spec:
             {{- with .Values.gateway.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           # Decouple slow first boots (cold image + dependency wait) from liveness — liveness only
           # starts once startup succeeds, so a slow boot never triggers a restart loop.
           startupProbe:
@@ -106,6 +136,9 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -63,6 +63,24 @@ def _build_scheduler():
     return Scheduler(client, dispatch=_http_dispatch)
 
 
+def _build_runtime_stores(redis_url: str | None):
+    """Build workload and callback stores over one Redis connection.
+
+    The development-only no-Redis path remains in-memory. Every shipped deploy supplies
+    ``REDIS_URL``, preserving both callback destinations and pending deliveries across restart.
+    """
+
+    from .callbacks import InMemoryPendingStore, RedisPendingStore
+    from .store import InMemoryStore, RedisStore
+
+    if not redis_url:
+        return InMemoryStore(), InMemoryPendingStore()
+    import redis as redis_lib
+
+    client = redis_lib.from_url(redis_url, decode_responses=True)
+    return RedisStore(client), RedisPendingStore(client)
+
+
 def _start_ticker(scheduler) -> None:
     """Run the scheduler's tick() loop in a daemon thread (a real deployment loops tick on an
     interval; the eval calls tick() explicitly under a FakeClock). Recovers orphans on startup."""
@@ -123,17 +141,25 @@ def build_production_app():
     """Wire the runtime API with the env-selected spawn backend + the env-driven profile registry,
     plus the durable cron scheduler (REDIS_URL) with a background tick loop."""
     from .api import create_app
+    from .callbacks import CallbackQueue
     from .config_preflight import preflight
     from .kernel import Runtime
-    from .profiles import apply_command_overrides, default_registry, worker_image_for
+    from .profiles import (
+        agent_profile_enabled,
+        apply_command_overrides,
+        default_registry,
+        worker_image_for,
+    )
 
     # config.v1 boot preflight (ADR-0026): validate the declaration against the env — the runtime has
-    # no required-explicit keys today, so this logs the capability tri-states (scheduler · bot_spawn ·
-    # agent_spawn · model_inference, incl. the credentials-file probe that catches a SET
+    # requires the callback credential and its exact trusted origins, then logs the capability
+    # tri-states (scheduler · bot_spawn · minutes_bot_v2 · agent_spawn · model_inference, including
+    # the credentials-file probe that catches a SET
     # HOST_CLAUDE_CREDENTIALS whose host file is absent) so a deploy's config completeness is visible
     # in the boot log and on /health BEFORE any workload runs. Capabilities never block boot.
     preflight()
 
+    bundled_agent_enabled = agent_profile_enabled()
     backend = _build_backend()
     # The agent worker is its OWN image (core/agent/worker/Dockerfile — claude-code + node + the
     # `worker` package), NOT a rename of the agent-api image. With the Docker backend we ensure that
@@ -143,13 +169,16 @@ def build_production_app():
     # than silently spawning agent-api bytes that die with 'No module named worker'. Other backends
     # (k8s/process) pull by full ref themselves, so we just derive AGENT_WORKER_IMAGE.
     agent_image = os.getenv("AGENT_IMAGE", "")
-    if agent_image:
+    if bundled_agent_enabled and agent_image:
         target = worker_image_for(agent_image)
         if hasattr(backend, "ensure_worker_image"):
             try:
                 target = backend.ensure_worker_image(target)
             except Exception as e:  # noqa: BLE001 — startup image ensure must never crash the boot
-                logger.warning("worker image ensure failed: %s; keeping %s", e, target)
+                logger.warning(
+                    "worker image ensure failed (%s); keeping configured target",
+                    type(e).__name__,
+                )
         os.environ["AGENT_WORKER_IMAGE"] = target
 
     scheduler = _build_scheduler()
@@ -158,7 +187,46 @@ def build_production_app():
     # apply_command_overrides is a no-op unless BOT_COMMAND / AGENT_WORKER_COMMAND are set (the
     # process-backend / `lite` case) — docker/k8s keep the image entrypoints unchanged.
     profiles = apply_command_overrides(default_registry())
-    runtime = Runtime(backend=backend, profiles=profiles, grace_sec=_kernel_grace_sec())
+    redis_url = os.getenv("REDIS_URL")
+    workload_store, callback_store = _build_runtime_stores(redis_url)
+    runtime = Runtime(
+        backend=backend,
+        profiles=profiles,
+        grace_sec=_kernel_grace_sec(),
+        store=workload_store,
+    )
+    control_secret = os.getenv("RUNTIME_CONTROL_SECRET") or ""
+    if not control_secret:
+        raise RuntimeError(
+            "RUNTIME_CONTROL_SECRET is required to authenticate runtime control operations"
+        )
+    callback_secret = os.getenv("RUNTIME_CALLBACK_SECRET") or ""
+    if not callback_secret:
+        raise RuntimeError(
+            "RUNTIME_CALLBACK_SECRET is required to authenticate runtime callbacks"
+        )
+    if callback_secret == control_secret:
+        raise RuntimeError(
+            "RUNTIME_CALLBACK_SECRET must be distinct from RUNTIME_CONTROL_SECRET"
+        )
+    callback_origins = {
+        value.strip()
+        for value in os.getenv("RUNTIME_CALLBACK_TRUSTED_ORIGINS", "").split(",")
+        if value.strip()
+    }
+    if not callback_origins:
+        raise RuntimeError(
+            "RUNTIME_CALLBACK_TRUSTED_ORIGINS is required for authenticated runtime callbacks"
+        )
+    if len(callback_origins) != 1:
+        raise RuntimeError(
+            "RUNTIME_CALLBACK_TRUSTED_ORIGINS must contain exactly one meeting-api origin"
+        )
+    callback_queue = CallbackQueue(
+        store=callback_store,
+        default_headers={"X-Runtime-Callback-Secret": callback_secret},
+        trusted_origins=callback_origins,
+    )
     # Re-adopt the workloads this runtime spawned that are STILL on the substrate (containers/pods
     # survive a runtime recreate untouched): without this, the fresh in-memory registry 404s over a
     # live bot, and the control plane misreads that 404 as "bot gone" — the orphaned-live-bot
@@ -172,7 +240,13 @@ def build_production_app():
             )
     except Exception as e:  # noqa: BLE001 — adoption is a boot aid; it must never block the boot
         logger.warning("workload re-adoption failed: %s", e)
-    return create_app(runtime, scheduler=scheduler)
+    return create_app(
+        runtime,
+        callback_queue=callback_queue,
+        scheduler=scheduler,
+        callback_sweep_interval_seconds=5.0,
+        control_secret=control_secret,
+    )
 
 
 def main() -> None:

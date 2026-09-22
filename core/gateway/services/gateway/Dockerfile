@@ -28,6 +28,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # 3) The shipped source (src/ is on PYTHONPATH; the package is not pip-installed).
 COPY src ./src
 
+# Match the gateway's Helm runAsUser. The image identity is an independent backstop for Compose
+# and direct `docker run` paths, while the chart also enforces the same numeric UID.
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN groupadd --gid 10001 vexa && \
+    useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin vexa
+USER 10001:10001
+
 EXPOSE 8000
 # python -m gateway → uvicorn gateway.adapters:app (HOST/PORT from env).
 CMD ["python", "-m", "gateway"]

@@ -5,12 +5,10 @@ The critical untested seam: a FIXED transcript fed through ``worker.meeting_card
 This makes the whole "fixed transcript in → expected entities out" pipeline reproducible:
 
   fixture segments → meeting_card_turn → CompletionPort fake → parse_notes / parse_cards → shapes
-  deduped cards    → meeting_doc_turn  → HarnessPort (fake exec) write+commit → entity frontmatter
+  deduped cards    → meeting_doc_turn  → deterministic structured writer → entity frontmatter
 
 The card turn takes an injectable ``completion`` (a fake CompletionPort that records the prompt and
-returns a canned reply / raises); the doc turn resolves the harness through the
-``worker.harness_factory`` seam, patched with a ``ClaudeCodeHarness`` whose ``exec_fn`` replays
-canned stream-json lines — the same injection points ``tests/test_worker.py`` uses.
+returns a canned reply / raises); the document turn does not invoke a model or tools.
 
 Also covers WS1: the auth-error path (a misconfigured key/base_url → a DISTINCT ``auth-error`` event,
 not the generic ``model-error``) and the boot preflight guard.
@@ -21,8 +19,9 @@ import json
 import unittest.mock as mock
 from pathlib import Path
 
+import yaml
+
 from llm import CompletionResult, LLMAuthError, LLMError
-from llm.claude_code import ClaudeCodeHarness
 from worker import worker
 
 FIXTURE = Path(__file__).resolve().parents[1] / "eval" / "replay" / "gamestop-allin.jsonl"
@@ -177,43 +176,23 @@ def test_offline_meeting_card_turn_falls_back_when_reply_omits_notes(tmp_path):
 
 
 def test_offline_meeting_doc_turn_authors_entity_from_fixed_cards(tmp_path):
-    """The post-meeting WRITE turn, offline: a FIXED card set replayed through a deterministic exec that
-    writes the entity file → assert the meeting frontmatter + grouped wikilinks landed and committed."""
-    native = "gme-allin-001"
+    """A fixed card set is serialized deterministically into the canonical row document."""
+    row_id = "41"
     cards = [
         {"kind": "person", "title": "Ryan Cohen", "body": "chairman"},
         {"kind": "company", "title": "GameStop", "body": "the company"},
         {"kind": "company", "title": "AppLovin", "body": "ad platform"},
     ]
 
-    def fake_exec(argv, cwd):
-        doc = Path(cwd) / "kg" / "entities" / "meeting" / f"{native}.md"
-        doc.parent.mkdir(parents=True, exist_ok=True)
-        doc.write_text(
-            "---\n"
-            "type: meeting\n"
-            f"id: {native}\n"
-            "title: GME All-In\n"
-            f"meeting_id: {native}\n"
-            f"session_uid: {native}\n"
-            "platform: google_meet\n"
-            "date: 2026-06-27\n"
-            "---\n\n"
-            "Ryan Cohen defended GameStop and cited AppLovin as a bootstrapped success.\n\n"
-            "## Attendees\n- [[Ryan Cohen]]\n\n## Companies\n- [[GameStop]]\n- [[AppLovin]]\n"
-        )
-        yield _result_line("wrote kg/entities/meeting/%s.md" % native)
+    evs = list(worker.meeting_doc_turn(
+        tmp_path, cards, row_id=row_id, platform="google_meet", date="2026-06-27",
+    ))
 
-    with mock.patch.object(worker, "harness_factory", lambda: ClaudeCodeHarness(exec_fn=fake_exec)):
-        evs = list(worker.meeting_doc_turn(
-            tmp_path, cards, native=native, meeting_id=native, session_uid=native,
-            platform="google_meet", date="2026-06-27", title="GME All-In",
-        ))
-
-    assert any(e.get("type") == "commit" for e in evs)  # governance committed the write
-    doc = (tmp_path / "kg" / "entities" / "meeting" / f"{native}.md").read_text()
-    assert "type: meeting" in doc and f"id: {native}" in doc
-    assert "platform: google_meet" in doc and "date: 2026-06-27" in doc
+    assert evs == [{"type": "message-delta", "text": "Updated meeting 41."}]
+    doc = (tmp_path / "kg" / "entities" / "meeting" / f"{row_id}.md").read_text()
+    fm = yaml.safe_load(doc.split("---\n", 2)[1])
+    assert fm["type"] == "meeting" and fm["id"] == "41"
+    assert fm["platform"] == "google_meet" and fm["date"] == "2026-06-27"
     assert "[[Ryan Cohen]]" in doc and "[[GameStop]]" in doc and "[[AppLovin]]" in doc
 
 

@@ -1,3 +1,17 @@
+{{- $reservedAdminEnv := list
+  "ADMIN_API_TOKEN" "INTERNAL_API_SECRET" "DB_SSL_MODE"
+  "DATABASE_URL" "DB_HOST" "DB_PORT" "DB_NAME" "DB_USER" "DB_PASSWORD"
+  "VEXA_USER_MODEL_ALLOWED_HOSTS" "VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS"
+  "ZAKI_MINUTES_CAPTURE_ENABLED" "ZAKI_MINUTES_READ_ENABLED" "LOG_LEVEL"
+-}}
+{{- if .Values.adminApi.enabled -}}
+{{- range .Values.adminApi.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if or (has $name $reservedAdminEnv) (hasPrefix "ZAKI_MINUTES_" $name) (hasPrefix "ZAKI_AGENT_ERASURE_" $name) (hasPrefix "MINUTES_" $name) (eq $name "ZAKI_READ_TOKEN_MINUTES") -}}
+  {{- fail (printf "adminApi.extraEnv may not override reserved Minutes deployment setting %s" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
 {{- if .Values.adminApi.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +32,14 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: admin-api
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        checksum/database-secret: {{ include "vexa.databaseSecretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml (mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.adminApi.runAsUser) "fsGroupChangePolicy" "OnRootMismatch")) | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -29,8 +47,8 @@ spec:
       containers:
         - name: admin-api
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.adminApi.image.repository }}:{{ .Values.global.imageTag | default .Values.adminApi.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.adminApi.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.adminApi.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.adminApi.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -40,6 +58,8 @@ spec:
               value: {{ include "vexa.dbHostEffective" . | quote }}
             - name: DB_PORT
               value: {{ include "vexa.dbPortEffective" . | quote }}
+            - name: DB_SSL_MODE
+              value: {{ .Values.database.sslMode | quote }}
             - name: DB_NAME
               valueFrom:
                 secretKeyRef:
@@ -65,11 +85,22 @@ spec:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
                   key: INTERNAL_API_SECRET
+            - name: VEXA_USER_MODEL_ALLOWED_HOSTS
+              value: {{ .Values.adminApi.userModelAllowedHosts | default "" | quote }}
+            - name: VEXA_USER_TRANSCRIPTION_ALLOWED_HOSTS
+              value: {{ .Values.adminApi.userTranscriptionAllowedHosts | default "" | quote }}
+            - name: ZAKI_MINUTES_CAPTURE_ENABLED
+              value: {{ .Values.minutes.captureEnabled | quote }}
+            - name: ZAKI_MINUTES_READ_ENABLED
+              value: {{ .Values.minutes.readEnabled | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.adminApi.logLevel | default "info" | quote }}
             {{- with .Values.adminApi.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
           startupProbe:
             httpGet:
               path: /health
@@ -90,6 +121,9 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.adminApi.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.global.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

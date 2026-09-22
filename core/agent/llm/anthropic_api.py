@@ -17,6 +17,12 @@ from typing import Optional
 import httpx
 
 from llm.errors import LLMAuthError, LLMConfigError, LLMError
+from llm.http_safety import (
+    MAX_LLM_OUTPUT_CHARS,
+    MAX_LLM_RESPONSE_ITEMS,
+    encode_request,
+    read_response_json,
+)
 from llm.ports import CompletionResult
 
 _DEFAULT_BASE = "https://api.anthropic.com"
@@ -32,6 +38,7 @@ def _max_tokens() -> int:
 
 class AnthropicCompletion:
     name = "anthropic"
+    supports_max_tokens = True
 
     def __init__(self, *, base_url: Optional[str] = None, api_key: Optional[str] = None,
                  model: Optional[str] = None, timeout: float = 120.0,
@@ -42,10 +49,15 @@ class AnthropicCompletion:
                      or os.environ.get("ANTHROPIC_AUTH_TOKEN")
                      or os.environ.get("ANTHROPIC_API_KEY") or "")
         self._model = model or os.environ.get("VEXA_LLM_MODEL") or ""
-        self._client = httpx.Client(timeout=timeout, transport=transport)
+        self._client = httpx.Client(
+            timeout=timeout,
+            transport=transport,
+            follow_redirects=False,
+        )
 
     def complete(self, prompt: str, *, system: Optional[str] = None,
-                 model: Optional[str] = None) -> CompletionResult:
+                 model: Optional[str] = None,
+                 max_tokens: Optional[int] = None) -> CompletionResult:
         target = (model or "").strip() or self._model
         if not target:
             raise LLMConfigError(
@@ -54,23 +66,59 @@ class AnthropicCompletion:
             )
         payload: dict = {
             "model": target,
-            "max_tokens": _max_tokens(),
+            "max_tokens": max_tokens if max_tokens is not None else _max_tokens(),
             "messages": [{"role": "user", "content": prompt}],
         }
         if system:
             payload["system"] = system
-        headers = {"x-api-key": self._key, "anthropic-version": _API_VERSION}
+        if (
+            isinstance(payload["max_tokens"], bool)
+            or not isinstance(payload["max_tokens"], int)
+            or payload["max_tokens"] <= 0
+        ):
+            raise LLMConfigError("max_tokens must be a positive integer")
+        headers = {
+            "x-api-key": self._key,
+            "anthropic-version": _API_VERSION,
+            "Content-Type": "application/json",
+        }
+        body = encode_request(payload)
         try:
-            r = self._client.post(f"{self._base}/v1/messages", json=payload, headers=headers)
-        except httpx.HTTPError as exc:
-            raise LLMError(f"completion transport failure against {self._base}: {exc}") from exc
-        if r.status_code in (401, 403):
-            raise LLMAuthError(f"{r.status_code} from {self._base}: {r.text[:300]}")
-        if r.status_code >= 400:
-            raise LLMError(f"{r.status_code} from {self._base}: {r.text[:300]}")
-        try:
-            blocks = r.json().get("content") or []
-            text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-        except (ValueError, AttributeError, TypeError) as exc:
-            raise LLMError(f"malformed completion payload from {self._base}: {exc}") from exc
-        return CompletionResult(text=text, model=target)
+            with self._client.stream(
+                "POST",
+                f"{self._base}/v1/messages",
+                content=body,
+                headers=headers,
+                follow_redirects=False,
+            ) as r:
+                if r.status_code in (401, 403):
+                    raise LLMAuthError(f"completion endpoint rejected credentials (HTTP {r.status_code})")
+                if not 200 <= r.status_code < 300:
+                    raise LLMError(f"completion endpoint answered HTTP {r.status_code}")
+                data = read_response_json(r)
+        except (LLMAuthError, LLMError):
+            raise
+        except httpx.HTTPError:
+            # HTTPX retains the prompt- and credential-bearing Request on transport failures.
+            raise LLMError("completion transport failure") from None
+
+        if not isinstance(data, dict):
+            raise LLMError("malformed completion payload")
+        blocks = data.get("content")
+        if not isinstance(blocks, list) or len(blocks) > MAX_LLM_RESPONSE_ITEMS:
+            raise LLMError("malformed completion payload")
+        pieces: list[str] = []
+        total_chars = 0
+        for block in blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+                raise LLMError("malformed completion payload")
+            if block["type"] != "text":
+                continue
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise LLMError("malformed completion payload")
+            total_chars += len(text)
+            if total_chars > MAX_LLM_OUTPUT_CHARS:
+                raise LLMError("completion output exceeds limit")
+            pieces.append(text)
+        return CompletionResult(text="".join(pieces), model=target)

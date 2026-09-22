@@ -9,20 +9,17 @@
  *  httpOnly only stops JS reads, so a hand-crafted Cookie header claiming another user's email
  *  would otherwise mint/list/revoke THAT user's tokens.
  */
-import { cookies } from "next/headers";
-import { AUTH_COOKIE, validateAuthToken } from "../auth/adminApi";
+import { validateAuthToken } from "../auth/adminApi";
+import { resolveApiKey } from "../proxyAuth";
 
 export type CurrentUser =
   | { ok: true; userId: string | number; email: string }
   | { ok: false; status: number; error: string };
 
 export async function currentUser(): Promise<CurrentUser> {
-  let token: string | undefined;
-  try {
-    token = (await cookies()).get(AUTH_COOKIE)?.value;
-  } catch {
-    /* outside a request scope */
-  }
+  // Hosted mode yields only the login cookie; explicit Lite shared mode yields its provisioned
+  // user token. In both cases the internal oracle below derives user_id — never client metadata.
+  const token = await resolveApiKey();
   if (!token) return { ok: false, status: 401, error: "Not authenticated" };
 
   return validateAuthToken(token);

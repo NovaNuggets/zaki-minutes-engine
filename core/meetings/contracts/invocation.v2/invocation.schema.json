@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vexa.ai/schemas/invocation.v2",
+  "title": "invocation.v2",
+  "description": "Managed Minutes meeting-bot constructor with explicit retention authority and string identifiers.",
+  "$defs": {
+    "Platform": { "enum": ["google_meet", "zoom", "teams", "jitsi"] },
+    "AutomaticLeave": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "waitingRoomTimeout": { "type": "integer", "default": 300000 },
+        "noOneJoinedTimeout": { "type": "integer", "default": 600000 },
+        "everyoneLeftTimeout": { "type": "integer", "default": 120000 }
+      }
+    },
+    "ScopeExpiries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["audio", "transcript", "summary"],
+      "properties": {
+        "audio": { "type": "string", "format": "date-time" },
+        "transcript": { "type": "string", "format": "date-time" },
+        "summary": { "type": "string", "format": "date-time" }
+      }
+    },
+    "ManagedRetention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policyVersion", "scopeExpiresAt"],
+      "properties": {
+        "policyVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "scopeExpiresAt": { "$ref": "#/$defs/ScopeExpiries" }
+      }
+    },
+    "Invocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractVersion", "platform", "meetingUrl", "botName", "nativeMeetingId",
+        "token", "connectionId", "meeting_id", "transcriptIngestUrl", "retentionFenceUrl",
+        "meetingApiCallbackUrl", "transcribeEnabled", "transcriptionServiceUrl",
+        "transcriptionServiceToken", "recordingEnabled", "recordingUploadUrl", "captureModes",
+        "captureExpiresAt", "managedRetention"
+      ],
+      "properties": {
+        "contractVersion": { "const": "invocation.v2" },
+        "platform": { "$ref": "#/$defs/Platform" },
+        "meetingUrl": { "type": ["string", "null"], "description": "null only for native-SDK zoom" },
+        "botName": { "type": "string" },
+        "passcode": { "type": "string" },
+        "nativeMeetingId": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "token": { "type": "string", "minLength": 1, "description": "SECRET — MeetingToken; placeholder in goldens" },
+        "connectionId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "meeting_id": { "type": "string", "pattern": "^[1-9][0-9]{0,18}$", "description": "Canonical positive decimal database id; never a JSON number" },
+        "container_name": { "type": "string" },
+        "transcriptIngestUrl": { "type": "string", "format": "uri", "description": "MeetingToken-authenticated, server-mediated transcript.v1 ingress" },
+        "retentionFenceUrl": { "type": "string", "format": "uri", "description": "MeetingToken-authenticated permanent capture fence" },
+        "meetingApiCallbackUrl": { "type": "string", "format": "uri" },
+        "language": { "type": ["string", "null"] },
+        "task": { "type": ["string", "null"] },
+        "allowedLanguages": { "type": "array", "items": { "type": "string" } },
+        "transcribeEnabled": { "const": true },
+        "transcriptionTier": { "enum": ["realtime", "deferred"] },
+        "transcriptionServiceUrl": { "type": "string", "format": "uri" },
+        "transcriptionServiceToken": { "type": "string", "minLength": 1, "description": "SECRET; placeholder in goldens" },
+        "recordingEnabled": { "const": true },
+        "captureModes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["audio", "video"] } },
+        "recordingUploadUrl": { "type": "string", "format": "uri" },
+        "captureExpiresAt": { "type": "string", "format": "date-time" },
+        "managedRetention": { "$ref": "#/$defs/ManagedRetention" },
+        "automaticLeave": { "$ref": "#/$defs/AutomaticLeave" },
+        "reconnectionIntervalMs": { "type": "integer" },
+        "voiceAgentEnabled": { "const": false },
+        "defaultAvatarUrl": { "type": "string", "format": "uri" },
+        "videoReceiveEnabled": { "type": "boolean" },
+        "cameraEnabled": { "type": "boolean" },
+        "authenticated": { "type": "boolean" },
+        "userdataS3Path": { "type": "string" },
+        "s3Endpoint": { "type": "string" },
+        "s3Bucket": { "type": "string" },
+        "s3AccessKey": { "type": "string", "description": "SECRET; placeholder in goldens" },
+        "s3SecretKey": { "type": "string", "description": "SECRET; placeholder in goldens" }
+      }
+    }
+  }
+}

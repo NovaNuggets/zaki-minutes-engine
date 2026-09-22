@@ -31,6 +31,8 @@ gateway's contextvars (the cross-hop trace ``test_tracing.py`` asserts).
 """
 from __future__ import annotations
 
+import hmac
+import os
 from typing import Any, Callable, Optional
 
 from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Response
@@ -40,6 +42,10 @@ from .meeting_link import parse_meeting_url
 from .obs import TraceMiddleware as _DefaultTraceMiddleware
 from .obs import log_event as _default_log_event
 from .ports import RedisBus, TranscriptStore
+from ..public_status import (
+    internal_meeting_status,
+    public_meeting_projection,
+)
 
 
 # The two INTENT states the USER owns (pre-FSM). The user dropdown is the source of truth for
@@ -140,7 +146,7 @@ def build_router(
             user_id=user_id, meeting_id=str(meeting_id),
             fields={"segments": len(doc.get("segments", []))},
         )
-        return JSONResponse(content=doc)
+        return JSONResponse(content=public_meeting_projection(doc))
 
     # --- GET /transcripts/{platform}/{native_meeting_id} → api.v1 TranscriptionResponse ---
     @router.get("/transcripts/{platform}/{native_meeting_id}")
@@ -174,7 +180,7 @@ def build_router(
             meeting_id=f"{platform}/{native_meeting_id}",
             fields={"segments": len(doc.get("segments", []))},
         )
-        return JSONResponse(content=doc)
+        return JSONResponse(content=public_meeting_projection(doc))
 
     # --- GET /meetings → api.v1 MeetingListResponse ---
     @router.get("/meetings")
@@ -190,7 +196,7 @@ def build_router(
         user_id = _resolve_user_id(x_user_id)
         member_workspaces = {w.strip() for w in (x_user_workspaces or "").split(",") if w.strip()}
         meetings = await store.list_meetings(
-            user_id, status=status, platform=platform, limit=limit, offset=offset,
+            user_id, status=internal_meeting_status(status), platform=platform, limit=limit, offset=offset,
             member_workspaces=member_workspaces,
         )
         log_event(
@@ -200,7 +206,9 @@ def build_router(
             user_id=user_id,
             fields={"count": len(meetings)},
         )
-        return JSONResponse(content={"meetings": meetings})
+        return JSONResponse(content={
+            "meetings": [public_meeting_projection(meeting) for meeting in meetings]
+        })
 
     # --- GET /bots → the dashboard's primary meetings-list source (api.v1). Same DB query + shape as
     # GET /meetings, plus `has_more` for the proxy's pagination. ---
@@ -215,13 +223,16 @@ def build_router(
     ):
         user_id = _resolve_user_id(x_user_id)
         meetings = await store.list_meetings(
-            user_id, status=status, platform=platform, limit=limit, offset=offset
+            user_id, status=internal_meeting_status(status), platform=platform, limit=limit, offset=offset
         )
         log_event(
             "bots_listed", audience="user", span="bots.list",
             user_id=user_id, fields={"count": len(meetings)},
         )
-        return JSONResponse(content={"meetings": meetings, "has_more": False})
+        return JSONResponse(content={
+            "meetings": [public_meeting_projection(meeting) for meeting in meetings],
+            "has_more": False,
+        })
 
     # --- GET /bots/status → the caller's currently-running bots (api/meetings.mdx "Running bots").
     # Running == any non-terminal FSM status (requested·joining·awaiting_admission·active·stopping);
@@ -241,7 +252,51 @@ def build_router(
             "bots_status", audience="user", span="bots.status",
             user_id=user_id, fields={"running": len(running)},
         )
-        return JSONResponse(content={"running": running, "count": len(running)})
+        return JSONResponse(content={
+            "running": [public_meeting_projection(meeting) for meeting in running],
+            "count": len(running),
+        })
+
+    @router.get("/internal/meetings/{meeting_id}/owner")
+    async def internal_meeting_owner(
+        meeting_id: int,
+        x_internal_secret: Optional[str] = Header(default=None),
+    ):
+        """Minimal row-attribution authority for the in-cluster agent watcher.
+
+        The response deliberately contains no meeting metadata or content.  A missing server secret
+        disables the edge, and every caller must prove possession with ``X-Internal-Secret``.
+        """
+        configured = os.environ.get("INTERNAL_API_SECRET", "")
+        if not configured:
+            raise HTTPException(status_code=503, detail="owner authority is unavailable")
+        if not x_internal_secret or not hmac.compare_digest(x_internal_secret, configured):
+            raise HTTPException(status_code=403, detail="internal secret required")
+
+        owner = await store.owner_for(meeting_id)
+        if owner is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        return JSONResponse(content={
+            "meeting_id": str(meeting_id),
+            "user_id": str(owner),
+        })
+
+    @router.post("/internal/meetings/{meeting_id}/docs")
+    async def internal_connect_meeting_doc(
+        meeting_id: int,
+        x_internal_secret: Optional[str] = Header(default=None),
+    ):
+        """Connect the generated kg doc to one exact row without a user/API-key carrier."""
+        configured = os.environ.get("INTERNAL_API_SECRET", "")
+        if not configured:
+            raise HTTPException(status_code=503, detail="meeting doc authority is unavailable")
+        if not x_internal_secret or not hmac.compare_digest(x_internal_secret, configured):
+            raise HTTPException(status_code=403, detail="internal secret required")
+
+        doc = await store.connect_meeting_doc_by_id(meeting_id)
+        if doc is None:
+            raise HTTPException(status_code=404, detail="meeting not found")
+        return JSONResponse(content={"meeting_id": str(meeting_id), "doc": doc})
 
     # --- GET /meetings/{meeting_id} → the single meeting (api.v1; the meeting-detail page fetches it).
     # Reuses list_meetings + filters by id (owner-scoped, so a non-owner can't read another's meeting). ---
@@ -256,7 +311,7 @@ def build_router(
         meeting = next((m for m in meetings if m.get("id") == meeting_id), None)
         if meeting is None:
             return JSONResponse(status_code=404, content={"detail": "Meeting not found"})
-        return JSONResponse(content=meeting)
+        return JSONResponse(content=public_meeting_projection(meeting))
 
     # --- POST /meetings → CREATE a PLANNED meeting (intent status, NO bot spawned). The user plans a
     # meeting ahead of time — with or without a meeting link, with or without a time. Status starts at

@@ -6,10 +6,9 @@
  * bridge fails (the largest blob's `onChunk` callback dropped), the server assembles a headerless
  * master from the cluster-only survivors — `43 b6 75 …` mid-Matroska, which no player accepts.
  *
- * The chunker fix: retain the init segment from the first header-bearing blob, and — until a
- * header-bearing chunk has been ACK'd by `onChunk` — PREPEND the retained init segment to the
- * next surviving cluster chunk. So a surviving chunk always re-forms a valid self-describing
- * webm even when chunk 0 itself never made it across.
+ * A permanent delivery failure cannot be repaired by sending a later chunk: the hosted receiver
+ * requires a contiguous durable manifest. The chunker therefore fails closed, pauses capture,
+ * suppresses the final signal, and leaves already-ACKed chunks available for operator recovery.
  *
  * No assertion lib — same tsx + exit-code shape as chunker.smoke.test.ts.
  */
@@ -76,16 +75,15 @@ async function main() {
       got[1] ? Buffer.from(decode(got[1].base64)).toString('hex') : 'no chunk1');
   }
 
-  // ── 2) THE FIELD BUG: chunk 0's onChunk FAILS (bridge dropped the big blob). The retained init
-  //        segment must be re-attached to the next surviving cluster chunk so a header survives. ──
+  // ── 2) Permanent chunk-0 failure: do not continue across a manifest gap or emit a false final. ──
   {
     const got: RecordingChunk[] = [];
-    let firstSeen = false;
+    let calls = 0;
     const chunker = new MediaRecorderChunker({
       stream: {} as any, timesliceMs: 1000,
       onChunk: async (c) => {
-        // Fail ONLY the first delivery (the header-bearing chunk 0) — model the dropped big blob.
-        if (!firstSeen) { firstSeen = true; throw new Error('bridge RPC dropped chunk 0'); }
+        calls++;
+        if (calls === 1) throw new Error('bridge RPC dropped chunk 0');
         got.push(c);
         return true;
       },
@@ -94,15 +92,11 @@ async function main() {
     const mr = chunker.getMediaRecorder() as unknown as FakeMediaRecorder;
     mr.emit(headerBlob);          // chunk 0 — its onChunk throws (lost)
     await new Promise((r) => setTimeout(r, 10));
-    mr.emit(clusterBlob(0x20));   // chunk 1 — survives, MUST now carry the re-attached header
+    mr.emit(clusterBlob(0x20));   // must be refused: there is no safe contiguous manifest
     await new Promise((r) => setTimeout(r, 10));
-    check('field: a surviving chunk carries the EBML header after chunk 0 was lost',
-      got.some((c) => startsWith(decode(c.base64), EBML)),
-      got.map((c) => Buffer.from(decode(c.base64)).toString('hex').slice(0, 8)).join(','));
-    const survivor = got.find((c) => startsWith(decode(c.base64), EBML));
-    check('field: the re-attached survivor is [EBML init][cluster] (self-describing again)',
-      !!survivor && startsWith(decode(survivor.base64), EBML),
-      survivor ? Buffer.from(decode(survivor.base64)).toString('hex') : 'no survivor');
+    await chunker.stop();
+    check('failure: no later media crosses the missing sequence', got.length === 0, String(got.length));
+    check('failure: no false final is emitted after permanent delivery failure', calls === 1, String(calls));
   }
 
   // ── 3) ONCE DELIVERED, never re-attach: after a header-bearing chunk is ACK'd, later clusters
@@ -126,7 +120,7 @@ async function main() {
   }
 
   if (failed) { console.error(`\n❌ init-segment.smoke: ${failed} check(s) FAILED.`); process.exit(1); }
-  console.log('\n✅ init-segment.smoke: the chunker retains + re-attaches the EBML init segment when chunk 0 is lost, and never duplicates it once delivered.');
+  console.log('\n✅ init-segment.smoke: the chunker preserves a single init segment on success and fails closed across permanent manifest gaps.');
   process.exit(0);
 }
 

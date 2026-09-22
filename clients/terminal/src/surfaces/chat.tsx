@@ -16,6 +16,7 @@ import { streamChatTurn, type ChatPhase } from "./chatStream";
 import { buildChatContext, focusTarget, readIncludeSchedule, scheduleEligible, writeIncludeSchedule, type FocusPayload } from "./chatContext";
 import { useLiveMeetings } from "./liveMeetings";
 import { meetingPhase, type MeetingMock, type MeetingPhase } from "./meetingModel";
+import { canonicalMeetingDocPath, canonicalMeetingRow } from "./minutesIdentity";
 import { ASK_CHAT_EVENT, ONBOARDING_KICKOFF_MARK, ONBOARDING_SEED_EVENT, ONBOARDING_GREETING, ONBOARDING_GROUNDING, ONBOARDING_REPLY_SEP } from "../canvas/actions";
 
 /** classify a tool name into one of the op icons so the operation line reads at a glance */
@@ -401,7 +402,7 @@ function AttachmentChips({ attachments, onRemove }: { attachments: ComposerAttac
   );
 }
 
-function referenceContext(text: string): string {
+export function referenceContext(text: string): string {
   const refs = referenceTokens(text);
   if (refs.length === 0) return "";
   const lines = [
@@ -417,14 +418,22 @@ function referenceContext(text: string): string {
         "  instruction: Read this workspace-relative path before relying on it.",
       );
     } else {
-      const notesPath = `kg/entities/meeting/${ref.value}.md`;
+      const row = canonicalMeetingRow(ref.value);
+      const notesPath = canonicalMeetingDocPath(row);
+      if (!row || !notesPath) {
+        lines.push(
+          `- token: ${ref.raw}`,
+          "  kind: meeting",
+          "  instruction: This is not a canonical numeric meeting-row reference; do not derive a workspace path or transcript address from it.",
+        );
+        continue;
+      }
       lines.push(
         `- token: ${ref.raw}`,
         "  kind: meeting",
-        `  native_id: ${ref.value}`,
-        "  platform: google_meet",
+        `  meeting_id: ${row}`,
         `  notes_workspace_path: ${notesPath}`,
-        `  transcript_api_path: /api/transcripts/google_meet/${ref.value}`,
+        `  transcript_api_path: /api/transcripts/by-id/${row}`,
         "  instruction: Use notes_workspace_path first; fetch or identify the transcript only when needed. Keep the visible chat compact: refer to the token instead of pasting the transcript.",
       );
     }
@@ -570,8 +579,11 @@ export function Chat({ params = {} }: ChatProps) {
   const activeMeeting = activeRef?.kind === "meeting"
     ? meetings.find((m) => m.id === activeRef.value || m.native_id === activeRef.value)
     : undefined;
+  const activeMeetingRow = canonicalMeetingRow(activeMeeting?.id ?? focusRef?.value);
   const contextRef: ActiveReference | null = focusRef?.kind === "meeting"
-    ? { kind: "meeting", value: activeMeeting?.native_id ?? activeMeeting?.id ?? focusRef.value, raw: `@meeting:${activeMeeting?.native_id ?? activeMeeting?.id ?? focusRef.value}` }
+    ? (activeMeetingRow
+        ? { kind: "meeting", value: activeMeetingRow, raw: `@meeting:${activeMeetingRow}` }
+        : null)
     : focusRef;
   const [uploading, setUploading] = useState(false);
   const [value, setValue] = useState("");
@@ -786,7 +798,7 @@ export function Chat({ params = {} }: ChatProps) {
       ? undefined
       : contextRef.kind === "meeting"
         ? {
-            kind: "meeting", native_id: contextRef.value, meeting_id: activeMeeting?.id,
+            kind: "meeting", native_id: activeMeeting?.native_id ?? contextRef.value, meeting_id: contextRef.value,
             platform: meetingPlatformSlug(activeMeeting),
             status: activeMeeting?.live_status,
             title: activeMeeting ? meetingLabel(activeMeeting) : undefined,

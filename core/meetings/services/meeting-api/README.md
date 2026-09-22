@@ -16,6 +16,8 @@ and stays in their ecosystem (FastAPI + redis + DB).
 | calls | api-gateway / agent-api | `POST /bots` | request a bot (platform + native id + per-user webhook cfg) → eager `MeetingSession` |
 | calls | api-gateway / agent-api | `DELETE /bots/{platform}/{native}` | user-stop → leave command + workload teardown |
 | calls | dashboard / agent-api | `GET /meetings` | the user's meetings (live + past), api.v1 `MeetingListResponse` |
+| serves | agent-api watcher | `GET /internal/meetings/{row}/owner` | secret-protected exact row → canonical decimal-string row/owner, with no meeting content |
+| serves | agent-api watcher | `POST /internal/meetings/{row}/docs` | secret-protected decimal-string exact-row generated-doc link; meeting-api derives owner workspace + canonical row path under the row lock |
 | calls | dashboard / agent-api | `GET /transcripts/{platform}/{native}` | the meeting transcript, api.v1 `TranscriptionResponse` |
 | calls | api-gateway `/ws` | `POST /ws/authorize-subscribe` | identity-scoped subscribe authorization |
 | spawns-over | runtime kernel | `runtime.v1` (`RuntimeClient.create_workload`) | the meeting-bot workload (carries the `invocation.v1` BOT_CONFIG + MeetingToken) |
@@ -25,14 +27,20 @@ and stays in their ecosystem (FastAPI + redis + DB).
 | publishes | api-gateway `/ws` | redis channel `tc:meeting:{id}:mutable` | the live mutable transcript bundle |
 | publishes | api-gateway `/ws` | redis channel `bm:meeting:{id}:status` | ws.v1 `meeting.status` (BotStatus) on each FSM advance |
 | produces | user webhook endpoint | `webhook.v1` envelope | `meeting.status_change` (signed, best-effort delivery) |
+| produces | operator Minutes Hub sink | `minutes-finalized.v1` | exact content-free, bigint-safe, non-bearer HMAC event after durable finalization |
+| consumes | Agent erasure endpoint | `erasure.v1` (`owner=agent`) | exact fresh subject-bound signed derivative-purge proof |
+| produces | gateway / Terminal | `minutes-api.v1` + `erasure.v1` | owner-scoped managed status and exact signed meeting-erasure proof |
 
 ## Contracts
 
 **Owns:** `core/meetings/contracts/lifecycle.v1` · `core/meetings/contracts/transcript.v1` ·
 `core/meetings/contracts/webhook.v1` · `core/meetings/contracts/invocation.v1` ·
+`core/meetings/contracts/minutes-api.v1` · `core/meetings/contracts/erasure.v1` ·
+`core/meetings/contracts/minutes-finalized.v1` ·
 `core/meetings/contracts/acts.v1`.
 **Consumes:** `core/runtime/contracts/runtime.v1` (spawn the bot workload) and api.v1
-(`MeetingListResponse` / `TranscriptionResponse` response shapes). All sealed in `contracts.seal.json`.
+(`MeetingListResponse` / `TranscriptionResponse` response shapes). The existing contracts are sealed
+in `contracts.seal.json`; `minutes-finalized.v1` is the candidate for the next deliberate seal.
 
 ## Isolated evaluation
 
@@ -53,5 +61,11 @@ Levels: **L1** contract conformance (`test_contract_conformance`, `collector_con
 - ✅ delivered — collector: `transcription_segments` → DB, publish `tc:meeting:{id}:mutable` + `bm:meeting:{id}:status`
 - ✅ delivered — `GET /meetings` (live + past per user) · `GET /transcripts` · `POST /ws/authorize-subscribe`
 - ✅ delivered — `webhook.v1` `meeting.status_change` signed per-user delivery
+- ✅ delivered — default-off operator `transcript.finalized` sink with secret-free durable Redis outbox
+- ✅ delivered — exact managed status/OpenAPI and signed, pre-commit-durable meeting erasure path
+- ✅ delivered — downstream complete mediation: Zaki deploys deny ordinary `POST /bots`; managed
+  capture remains the only spawn path. Calendar auto-join is default-off and flag-on fails boot until
+  it has the same consent, retention, attestation, and withdrawal-fence authority.
+- ⚠️ activation handoff — production requires independent Agent/Minutes erasure key sources and an Agent signer; legacy Agent receipts fail closed
 - 🟡 partial — production composition root wiring real adapters (DB/redis/MinIO) is P3; ports are in place
 - ⬜ planned — `GET /meetings` is the source the terminal meetings list (live+past) will read via agent-api

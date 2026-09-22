@@ -39,6 +39,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 COPY src ./src
 
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN groupadd --gid 10004 vexa && \
+    useradd --uid 10004 --gid 10004 --create-home --shell /usr/sbin/nologin vexa
+USER 10004:10004
+
 EXPOSE 8090
 # python -m runtime_kernel → uvicorn over create_app(Runtime(DockerBackend(), default_registry())).
 CMD ["python", "-m", "runtime_kernel"]

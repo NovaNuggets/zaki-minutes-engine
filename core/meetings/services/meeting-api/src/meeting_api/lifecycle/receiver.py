@@ -11,7 +11,9 @@ the record store is in-memory (`MeetingStore`).
 """
 from __future__ import annotations
 
+import hmac
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -42,6 +44,45 @@ def _load_lifecycle_schema() -> dict:
 _SCHEMA = _load_lifecycle_schema()
 _REGISTRY = Registry().with_resource(_SCHEMA["$id"], Resource.from_contents(_SCHEMA))
 
+# Lifecycle payloads may carry the bounded 50 KiB bot-log ring plus diagnostics. Keep the HTTP
+# envelope itself bounded as well: malformed or hostile internal traffic must not make Starlette
+# buffer an unbounded body before the contract validator gets a turn.
+_MAX_LIFECYCLE_BODY_BYTES = 128 * 1024
+
+
+class LifecycleBodyError(ValueError):
+    """A bounded, caller-safe lifecycle request-body failure."""
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+
+async def _read_bounded_json(request: Request, *, label: str) -> Any:
+    """Read and decode one bounded callback body without reflecting parser details."""
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > _MAX_LIFECYCLE_BODY_BYTES:
+            raise LifecycleBodyError(413, f"{label} request body too large")
+        chunks.append(chunk)
+    try:
+        return json.loads(b"".join(chunks))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise LifecycleBodyError(400, "malformed JSON body") from None
+
+
+async def read_lifecycle_json(request: Request) -> Any:
+    """Read and decode one bounded lifecycle body."""
+    return await _read_bounded_json(request, label="lifecycle")
+
+
+async def read_runtime_json(request: Request) -> Any:
+    """Read and decode one bounded runtime callback body."""
+    return await _read_bounded_json(request, label="runtime callback")
+
 
 def conforms(obj: Dict[str, Any], shape: str) -> None:
     """Validate `obj` against `lifecycle.v1#/$defs/<shape>` (raises on non-conformance)."""
@@ -50,10 +91,39 @@ def conforms(obj: Dict[str, Any], shape: str) -> None:
     ).validate(obj)
 
 
+def authorize_internal_callback(
+    request: Request,
+    internal_secret: Optional[str],
+) -> Optional[JSONResponse]:
+    """Authenticate a lifecycle-mutating service callback before reading its body.
+
+    Production is fail closed. The two-key development escape hatch exists only for the in-process
+    conformance harness; a configured secret always takes precedence and must match exactly.
+    """
+    if internal_secret is not None:
+        if not isinstance(internal_secret, str) or not internal_secret:
+            raise ValueError("lifecycle internal secret must be a non-empty string")
+        provided = request.headers.get("X-Internal-Secret", "")
+        if hmac.compare_digest(provided, internal_secret):
+            return None
+        return JSONResponse(status_code=403, content={"status": "error", "detail": "forbidden"})
+    if (
+        os.getenv("DEV_MODE", "false").strip().lower() == "true"
+        and os.getenv("VEXA_ALLOW_INSECURE_LIFECYCLE_CALLBACKS", "false").strip().lower()
+        == "true"
+    ):
+        return None
+    return JSONResponse(
+        status_code=503,
+        content={"status": "error", "detail": "lifecycle callback authentication unavailable"},
+    )
+
+
 def create_app(
     store: Optional[MeetingStore] = None,
     *,
     on_status_change: Optional[Any] = None,
+    internal_secret: Optional[str] = None,
 ) -> FastAPI:
     """Build the receiver app. `store` lets the eval inspect record state after POSTs.
 
@@ -81,7 +151,16 @@ def create_app(
 
     @app.post("/bots/internal/callback/lifecycle")
     async def lifecycle_callback(request: Request) -> JSONResponse:
-        body = await request.json()
+        denial = authorize_internal_callback(request, internal_secret)
+        if denial is not None:
+            return denial
+        try:
+            body = await read_lifecycle_json(request)
+        except LifecycleBodyError as exc:
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"status": "error", "detail": exc.detail},
+            )
 
         # 1. Validate at the seam — jsonschema by path against the sealed contract.
         try:

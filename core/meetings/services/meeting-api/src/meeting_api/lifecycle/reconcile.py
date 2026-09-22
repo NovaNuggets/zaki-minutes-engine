@@ -52,8 +52,8 @@ async def _teardown_verdict(
     except WorkloadUnknown as e:
         log.error(
             "reconcile: runtime does not know workload %s for meeting %s — termination "
-            "UNCONFIRMED, a live container may be orphaned; NOT advancing the meeting (%s)",
-            bot_container_id, meeting_id, e,
+            "UNCONFIRMED, a live container may be orphaned; NOT advancing the meeting",
+            bot_container_id, meeting_id,
         )
         _log_orphan_kill_failed(meeting_id, bot_container_id, e, unconfirmed=True)
         return "untracked"
@@ -328,7 +328,11 @@ def _log_orphan_kill_failed(meeting_id, workload_id, err, *, unconfirmed: bool =
             audience="system",
             level="error" if unconfirmed else "warning",
             span="reconcile.stop",
-            fields={"meeting_id": meeting_id, "workload_id": workload_id, "error": str(err)},
+            fields={
+                "meeting_id": meeting_id,
+                "workload_id": workload_id,
+                "error_type": type(err).__name__,
+            },
         )
     except Exception:
         pass
@@ -365,6 +369,10 @@ def _log_untracked_escalated(meeting_id, status, workload_id, reason) -> None:
 
 # Workload states the runtime kernel reports as TERMINAL (the workload is gone).
 TERMINAL_WORKLOAD_STATES = frozenset({"destroyed", "failed", "exited", "crashed", "stopped", "error"})
+
+
+class RuntimeCallbackProcessingError(RuntimeError):
+    """Transient terminal-callback work that must be retried by the runtime delivery queue."""
 # Meeting statuses where the bot has NOT yet reported `active` — a terminal workload here means the bot
 # never started and never will (image-pull fail, OOM, crash on boot), so it can be classed `failed`
 # unambiguously.
@@ -384,6 +392,7 @@ async def synthesize_terminal_for_dead_workload(
     drive_terminal: Callable[[dict], Awaitable[Any]],
     *,
     log: Any,
+    raise_on_transient: bool = False,
 ) -> bool:
     """Consume a runtime-confirmed TERMINAL workload callback (``destroyed``/``exited``/…) as EVIDENCE the
     run is over, and advance its still-non-terminal meeting through the bot's OWN lifecycle callback
@@ -414,7 +423,13 @@ async def synthesize_terminal_for_dead_workload(
     try:
         info = await repo.find_by_container(bot_container_id=workload_id)
     except Exception as e:  # noqa: BLE001 — lookup is best-effort
-        log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
+        log.warning(
+            "runtime-callback: find_by_container failed for %s (error_type=%s)",
+            workload_id,
+            type(e).__name__,
+        )
+        if raise_on_transient:
+            raise RuntimeCallbackProcessingError("meeting lookup failed") from None
         return False
     if not info or not info.get("session_uid"):
         return False
@@ -442,12 +457,24 @@ async def synthesize_terminal_for_dead_workload(
     else:
         return False  # already terminal (completed/failed) — the bot's own callback is authoritative
     try:
-        await drive_terminal(body)
+        result = await drive_terminal(body)
+        if raise_on_transient and (
+            not isinstance(result, int) or not 200 <= result < 300
+        ):
+            raise RuntimeCallbackProcessingError("synthetic lifecycle write was not accepted")
         log.info("runtime-callback: drove synthetic %s for meeting %s (workload %s %s, was %s)",
                  body["status"], info.get("meeting_id"), workload_id, state, status)
         return True
+    except RuntimeCallbackProcessingError:
+        raise
     except Exception as e:  # noqa: BLE001 — best-effort; the stop/stale sweeps remain the backstop
-        log.warning("runtime-callback: synthetic terminal POST failed for %s: %s", workload_id, e)
+        log.warning(
+            "runtime-callback: synthetic terminal write failed for %s (error_type=%s)",
+            workload_id,
+            type(e).__name__,
+        )
+        if raise_on_transient:
+            raise RuntimeCallbackProcessingError("synthetic lifecycle write failed") from None
         return False
 
 
@@ -469,7 +496,11 @@ async def synthesize_failed_for_dead_workload(
     try:
         info = await repo.find_by_container(bot_container_id=workload_id)
     except Exception as e:  # noqa: BLE001 — lookup is best-effort
-        log.warning("runtime-callback: find_by_container failed for %s: %s", workload_id, e)
+        log.warning(
+            "runtime-callback: find_by_container failed for %s (error_type=%s)",
+            workload_id,
+            type(e).__name__,
+        )
         return False
     if not info or info.get("status") not in _PRE_ACTIVE_STATUSES:
         return False  # old contract: only pre-active drove a synthetic failed

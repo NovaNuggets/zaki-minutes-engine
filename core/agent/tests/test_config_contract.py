@@ -34,8 +34,20 @@ def _fresh_probe_cache():
 def test_declaration_loads_and_is_internally_consistent():
     decl = cp.load_declaration()
     assert decl["service"] == "agent-api"
-    assert set(decl["capabilities"]) == {"bot_gateway", "model_inference"}
+    assert set(decl["capabilities"]) == {"bot_gateway", "model_inference", "minutes_read"}
     assert decl["capabilities"]["model_inference"]["mode"] == "any"
+
+    keys = {entry["key"]: entry for entry in decl["keys"]}
+    assert keys["ZAKI_AGENT_ERASURE_SIGNING_KEY_ID"]["default"].startswith("(unset")
+    assert keys["ZAKI_AGENT_ERASURE_SIGNING_SECRET"]["secret"] is True
+    assert keys["ZAKI_AGENT_ERASURE_SIGNING_SECRET"]["default"].startswith("(unset")
+    assert keys["ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_KEY_ID"]["default"].startswith(
+        "(unset"
+    )
+    assert keys["ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET"]["secret"] is True
+    assert keys["ZAKI_AGENT_ERASURE_PREVIOUS_VERIFICATION_SECRET"]["default"].startswith(
+        "(unset"
+    )
 
 
 def test_every_settings_field_is_declared():
@@ -43,8 +55,12 @@ def test_every_settings_field_is_declared():
     os.getenv scanner, so THIS test holds the sync: a new Settings field must land in the
     declaration (the SSOT) to pass."""
     declared = {k["key"] for k in cp.load_declaration()["keys"]}
-    for field in Settings.model_fields:
-        env_name = f"VEXA_{field.upper()}"
+    for field, definition in Settings.model_fields.items():
+        env_name = (
+            definition.validation_alias
+            if isinstance(definition.validation_alias, str)
+            else f"VEXA_{field.upper()}"
+        )
         assert env_name in declared, (
             f"Settings.{field} reads {env_name} but config.v1.json does not declare it — "
             "add it to core/agent/control_plane/config.v1.json"
@@ -58,12 +74,22 @@ def test_capability_tri_states():
     assert cp.capability_states({})["model_inference"] == cp.NOT_CONFIGURED
     assert cp.capability_states({"HOST_CLAUDE_CREDENTIALS": "/x.json"})["model_inference"] == cp.CONFIGURED
     assert cp.capability_states({"ANTHROPIC_AUTH_TOKEN": "tok"})["model_inference"] == cp.CONFIGURED
+    assert cp.capability_states({})["minutes_read"] == cp.NOT_CONFIGURED
+    assert cp.capability_states({
+        "ZAKI_MINUTES_READ_BASE_URL": "https://minutes.internal",
+    })["minutes_read"] == cp.MISCONFIGURED
+    assert cp.capability_states({
+        "ZAKI_MINUTES_READ_BASE_URL": "https://minutes.internal",
+        "ZAKI_READ_TOKEN_MINUTES": "token",
+    })["minutes_read"] == cp.CONFIGURED
 
 
-def test_preflight_has_no_required_keys_and_reports_rows(monkeypatch):
+def test_preflight_requires_runtime_control_secret_and_reports_rows(monkeypatch):
     for k in ("VEXA_BOT_API_KEY", "HOST_CLAUDE_CREDENTIALS", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         monkeypatch.delenv(k, raising=False)
-    report = cp.preflight()
+    with pytest.raises(cp.ConfigError, match="VEXA_RUNTIME_CONTROL_SECRET"):
+        cp.preflight({})
+    report = cp.preflight({"VEXA_RUNTIME_CONTROL_SECRET": "runtime-control-secret"})
     assert report["service"] == "agent-api"
     assert report["capabilities"]["bot_gateway"]["state"] == cp.NOT_CONFIGURED
     assert report["capabilities"]["model_inference"]["state"] == cp.NOT_CONFIGURED

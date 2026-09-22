@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # =============================================================================
 # Vexa Lite — meeting-bot launcher (process backend)
 # =============================================================================
@@ -6,10 +6,74 @@
 # meeting-bot profile (BOT_COMMAND). Unlike the bot's own container entrypoint, it does
 # NOT bring up Xvfb / PulseAudio — supervisord already owns those for the whole container
 # (one shared display, like 0.10.6 lite). The bot's full constructor arrives in the
-# inherited env as VEXA_BOT_CONFIG (invocation.v1); we just run the worker.
-set -u
+# inherited env as VEXA_BOT_CONFIG (invocation.v1). This launcher is also the Lite bot's kernel
+# privilege boundary: runtime is root so it can operate the control plane, but meeting code is not.
+set -eu
+
+readonly BOT_GROUP="vexa-bot"
+# Disjoint from Lite Agent uids (100000..199999) and workspace gids (200000+). Linux pid_max is at
+# most 4194304, so BOT_UID_BASE + $$ remains far below the 32-bit uid ceiling.
+readonly BOT_UID_BASE=10000000
+readonly TRUSTED_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="$TRUSTED_PATH"
+export PATH
+unset BASH_ENV ENV CDPATH LD_PRELOAD LD_LIBRARY_PATH
+
+fail() {
+  echo "vexa-bot-launch: $*" >&2
+  exit 126
+}
 
 export DISPLAY="${DISPLAY:-:99}"
+
+# The runtime launches this script as root. Provision only the bot-owned runtime directories, then
+# atomically replace the root shell with the same trusted launcher under the dedicated uid/gid.
+# NoNewPrivs plus empty capability sets prevent a later exec from recovering container privilege.
+if [ "$(id -u)" -eq 0 ]; then
+  # A shared static uid lets one concurrent bot read another bot's MeetingToken through
+  # /proc/<pid>/environ. Shell pids are unique among live launchers, so derive a distinct numeric
+  # uid for every live meeting process. Clear an old pid-reuse home before assigning it again.
+  bot_uid=$((BOT_UID_BASE + $$))
+  [ "$bot_uid" -gt "$BOT_UID_BASE" ] || fail "could not allocate a per-meeting uid"
+  bot_home="/var/lib/vexa-bot/$bot_uid"
+  bot_runtime="/run/vexa-bot/$bot_uid"
+  install -d -o root -g root -m 0711 /var/lib/vexa-bot /run/vexa-bot
+  rm -rf "$bot_home" "$bot_runtime"
+  install -d -o "$bot_uid" -g "$BOT_GROUP" -m 0700 "$bot_home" "$bot_runtime"
+  export VEXA_LITE_BOT_UID="$bot_uid"
+  export HOME="$bot_home"
+  export USER="vexa-bot-$bot_uid"
+  export LOGNAME="$USER"
+  export TMPDIR="/tmp"
+  export XDG_RUNTIME_DIR="$bot_runtime"
+  export XDG_CACHE_HOME="$bot_home/.cache"
+  export XDG_CONFIG_HOME="$bot_home/.config"
+  exec setpriv --reuid="$bot_uid" --regid="$BOT_GROUP" --groups=pulse-access \
+    --no-new-privs --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- "$0" "$@"
+fi
+
+# Fail closed if this launcher is invoked directly as an arbitrary service/container user. That
+# avoids silently turning a future supervisor refactor into a shared-privilege bot deployment.
+case "${VEXA_LITE_BOT_UID:-}" in
+  ''|*[!0-9]*) fail "missing trusted per-meeting uid" ;;
+esac
+if [ "$(id -u)" != "$VEXA_LITE_BOT_UID" ] || [ "$(id -gn)" != "$BOT_GROUP" ]; then
+  fail "refusing to run as unexpected identity $(id -u):$(id -g)"
+fi
+case " $(id -nG) " in
+  *" pulse-access "*) ;;
+  *) fail "missing required pulse-access group" ;;
+esac
+
+# /run/vexa is the root-only operator-secret tier. Checking the directory itself covers present and
+# future filenames; a bot must be unable to list OR traverse it. These checks make a permission
+# regression fail before any untrusted meeting/browser code starts.
+if [ -e /run/vexa ] && { [ -x /run/vexa ] || [ -r /run/vexa ]; }; then
+  fail "operator-secret directory is accessible"
+fi
+[ -r /app/core/meetings/services/bot/dist/index.js ] || fail "bot application is unreadable"
+[ -w /tmp ] || fail "/tmp is not writable"
+[ -d "$HOME" ] && [ -w "$HOME" ] || fail "bot home is not writable"
 
 # Run from the bot package dir so its relative schema path (src→../../../contracts) and the
 # pnpm-linked workspace deps resolve, exactly like the bot's container entrypoint does. The

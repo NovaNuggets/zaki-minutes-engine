@@ -19,6 +19,13 @@ from __future__ import annotations
 from typing import Any, AsyncIterator, Optional, Protocol, runtime_checkable
 
 
+DEFAULT_MAX_BUFFERED_BODY_BYTES = 32 * 1024 * 1024
+
+
+class DownstreamBodyTooLarge(RuntimeError):
+    """The downstream exceeded the gateway's finite buffered-response budget."""
+
+
 @runtime_checkable
 class Authorizer(Protocol):
     """Resolve identity + subscribe-authorization for the caller's ``x-api-key``.
@@ -59,6 +66,21 @@ class DownstreamResponse(Protocol):
 
 
 @runtime_checkable
+class DownstreamStreamingResponse(Protocol):
+    """An opened downstream response whose body is consumed incrementally and explicitly closed."""
+
+    @property
+    def status_code(self) -> int: ...
+
+    @property
+    def headers(self) -> Any: ...
+
+    def aiter_raw(self) -> AsyncIterator[bytes]: ...
+
+    async def aclose(self) -> None: ...
+
+
+@runtime_checkable
 class DownstreamClient(Protocol):
     """Forward an HTTP request to a downstream service (meeting-api / transcription-collector)
     and return its response. Mirrors the ``client.request(...)`` call in ``main.forward_request``.
@@ -70,7 +92,7 @@ class DownstreamClient(Protocol):
         url: str,
         *,
         headers: Optional[dict] = None,
-        params: Optional[dict] = None,
+        params: Optional[dict | str] = None,
         content: Optional[bytes] = None,
     ) -> DownstreamResponse:
         ...
@@ -81,12 +103,24 @@ class DownstreamClient(Protocol):
         url: str,
         *,
         headers: Optional[dict] = None,
-        params: Optional[dict] = None,
+        params: Optional[dict | str] = None,
         content: Optional[bytes] = None,
     ) -> AsyncIterator[bytes]:
         """Forward a request and yield the downstream response body as it arrives (the SSE path —
         agent chat). An async generator: ``async for chunk in downstream.stream(...)``. Used so a
         streamed turn is relayed token-by-token instead of buffered."""
+        ...
+
+    async def open_stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict] = None,
+        params: Optional[dict | str] = None,
+        content: Optional[bytes] = None,
+    ) -> DownstreamStreamingResponse:
+        """Open a non-SSE byte relay while retaining status and media headers."""
         ...
 
 

@@ -1,3 +1,33 @@
+{{- $reservedRuntimeEnv := list
+  "RUNTIME_BACKEND" "RUNTIME_AGENT_PROFILE_ENABLED" "POD_NAMESPACE" "DOCKER_NETWORK"
+  "REDIS_URL" "BROWSER_IMAGE" "MINUTES_BROWSER_IMAGE" "AGENT_IMAGE" "AGENT_WORKER_IMAGE"
+  "RUNTIME_CONTROL_SECRET" "RUNTIME_CALLBACK_SECRET" "RUNTIME_CALLBACK_TRUSTED_ORIGINS"
+  "RUNTIME_K8S_NODE_SELECTOR_JSON" "RUNTIME_K8S_TOLERATIONS_JSON"
+  "RUNTIME_K8S_AFFINITY_JSON" "RUNTIME_K8S_IMAGE_PULL_SECRETS_JSON"
+  "RUNTIME_K8S_IMAGE_PULL_POLICY" "RUNTIME_K8S_RUN_AS_USER"
+  "RUNTIME_K8S_BOT_RUN_AS_USER" "RUNTIME_K8S_BOT_RUN_AS_GROUP" "RUNTIME_K8S_BOT_FS_GROUP"
+  "RUNTIME_K8S_AGENT_RUN_AS_USER" "RUNTIME_K8S_AGENT_RUN_AS_GROUP" "RUNTIME_K8S_AGENT_FS_GROUP"
+  "RUNTIME_K8S_DEFAULT_CPU" "RUNTIME_K8S_DEFAULT_MEMORY_MB"
+  "RUNTIME_K8S_MAX_CPU" "RUNTIME_K8S_MAX_MEMORY_MB" "RUNTIME_K8S_MAX_GPU"
+  "ANTHROPIC_API_KEY" "ANTHROPIC_AUTH_TOKEN" "ANTHROPIC_BASE_URL" "ANTHROPIC_MODEL"
+  "ANTHROPIC_DEFAULT_OPUS_MODEL" "ANTHROPIC_DEFAULT_SONNET_MODEL"
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL" "LOG_LEVEL"
+  "ADMIN_TOKEN" "ADMIN_API_TOKEN" "INTERNAL_API_SECRET" "MEETING_TOKEN_SECRET"
+  "REDIS_PASSWORD" "VEXA_DISPATCH_SIGNING_KEY" "VEXA_BOT_API_KEY" "CLAUDE_CODE_OAUTH_TOKEN"
+  "ZAKI_READ_TOKEN_MINUTES"
+-}}
+{{- if .Values.runtime.enabled -}}
+{{- range .Values.runtime.extraEnv -}}
+  {{- $name := toString (.name | default "") -}}
+  {{- if or (has $name $reservedRuntimeEnv) (hasPrefix "ZAKI_MINUTES_" $name) (hasPrefix "ZAKI_AGENT_ERASURE_" $name) (hasPrefix "MINUTES_" $name) -}}
+  {{- fail (printf "runtime.extraEnv may not override reserved runtime authentication setting %s; use the chart field and operator Secret" $name) -}}
+  {{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $runtimePodSecurityContext := mergeOverwrite (deepCopy .Values.global.podSecurityContext) (dict "fsGroup" (int .Values.runtime.runAsUser) "fsGroupChangePolicy" "OnRootMismatch") -}}
+{{- if eq .Values.runtime.backend "docker" -}}
+  {{- $_ := set $runtimePodSecurityContext "supplementalGroups" (list (int .Values.runtime.dockerSocketGroup)) -}}
+{{- end -}}
 {{- if .Values.runtime.enabled }}
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +48,13 @@ spec:
         {{- include "vexa.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: runtime
       annotations:
-        {{- toYaml .Values.global.podAnnotations | nindent 8 }}
+        checksum/platform-secret: {{ include "vexa.secretRolloutChecksum" . | quote }}
+        {{- with .Values.global.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       securityContext:
-        {{- toYaml .Values.global.podSecurityContext | nindent 8 }}
+        {{- toYaml $runtimePodSecurityContext | nindent 8 }}
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -33,8 +66,8 @@ spec:
       containers:
         - name: runtime
           securityContext:
-            {{- toYaml .Values.global.securityContext | nindent 12 }}
-          image: "{{ .Values.runtime.image.repository }}:{{ .Values.global.imageTag | default .Values.runtime.image.tag }}"
+            {{- toYaml (mergeOverwrite (deepCopy .Values.global.securityContext) (dict "allowPrivilegeEscalation" false "capabilities" (dict "add" (list) "drop" (list "ALL")) "runAsGroup" (int .Values.runtime.runAsUser) "runAsNonRoot" true "runAsUser" (int .Values.runtime.runAsUser) "readOnlyRootFilesystem" true)) | nindent 12 }}
+          image: {{ include "vexa.imageRef" (list . .Values.runtime.image) | quote }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           ports:
             - name: http
@@ -42,11 +75,48 @@ spec:
           env:
             - name: RUNTIME_BACKEND
               value: {{ .Values.runtime.backend | quote }}
+            - name: RUNTIME_AGENT_PROFILE_ENABLED
+              value: {{ .Values.agentApi.enabled | quote }}
             {{- if eq .Values.runtime.backend "k8s" }}
             - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
+              value: {{ include "vexa.workloadNamespace" . | quote }}
+            # Operator-owned policy for every ephemeral bot/worker Pod. These values are serialized
+            # by Helm and read only from the runtime process environment; workload specs cannot
+            # override placement, registry, identity, or resource ceilings.
+            - name: RUNTIME_K8S_NODE_SELECTOR_JSON
+              value: {{ toJson .Values.global.nodeSelector | quote }}
+            - name: RUNTIME_K8S_TOLERATIONS_JSON
+              value: {{ toJson .Values.global.tolerations | quote }}
+            - name: RUNTIME_K8S_AFFINITY_JSON
+              value: {{ toJson .Values.global.affinity | quote }}
+            - name: RUNTIME_K8S_IMAGE_PULL_SECRETS_JSON
+              value: {{ toJson .Values.global.imagePullSecrets | quote }}
+            - name: RUNTIME_K8S_IMAGE_PULL_POLICY
+              value: {{ .Values.global.imagePullPolicy | quote }}
+            - name: RUNTIME_K8S_RUN_AS_USER
+              value: {{ .Values.runtime.spawnedPods.botIdentity.runAsUser | quote }}
+            - name: RUNTIME_K8S_BOT_RUN_AS_USER
+              value: {{ .Values.runtime.spawnedPods.botIdentity.runAsUser | quote }}
+            - name: RUNTIME_K8S_BOT_RUN_AS_GROUP
+              value: {{ .Values.runtime.spawnedPods.botIdentity.runAsGroup | quote }}
+            - name: RUNTIME_K8S_BOT_FS_GROUP
+              value: {{ .Values.runtime.spawnedPods.botIdentity.fsGroup | quote }}
+            - name: RUNTIME_K8S_AGENT_RUN_AS_USER
+              value: {{ .Values.runtime.spawnedPods.agentIdentity.runAsUser | quote }}
+            - name: RUNTIME_K8S_AGENT_RUN_AS_GROUP
+              value: {{ .Values.runtime.spawnedPods.agentIdentity.runAsGroup | quote }}
+            - name: RUNTIME_K8S_AGENT_FS_GROUP
+              value: {{ .Values.runtime.spawnedPods.agentIdentity.fsGroup | quote }}
+            - name: RUNTIME_K8S_DEFAULT_CPU
+              value: {{ .Values.runtime.spawnedPods.defaultCpu | quote }}
+            - name: RUNTIME_K8S_DEFAULT_MEMORY_MB
+              value: {{ .Values.runtime.spawnedPods.defaultMemoryMb | quote }}
+            - name: RUNTIME_K8S_MAX_CPU
+              value: {{ .Values.runtime.spawnedPods.maxCpu | quote }}
+            - name: RUNTIME_K8S_MAX_MEMORY_MB
+              value: {{ .Values.runtime.spawnedPods.maxMemoryMb | quote }}
+            - name: RUNTIME_K8S_MAX_GPU
+              value: {{ .Values.runtime.spawnedPods.maxGpu | quote }}
             {{- end }}
             {{- if eq .Values.runtime.backend "docker" }}
             # The spawned bot/worker join the runtime's namespace network. On k8s the kernel resolves
@@ -55,18 +125,37 @@ spec:
               value: {{ .Values.runtime.dockerNetwork | default "" | quote }}
             {{- end }}
             - name: REDIS_URL
-              value: {{ include "vexa.redisUrl" . | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: REDIS_URL
             - name: BROWSER_IMAGE
               value: {{ include "vexa.botImage" . | quote }}
+            {{- if .Values.minutes.invocationV2Enabled }}
+            - name: MINUTES_BROWSER_IMAGE
+              value: {{ .Values.minutes.botImage | quote }}
+            {{- end }}
+            {{- if .Values.agentApi.enabled }}
             - name: AGENT_IMAGE
               value: {{ include "vexa.agentImage" . | quote }}
             - name: AGENT_WORKER_IMAGE
               value: {{ include "vexa.agentWorkerImage" . | quote }}
-            - name: INTERNAL_API_SECRET
+            {{- end }}
+            - name: RUNTIME_CONTROL_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ include "vexa.adminTokenSecretName" . }}
-                  key: INTERNAL_API_SECRET
+                  key: RUNTIME_CONTROL_SECRET
+            - name: RUNTIME_CALLBACK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "vexa.adminTokenSecretName" . }}
+                  key: RUNTIME_CALLBACK_SECRET
+            - name: RUNTIME_CALLBACK_TRUSTED_ORIGINS
+              value: "http://{{ include "vexa.componentName" (list . "meeting-api") }}:{{ .Values.meetingApi.service.port }}"
+            {{- if .Values.agentApi.enabled }}
+            # Runtime brokers model auth only for the bundled Agent-worker profile. Managed Minutes
+            # disables that profile, so its runtime must not receive dormant provider credentials.
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -93,13 +182,16 @@ spec:
               value: {{ .Values.models.anthropicSonnetModel | default "" | quote }}
             - name: ANTHROPIC_DEFAULT_HAIKU_MODEL
               value: {{ .Values.models.anthropicHaikuModel | default "" | quote }}
+            {{- end }}
             - name: LOG_LEVEL
               value: {{ .Values.runtime.logLevel | default "info" | quote }}
             {{- with .Values.runtime.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- if eq .Values.runtime.backend "docker" }}
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          {{- if eq .Values.runtime.backend "docker" }}
             - name: docker-sock
               mountPath: /var/run/docker.sock
           {{- end }}
@@ -123,8 +215,10 @@ spec:
             periodSeconds: 20
           resources:
             {{- toYaml .Values.runtime.resources | nindent 12 }}
-      {{- if eq .Values.runtime.backend "docker" }}
       volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- if eq .Values.runtime.backend "docker" }}
         - name: docker-sock
           hostPath:
             path: /var/run/docker.sock

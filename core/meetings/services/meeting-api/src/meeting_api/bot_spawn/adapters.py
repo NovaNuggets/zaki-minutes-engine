@@ -12,23 +12,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
 from ..meeting_writes import (
-    MEETING_WRITE_LOCK_NAMESPACE,
     capture_authority_is_stale,
     capture_is_withdrawn,
+    meeting_write_lock_key,
 )
 from ..sessions import new_session
+from .lifecycle_write import classify_lifecycle_write
 from .ports import (
     CaptureGrantConsumed,
     DuplicateMeeting,
     MaxBotsExceeded,
+    MeetingStatusWrite,
     QuotaExceeded,
     SpawnFailed,
     WorkloadUnknown,
 )
+
+_RUNTIME_WORKLOAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
 
 
 def _row_to_dict(m) -> dict:
@@ -100,6 +105,32 @@ class SqlAlchemyMeetingRepo:
             m = (await db.execute(stmt)).scalars().first()
             return _row_to_dict(m) if m else None
 
+    async def find_owned_minutes(self, *, user_id: int, meeting_id: int) -> Optional[dict]:
+        from sqlalchemy import select
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            meeting = (
+                await db.execute(
+                    select(Meeting).where(
+                        Meeting.id == meeting_id,
+                        Meeting.user_id == user_id,
+                    )
+                )
+            ).scalars().first()
+            if meeting is None:
+                return None
+            row = _row_to_dict(meeting)
+            data = row.get("data")
+            capture = data.get("zaki_capture") if isinstance(data, dict) else None
+            if (
+                not isinstance(capture, dict)
+                or capture.get("tenant_id") != f"user:{user_id}"
+            ):
+                return None
+            return row
+
     async def reopen_meeting(self, *, meeting_id) -> dict:
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
@@ -140,6 +171,21 @@ class SqlAlchemyMeetingRepo:
             ).scalars().first()
             return status
 
+    async def get_meeting_id_by_session(self, *, session_uid) -> Optional[int]:
+        from sqlalchemy import select
+
+        from ..sessions.models import Meeting, MeetingSession
+
+        async with self._session_factory() as db:
+            meeting_id = (
+                await db.execute(
+                    select(MeetingSession.meeting_id)
+                    .join(Meeting, Meeting.id == MeetingSession.meeting_id)
+                    .where(MeetingSession.session_uid == session_uid)
+                )
+            ).scalars().first()
+            return int(meeting_id) if meeting_id is not None else None
+
     async def find_by_container(self, *, bot_container_id) -> Optional[dict]:
         """The meeting + latest session for a workload id — used by the runtime callback (CC5) to drive a
         synthetic ``failed`` for a workload that died before the bot reported. ``{meeting_id, status,
@@ -167,8 +213,16 @@ class SqlAlchemyMeetingRepo:
             return {"meeting_id": mid, "status": status, "session_uid": sid}
 
     async def update_meeting_status(
-        self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
-    ) -> None:
+        self,
+        *,
+        session_uid,
+        status,
+        completion_reason=None,
+        failure_stage=None,
+        data=None,
+        expected_status=None,
+        force_terminal=False,
+    ) -> Optional[MeetingStatusWrite]:
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
 
@@ -187,19 +241,58 @@ class SqlAlchemyMeetingRepo:
             ).scalars().first()
             if m is None:
                 return
+            previous_status = m.status
             merged = dict(m.data) if isinstance(m.data, dict) else {}
             suppressed_nonterminal = (
                 capture_is_withdrawn(merged)
                 and status not in ("completed", "failed")
             )
-            if suppressed_nonterminal:
+            capture = merged.get("zaki_capture")
+            suppressed_terminal_after_withdrawal = (
+                capture_is_withdrawn(merged)
+                and m.status in ("completed", "failed")
+                and status in ("completed", "failed")
+                and (
+                    status != m.status
+                    or (
+                        isinstance(capture, dict)
+                        and capture.get("teardown_state") == "confirmed"
+                    )
+                )
+            )
+            suppressed_withdrawn_update = (
+                suppressed_nonterminal or suppressed_terminal_after_withdrawal
+            )
+            if expected_status is not None and previous_status != expected_status:
+                # A withdrawal CAS may have terminalized the row after the callback's status read.
+                # In that privacy-specific case the late bot event is a safe acknowledged no-op;
+                # every other mismatch remains a retryable cross-replica conflict.
+                return MeetingStatusWrite(
+                    row=_row_to_dict(m),
+                    disposition=("suppressed" if suppressed_withdrawn_update else "conflict"),
+                    previous_status=previous_status,
+                )
+            if suppressed_withdrawn_update:
                 status = m.status if m.status in ("completed", "failed") else "stopping"
+                disposition = "suppressed"
+            else:
+                disposition = classify_lifecycle_write(
+                    previous_status,
+                    status,
+                    force_terminal=force_terminal,
+                )
+                if disposition != "applied":
+                    return MeetingStatusWrite(
+                        row=_row_to_dict(m),
+                        disposition=disposition,
+                        previous_status=previous_status,
+                    )
             m.status = status
-            if completion_reason is not None and not suppressed_nonterminal:
+            if completion_reason is not None and not suppressed_withdrawn_update:
                 merged["completion_reason"] = completion_reason
-            if failure_stage is not None and not suppressed_nonterminal:
+            if failure_stage is not None and not suppressed_withdrawn_update:
                 merged["failure_stage"] = failure_stage
-            if not suppressed_nonterminal:
+            if not suppressed_withdrawn_update:
                 for k, v in (data or {}).items():
                     merged[k] = v
             m.data = merged
@@ -217,7 +310,41 @@ class SqlAlchemyMeetingRepo:
             await db.refresh(m)
             # Return the updated row so the lifecycle callback can deliver the per-user webhook from
             # meeting.data (and the stop route gets a clean dict) without a second query.
-            return _row_to_dict(m)
+            return MeetingStatusWrite(
+                row=_row_to_dict(m),
+                disposition=disposition,
+                previous_status=previous_status,
+            )
+
+    async def list_terminal_meeting_ids(self, *, before_id=None, limit=100) -> list[int]:
+        """Newest-first, bounded recovery scan for authorized Minutes finalization intent."""
+        from sqlalchemy import select, text
+
+        from ..sessions.models import Meeting
+
+        async with self._session_factory() as db:
+            stmt = select(Meeting.id).where(
+                Meeting.status.in_(("completed", "failed")),
+                text("""
+                    jsonb_typeof(meetings.data->'zaki_capture') = 'object'
+                    AND meetings.data #>> '{zaki_capture,state}' = 'authorized'
+                    AND jsonb_typeof(meetings.data->'zaki_retention') = 'object'
+                    AND meetings.data #>> '{zaki_retention,state}' = 'open'
+                    AND jsonb_typeof(meetings.data #> '{zaki_retention,expired_scopes}') = 'array'
+                    AND NOT ((meetings.data #> '{zaki_retention,expired_scopes}') ? 'transcript')
+                    AND jsonb_typeof(meetings.data #> '{zaki_retention,scope_expiries}') = 'object'
+                    AND CASE
+                      WHEN meetings.data #>> '{zaki_retention,scope_expiries,transcript}'
+                           ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,6})?(Z|[+]00:00)$'
+                      THEN CAST(meetings.data #>> '{zaki_retention,scope_expiries,transcript}' AS timestamptz) > NOW()
+                      ELSE FALSE
+                    END
+                """),
+            )
+            if before_id is not None:
+                stmt = stmt.where(Meeting.id < before_id)
+            stmt = stmt.order_by(Meeting.id.desc()).limit(limit)
+            return list((await db.execute(stmt)).scalars().all())
 
     async def count_active_bots(self, *, user_id, exclude_meeting_id=None) -> int:
         from sqlalchemy import func, select
@@ -579,7 +706,9 @@ class SqlAlchemyMeetingRepo:
             if meeting.end_time is None:
                 meeting.end_time = datetime.now(timezone.utc).replace(tzinfo=None)
             merged = dict(meeting.data) if isinstance(meeting.data, dict) else {}
-            merged["failure_stage"] = "runtime_spawn"
+            # Public lifecycle stage, not an infrastructure sub-step: runtime spawn fails while the
+            # meeting is still in `requested`. The content-free reason keeps the finer attribution.
+            merged["failure_stage"] = "requested"
             merged["spawn_failure_reason"] = reason
             patch = dict(data or {})
             if capture_is_withdrawn(merged):
@@ -626,13 +755,8 @@ class SqlAlchemyMeetingRepo:
                 return None
             meeting_id = int(found["id"])
             await db.execute(
-                self._statement(
-                    "SELECT pg_advisory_xact_lock(:lock_namespace, :meeting_id)"
-                ),
-                {
-                    "lock_namespace": MEETING_WRITE_LOCK_NAMESPACE,
-                    "meeting_id": meeting_id,
-                },
+                self._statement("SELECT pg_advisory_xact_lock(:meeting_lock_key)"),
+                {"meeting_lock_key": meeting_write_lock_key(meeting_id)},
             )
             selected = await db.execute(
                 self._statement(
@@ -654,6 +778,7 @@ class SqlAlchemyMeetingRepo:
             ):
                 return None
             prior_status = row["status"]
+            terminal_stop_already_durable = prior_status in ("completed", "failed")
             changed = capture.get("state") != "withdrawn"
             if changed:
                 capture = dict(capture)
@@ -662,11 +787,17 @@ class SqlAlchemyMeetingRepo:
                         "state": "withdrawn",
                         "withdrawal_reason": "consent_withdrawn",
                         "withdrawn_at": withdrawn_at,
+                        "teardown_state": (
+                            "confirmed" if terminal_stop_already_durable else "pending"
+                        ),
                     }
                 )
                 data["zaki_capture"] = capture
+            elif terminal_stop_already_durable and capture.get("teardown_state") != "confirmed":
+                capture = {**capture, "teardown_state": "confirmed"}
+                data["zaki_capture"] = capture
             data["stop_requested"] = True
-            should_stop = prior_status not in ("completed", "failed")
+            should_stop = not terminal_stop_already_durable
             status = "stopping" if should_stop else prior_status
             await db.execute(
                 self._statement(
@@ -701,22 +832,127 @@ class SqlAlchemyMeetingRepo:
                 "prior_status": prior_status,
             }
 
+    async def confirm_capture_teardown(self, *, meeting_id: int) -> bool:
+        """Atomically persist hard-stop proof and its consent-stop terminal projection.
+
+        Existing ``completed``/``failed`` outcomes remain authoritative. Otherwise a successful
+        kernel delete completes the meeting as ``stopped`` and supplies the terminal timestamp, so
+        terminal-only erasure never depends on a callback from a workload that is already gone.
+        """
+        async with self._session_factory() as db:
+            updated = await db.execute(
+                self._statement(
+                    "UPDATE meetings SET status = CASE "
+                    "WHEN status IN ('completed', 'failed') THEN status ELSE 'completed' END, "
+                    "end_time = COALESCE(end_time, CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), "
+                    "data = jsonb_set("
+                    "CASE WHEN status IN ('completed', 'failed') THEN data "
+                    "ELSE jsonb_set(data, '{completion_reason}', "
+                    "CAST(:completion_reason AS jsonb), true) END, "
+                    "'{zaki_capture,teardown_state}', CAST(:teardown_state AS jsonb), true) "
+                    "WHERE id = :meeting_id "
+                    "AND data->'zaki_capture'->>'state' = 'withdrawn' "
+                    "RETURNING id"
+                ),
+                {
+                    "meeting_id": meeting_id,
+                    "teardown_state": json.dumps("confirmed"),
+                    "completion_reason": json.dumps("stopped"),
+                },
+            )
+            confirmed = updated.mappings().first() is not None
+            await db.commit()
+            return confirmed
+
+
+_MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
+_MAX_RUNTIME_RESPONSE_BYTES = 1024 * 1024
+
+
+async def _read_runtime_json(response) -> dict:
+    declared = response.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_length = int(declared)
+        except (TypeError, ValueError):
+            raise SpawnFailed("runtime kernel returned an invalid response") from None
+        if declared_length < 0 or declared_length > _MAX_RUNTIME_RESPONSE_BYTES:
+            raise SpawnFailed("runtime kernel response is too large")
+
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in response.aiter_bytes(64 * 1024):
+        total += len(chunk)
+        if total > _MAX_RUNTIME_RESPONSE_BYTES:
+            raise SpawnFailed("runtime kernel response is too large")
+        chunks.append(chunk)
+    try:
+        payload = json.loads(b"".join(chunks))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SpawnFailed("runtime kernel returned an invalid response") from None
+    if not isinstance(payload, dict):
+        raise SpawnFailed("runtime kernel returned an invalid response")
+    for field in ("workloadId", "name", "state"):
+        value = payload.get(field)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) > 512
+            or any(control in value for control in ("\x00", "\r", "\n"))
+        ):
+            raise SpawnFailed("runtime kernel returned an invalid response")
+    return payload
+
 
 class HttpRuntimeClient:
     """``RuntimeClient`` over the runtime.v1 HTTP kernel (``POST /workloads``). 429 → QuotaExceeded;
     non-201 → SpawnFailed (parent ``_spawn_via_runtime_api``)."""
 
-    def __init__(self, client, runtime_api_url: str):
+    def __init__(
+        self,
+        client,
+        runtime_api_url: str,
+        *,
+        control_secret: str = "",
+    ):
         self._client = client
         self._url = runtime_api_url.rstrip("/")
+        self._control_secret = control_secret
+
+    def _control_headers(self) -> dict[str, str]:
+        return (
+            {"X-Runtime-Control-Secret": self._control_secret}
+            if self._control_secret
+            else {}
+        )
 
     async def create_workload(self, spec: dict) -> dict:
-        resp = await self._client.post(f"{self._url}/workloads", json=spec, timeout=30.0)
-        if resp.status_code == 429:
-            raise QuotaExceeded("runtime kernel: owner quota exceeded")
-        if resp.status_code != 201:
-            raise SpawnFailed(f"runtime kernel returned {resp.status_code}")
-        return resp.json()
+        try:
+            body = json.dumps(spec, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError):
+            raise SpawnFailed("runtime kernel request is invalid") from None
+        if len(body) > _MAX_RUNTIME_REQUEST_BYTES:
+            raise SpawnFailed("runtime kernel request is too large")
+        try:
+            async with self._client.stream(
+                "POST",
+                f"{self._url}/workloads",
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    **self._control_headers(),
+                },
+                timeout=30.0,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code == 429:
+                    raise QuotaExceeded("runtime kernel: owner quota exceeded")
+                if response.status_code != 201:
+                    raise SpawnFailed(f"runtime kernel returned {response.status_code}")
+                return await _read_runtime_json(response)
+        except (QuotaExceeded, SpawnFailed):
+            raise
+        except Exception:
+            raise SpawnFailed("runtime kernel request failed") from None
 
     async def delete_workload(self, workload_id: str) -> None:
         """Tear down a workload (``DELETE /workloads/{id}``) — teardown must be CONFIRMED.
@@ -727,14 +963,45 @@ class HttpRuntimeClient:
         (the orphaned-live-bot incident treated exactly this 404 as success). Any other error
         raises ``SpawnFailed``. Callers log loud and retry/backstop; they must never report a stop
         as done on these."""
+        kwargs = {
+            "timeout": 60.0,  # the kernel's graceful teardown can hold the request for its stop grace
+        }
+        if self._control_secret:
+            kwargs["headers"] = self._control_headers()
         resp = await self._client.delete(
             f"{self._url}/workloads/{workload_id}",
-            timeout=60.0,  # the kernel's graceful teardown can hold the request for its stop grace
+            **kwargs,
         )
         if resp.status_code == 404:
             raise WorkloadUnknown(workload_id)
-        if resp.status_code >= 400:
+        if not 200 <= resp.status_code < 300:
             raise SpawnFailed(f"runtime kernel delete_workload returned {resp.status_code}")
+
+    async def scrub_workload(self, workload_id: str) -> None:
+        """Reclaim a workload plus its durable runtime record for privacy erasure."""
+        if not isinstance(workload_id, str) or not _RUNTIME_WORKLOAD_ID.fullmatch(workload_id):
+            raise SpawnFailed("runtime workload identity is invalid")
+        try:
+            async with self._client.stream(
+                "POST",
+                f"{self._url}/workloads/{workload_id}/scrub",
+                headers=self._control_headers(),
+                # The launch-default runtime can spend 35s on graceful termination and then
+                # up to 60s proving Kubernetes deletion. Leave enough room for both phases and
+                # HTTP overhead; timing out earlier would turn a valid erasure into ambiguity.
+                timeout=120.0,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code == 404:
+                    raise WorkloadUnknown(workload_id)
+                if not 200 <= response.status_code < 300:
+                    raise SpawnFailed(
+                        f"runtime kernel scrub_workload returned {response.status_code}"
+                    )
+        except (WorkloadUnknown, SpawnFailed):
+            raise
+        except Exception:
+            raise SpawnFailed("runtime kernel scrub_workload request failed") from None
 
     async def get_workload(self, workload_id: str) -> Optional[dict]:
         """Liveness probe (``GET /workloads/{id}``). 404 → the kernel does not TRACK the workload →
@@ -742,12 +1009,23 @@ class HttpRuntimeClient:
         the reconcile sweep treats it as 'untracked: fail loud, do not reap'. Any other non-200
         raises (caller treats it as 'unknown, do not reap' — fail safe toward NOT killing a
         possibly-live meeting)."""
-        resp = await self._client.get(f"{self._url}/workloads/{workload_id}", timeout=10.0)
-        if resp.status_code == 404:
-            return None
-        if resp.status_code != 200:
-            raise SpawnFailed(f"runtime kernel get_workload returned {resp.status_code}")
-        return resp.json()
+        try:
+            async with self._client.stream(
+                "GET",
+                f"{self._url}/workloads/{workload_id}",
+                headers=self._control_headers(),
+                timeout=10.0,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code == 404:
+                    return None
+                if response.status_code != 200:
+                    raise SpawnFailed(f"runtime kernel get_workload returned {response.status_code}")
+                return await _read_runtime_json(response)
+        except SpawnFailed:
+            raise
+        except Exception:
+            raise SpawnFailed("runtime kernel request failed") from None
 
 
 def build_production_router(*, database_url: Optional[str] = None, runtime_api_url: Optional[str] = None):
@@ -761,8 +1039,20 @@ def build_production_router(*, database_url: Optional[str] = None, runtime_api_u
         "DATABASE_URL", "postgresql+asyncpg://postgres:postgres@postgres:5432/vexa"
     )
     runtime_api_url = runtime_api_url or os.getenv("RUNTIME_API_URL", "http://runtime:8090")
+    runtime_control_secret = os.getenv("RUNTIME_CONTROL_SECRET") or ""
+    if not runtime_control_secret:
+        raise RuntimeError(
+            "RUNTIME_CONTROL_SECRET is required to authenticate runtime operations"
+        )
 
     engine = create_async_engine(database_url, pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    http = httpx.AsyncClient(timeout=30.0)
-    return build_router(SqlAlchemyMeetingRepo(session_factory), HttpRuntimeClient(http, runtime_api_url))
+    http = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return build_router(
+        SqlAlchemyMeetingRepo(session_factory),
+        HttpRuntimeClient(
+            http,
+            runtime_api_url,
+            control_secret=runtime_control_secret,
+        ),
+    )

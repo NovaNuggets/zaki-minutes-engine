@@ -1,0 +1,10 @@
+{
+  "tool": {
+    "name": "minutes_read",
+    "scope": "minutes:read",
+    "grant": "gate",
+    "transport": "builtin",
+    "cred_ref": "secret://zaki-read/minutes",
+    "barriers": ["sensitive_pii"]
+  }
+}

@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
+import control_plane.workspace_attach as workspace_attach
 from control_plane.workspace_attach import (
     CloneError,
-    _authenticated_url,
     _git_clone,
     attached_workspaces,
     rename_workspace,
@@ -180,11 +180,49 @@ def test_requesting_active_repo_is_a_noop(tmp_path):
     assert res.swapped is False and res.cloned is False and res.parked_slug is None
 
 
-def test_authenticated_url_embeds_token_for_https_only():
-    assert _authenticated_url("https://github.com/o/r.git", "TOK") == "https://TOK@github.com/o/r.git"
-    assert _authenticated_url("https://github.com/o/r.git", None) == "https://github.com/o/r.git"
-    assert _authenticated_url("git@github.com:o/r.git", "TOK") == "git@github.com:o/r.git"  # ssh: untouched
-    assert _authenticated_url("/local/path", "TOK") == "/local/path"                         # local: untouched
+def test_authenticated_clone_uses_askpass_without_pat_in_argv_env_or_origin(monkeypatch, tmp_path):
+    real_run = subprocess.run
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    askpass_path: Path | None = None
+
+    def fake_run(argv, *, check, capture_output, text, env):
+        nonlocal askpass_path
+        args = [str(arg) for arg in argv]
+        copied_env = {str(key): str(value) for key, value in env.items()}
+        calls.append((args, copied_env))
+        assert "SEKRET-TOKEN" not in "\0".join(args)
+        assert "SEKRET-TOKEN" not in "\0".join(copied_env.values())
+        if "clone" in args:
+            askpass_path = Path(copied_env["GIT_ASKPASS"])
+            username = real_run(
+                [str(askpass_path), "Username for 'https://github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            password = real_run(
+                [str(askpass_path), "Password for 'https://x-access-token@github.com':"],
+                env=copied_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            assert username == "x-access-token"
+            assert password == "SEKRET-TOKEN"
+        elif "checkout" in args:
+            assert "VEXA_GIT_TOKEN_FILE" not in copied_env
+            assert askpass_path is not None and not askpass_path.exists()
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(workspace_attach.subprocess, "run", fake_run)
+    dest = tmp_path / "dest"
+    _git_clone(
+        "https://github.com/acme/private.git", "main", dest, token="SEKRET-TOKEN"
+    )
+
+    assert calls
+    assert askpass_path is not None and not askpass_path.exists()
 
 
 def test_token_threads_to_clone_but_is_never_stored(tmp_path):

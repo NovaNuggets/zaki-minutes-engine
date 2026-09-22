@@ -21,6 +21,11 @@ def _stt_configured(monkeypatch):
     for the UNCONFIGURED case clears these explicitly (`monkeypatch.delenv`)."""
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "http://stt.test/transcribe")
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "test-stt-token")
+    # The app factory is production-fail-closed for lifecycle mutation. Most seam tests exercise
+    # unrelated FSM behavior in process; this explicit two-key dev escape keeps those fixtures
+    # concise. Authentication tests configure a real secret, which always takes precedence.
+    monkeypatch.setenv("DEV_MODE", "true")
+    monkeypatch.setenv("VEXA_ALLOW_INSECURE_LIFECYCLE_CALLBACKS", "true")
 
 
 # --- lifecycle.v1 goldens (the seam) ---------------------------------------------------
@@ -62,6 +67,8 @@ def goldens() -> Dict[str, Dict[str, Any]]:
     """Every lifecycle.v1 golden, keyed by case (e.g. 'joining', 'active')."""
     out: Dict[str, Dict[str, Any]] = {}
     for p in sorted(_golden_dir().glob("LifecycleEvent.*.json")):
+        if ".invalid-" in p.name:
+            continue
         case = p.stem.split(".", 1)[1]
         out[case] = json.loads(p.read_text())
     return out

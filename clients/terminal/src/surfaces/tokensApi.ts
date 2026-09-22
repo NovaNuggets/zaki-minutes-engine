@@ -3,7 +3,7 @@
  *  client never sends a user_id (P20). Fail-loud via the shared apiClient (P18). */
 import { getJson } from "./apiClient";
 
-export const TOKEN_SCOPES = ["bot", "tx", "browser"] as const;
+export const TOKEN_SCOPES = ["bot", "tx", "browser", "agent"] as const;
 export type TokenScope = (typeof TOKEN_SCOPES)[number];
 
 export interface TokenInfo {
@@ -20,9 +20,23 @@ export interface MintedToken extends TokenInfo {
   token: string;
 }
 
-export async function listTokens(): Promise<TokenInfo[]> {
-  const { tokens } = await getJson<{ tokens: TokenInfo[] }>("/api/tokens", { cache: "no-store" });
-  return tokens;
+export interface TokenList {
+  tokens: TokenInfo[];
+  availableScopes: TokenScope[];
+  identityContract: "identity.v1" | "identity.v2";
+}
+
+export async function listTokens(): Promise<TokenList> {
+  const result = await getJson<{
+    tokens: TokenInfo[];
+    available_scopes: TokenScope[];
+    identity_contract: "identity.v1" | "identity.v2";
+  }>("/api/tokens", { cache: "no-store" });
+  return {
+    tokens: result.tokens,
+    availableScopes: result.available_scopes,
+    identityContract: result.identity_contract,
+  };
 }
 
 export async function createToken(opts: { scopes: TokenScope[]; name?: string; expiresIn?: number }): Promise<MintedToken> {

@@ -10,15 +10,20 @@ export type ModelPrefs = {
   base_url?: string | null;
   api_key_set?: boolean;
   api_key?: string | null; // masked on read (********abcd) — write-only in the clear
+  config_status?: "valid" | "blocked" | "incomplete";
+  validation_error?: string | null;
 };
 
 export type TranscriptionPrefs = {
   url?: string | null;
   token_set?: boolean;
   token?: string | null; // masked on read — write-only in the clear
+  config_status?: "valid" | "blocked" | "incomplete";
+  validation_error?: string | null;
 };
 
-/** Global platform settings carry the SAME fields unmasked (admin tier). */
+/** Global platform settings carry the same fields, but write-only secrets are masked even for an
+ * admin browser. An unchanged mask must be omitted; empty string explicitly clears. */
 export type GlobalSetting = Record<string, string>;
 
 async function jsonOrThrow(res: Response) {
@@ -70,17 +75,18 @@ export async function setGlobalSetting(key: GlobalSettingKey, update: GlobalSett
   return body.value ?? {};
 }
 
-/** On-demand credential tests (agent-api /api/{models,transcription}/test via the catch-all →
- *  gateway /agent/* edge). They test the EFFECTIVE config — the same user > global > env
- *  resolution a real turn / bot spawn applies — and fail LOUD with the remedy in `summary`. */
+/** On-demand tests (agent-api /api/{models,transcription}/test via the gateway). A personal custom
+ * tier may be probed live. An inherited platform/env tier returns generic managed/configured status
+ * only: no operator credential spend and no origin, account, balance, or expiry disclosure. */
 export type ConfigTestResult = {
   ok: boolean;
   summary: string;
-  mode?: string;          // models: "subscription" | "custom"
-  source?: string;        // transcription: "settings" | "env"
-  expires_in_hours?: number;
-  account?: string;
-  balance?: number | null;
+  mode?: string;
+  source?: "user" | "operator";
+  managed?: boolean;
+  expires_in_hours?: number; // personal result only
+  account?: string;          // personal STT result only
+  balance?: number | null;   // personal STT result only
 };
 
 export async function testModels(): Promise<ConfigTestResult> {

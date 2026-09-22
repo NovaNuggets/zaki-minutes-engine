@@ -13,6 +13,9 @@ eager-creates the `MeetingSession` keyed by the bot's `connectionId`.
   validate against the sealed schema **at the seam** before anything ships.
 - `MeetingRepo` / `RuntimeClient` ports + `QuotaExceeded` / `MaxBotsExceeded` / `SpawnFailed` /
   `DuplicateMeeting`.
+- `MeetingRepo.list_terminal_meeting_ids(...)` — the bounded id-only recovery read used to rebuild
+  an operator `transcript.finalized` intent if a process dies after the terminal database commit
+  but before Redis enqueue; it reads neither transcript nor user-webhook content.
 - `adapters.build_production_router(...)` — wire with real SQLAlchemy + the httpx runtime client.
 - `fakes` — `InMemoryMeetingRepo` / `FakeRuntimeClient` (offline drivers).
 
