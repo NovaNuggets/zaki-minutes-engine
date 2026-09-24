@@ -387,8 +387,9 @@ redis:
 minio:
   enabled: true
   image:
-    repository: minio/minio
-    tag: latest
+    # MinIO publishes on quay.io; the Docker Hub minio/* repos return pull access denied (#61).
+    repository: quay.io/minio/minio
+    tag: RELEASE.2025-09-07T16-13-09Z
   accessKey: vexa-access-key
   secretKey: vexa-secret-key
   bucket: vexa

@@ -28,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: minio-init
-          image: minio/mc:latest
+          image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
           imagePullPolicy: IfNotPresent
           # v0.10.5 Pack A.3 — replace `sleep 5` with poll-until-ready (#249).
           # On a fresh PVC, MinIO can take 30+ seconds to attach + initialize.
