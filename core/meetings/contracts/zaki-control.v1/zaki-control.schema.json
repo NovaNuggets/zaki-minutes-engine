@@ -375,6 +375,17 @@
         "policy_version": { "$ref": "#/$defs/Identifier" }
       }
     },
+    "PolicyResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "request_id", "subject", "policy"],
+      "properties": {
+        "api_version": { "const": "zaki-control.v1" },
+        "request_id": { "$ref": "#/$defs/Identifier" },
+        "subject": { "$ref": "#/$defs/Subject" },
+        "policy": { "$ref": "#/$defs/Policy" }
+      }
+    },
     "CaptureResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -524,7 +535,7 @@
           "enum": [
             "auth_failed", "subject_mismatch", "minutes_disabled", "quota_exhausted",
             "idempotency_conflict", "invalid_state", "invalid_request",
-            "upstream_unavailable", "internal_error"
+            "upstream_unavailable", "internal_error", "policy_not_found"
           ]
         },
         "retryable": { "type": "boolean" }

@@ -302,6 +302,97 @@ def test_control_rejects_a_valid_token_when_one_identity_copy_disagrees(monkeypa
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_policy_read_round_trips_the_stored_policy(monkeypatch):
+    """The control plane captures from the STORED policy; this read is the surface
+    the Hub renders the consent form from, so every stored field must come back."""
+    client, _store, *_ = _client(monkeypatch)
+    assert client.post(
+        "/api/zaki/control/v1/42/ensure", headers=_headers(), json=_ensure()
+    ).status_code == 200
+
+    response = client.get("/api/zaki/control/v1/42/policy", headers=_headers())
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "api_version": "zaki-control.v1",
+        "request_id": "request-1",
+        "subject": {"tenant_id": "tenant-1", "user_id": "42"},
+        "policy": {
+            "capture_enabled": True,
+            "agent_read_enabled": True,
+            "capture_notice_policy_version": "notice-v1",
+            "retention": {"audio_days": 7, "transcript_days": 30, "summary_days": 30},
+        },
+    }
+
+
+def test_policy_read_round_trips_a_consent_off_policy(monkeypatch):
+    """This row is consent-truth: a user who turned capture OFF must read back OFF.
+    Each field is asserted on its own so the read cannot return a constant, and
+    the three retention windows are distinct so a swap cannot hide."""
+    client, _store, *_ = _client(monkeypatch)
+    consent_off = _ensure()
+    consent_off["policy"] = {
+        "capture_enabled": False,
+        "agent_read_enabled": False,
+        "capture_notice_policy_version": "notice-v1",
+        "retention": {"audio_days": 0, "transcript_days": 90, "summary_days": 14},
+    }
+    assert client.post(
+        "/api/zaki/control/v1/42/ensure", headers=_headers(), json=consent_off
+    ).status_code == 200
+
+    response = client.get("/api/zaki/control/v1/42/policy", headers=_headers())
+
+    assert response.status_code == 200
+    policy = response.json()["policy"]
+    assert policy["capture_enabled"] is False
+    assert policy["agent_read_enabled"] is False
+    assert policy["capture_notice_policy_version"] == "notice-v1"
+    assert policy["retention"]["audio_days"] == 0
+    assert policy["retention"]["transcript_days"] == 90
+    assert policy["retention"]["summary_days"] == 14
+
+
+def test_policy_read_refuses_a_foreign_or_mismatched_subject(monkeypatch):
+    """Same binding as every control route: one disagreeing identity copy fails
+    closed, and a cleanly bound foreign subject gets the same 404 as absence —
+    stored policy existence must not be enumerable across users."""
+    client, _store, *_ = _client(monkeypatch)
+    assert client.post(
+        "/api/zaki/control/v1/42/ensure", headers=_headers(), json=_ensure()
+    ).status_code == 200
+
+    mismatched = client.get(
+        "/api/zaki/control/v1/42/policy", headers=_headers(**{"X-Zaki-User-Id": "43"})
+    )
+    assert mismatched.status_code == 403
+    assert mismatched.json()["code"] == "subject_mismatch"
+
+    foreign = client.get(
+        "/api/zaki/control/v1/43/policy",
+        headers={
+            "X-Zaki-Control-Token": _token(user_id="43"),
+            "X-Zaki-Tenant-Id": "tenant-1",
+            "X-Zaki-User-Id": "43",
+            "X-Request-Id": "request-foreign",
+        },
+    )
+    assert foreign.status_code == 404
+    assert foreign.json()["code"] == "policy_not_found"
+
+
+def test_policy_read_404s_policy_not_found_when_none_is_stored(monkeypatch):
+    client, _store, *_ = _client(monkeypatch)
+
+    response = client.get("/api/zaki/control/v1/42/policy", headers=_headers())
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "policy_not_found"
+    assert response.headers["cache-control"] == "no-store"
+
+
 def test_capture_uses_the_visible_notetaker_and_persists_read_policy(monkeypatch):
     client, store, _repo, runtime, *_ = _client(monkeypatch)
     assert client.post("/api/zaki/control/v1/42/ensure", headers=_headers(), json=_ensure()).status_code == 200

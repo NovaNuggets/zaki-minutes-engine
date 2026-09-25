@@ -26,6 +26,7 @@ token/path/header/body equality rules executable without carrying a service-toke
 
 ```text
 POST /api/zaki/control/v1/{userId}/ensure
+GET  /api/zaki/control/v1/{userId}/policy
 POST /api/zaki/control/v1/{userId}/captures
 GET  /api/zaki/control/v1/{userId}/captures/{captureId}
 POST /api/zaki/control/v1/{userId}/captures/{captureId}/stop
@@ -49,12 +50,13 @@ mutation request bodies; the validator infers the operation from the closed requ
 the canonical request SHA-256 itself. Each attempt also carries the observed response request ID and
 the canonical SHA-256 of a successful response after removing `request_id`; replay must preserve that
 result fingerprint while echoing the current attempt ID, and conflicts carry no successful result.
-Capture, stop, meeting-erasure and account-erasure replay paths are all covered explicitly. GET status
-is bounded, credential-free JSON.
+Capture, stop, meeting-erasure and account-erasure replay paths are all covered explicitly. GET policy
+and GET status are bounded, credential-free JSON reads under the same identity binding.
 
 | Route | Request `$def` | Success `$def` | Failure `$def` |
 |---|---|---|---|
 | `ensure` | `EnsureRequest` | `EnsureResponse` | `ErrorResponse` |
+| policy read | — | `PolicyResponse` | `ErrorResponse` |
 | `captures` | `CaptureRequest` | `CaptureResponse` | `ErrorResponse` |
 | capture status | — | `StatusResponse` | `ErrorResponse` |
 | capture stop | `StopCaptureRequest` | `StatusResponse` | `ErrorResponse` |
@@ -63,8 +65,8 @@ is bounded, credential-free JSON.
 | callback | `CallbackEnvelope` + `SignatureHeaders` | `CallbackAck` | `CallbackErrorResponse` |
 
 Control-route failures use `ErrorResponse`. Its closed code vocabulary separates authentication,
-binding, disabled, quota, idempotency conflict, illegal state, invalid input, retryable upstream and
-internal failures. Callback failures use `CallbackErrorResponse`, whose closed vocabulary is limited
+binding, disabled, quota, idempotency conflict, illegal state, invalid input, missing policy
+(`policy_not_found`), retryable upstream and internal failures. Callback failures use `CallbackErrorResponse`, whose closed vocabulary is limited
 to authentication, invalid input/state, retryable upstream and internal failures. Neither error shape
 carries free-form detail.
 
@@ -97,7 +99,9 @@ not. `StatusResponse.metering.terminal` is true exactly for `completed|failed` a
 non-terminal lifecycle states.
 
 Retention is explicit and policy-owned. This schema admits operator-selected bounded windows but
-does not choose defaults. Summary retention cannot outlive transcript retention. A read never extends
+does not choose defaults. Summary retention cannot outlive transcript retention. The policy read
+returns the stored `Policy` verbatim and `404 policy_not_found` when none is stored — including to a
+cleanly bound foreign subject, so stored-policy existence is never enumerable. A read never extends
 any window; `zaki-read.v1` remains the separate read boundary.
 
 ## Metering and idempotency
