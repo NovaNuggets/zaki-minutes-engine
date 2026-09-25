@@ -142,9 +142,12 @@ up: preflight
 		docker run -d --name $(MINIO_CONTAINER) --network $(NETWORK) --restart unless-stopped \
 			-e MINIO_ROOT_USER=$(MINIO_ACCESS_KEY) -e MINIO_ROOT_PASSWORD=$(MINIO_SECRET_KEY) \
 			-v vexa-lite-miniodata:/data \
-			quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --console-address ":9001" > /dev/null; \
+			--user 0:0 --entrypoint minio \
+			docker.io/bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20 server /data --console-address ":9001" > /dev/null; \
 		sleep 4; \
-		docker run --rm --network $(NETWORK) --entrypoint sh quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z -c \
+		docker run --rm --network $(NETWORK) --entrypoint sh \
+			-e MC_CONFIG_DIR=/tmp/.mc \
+			docker.io/bitnamilegacy/minio-client:2025.7.21-debian-12-r3@sha256:73bd39f7899a0cef12b8dd5df13aa93a3ed1aaa44236542442e9ac76819ac158 -c \
 			"mc alias set vexa http://$(MINIO_CONTAINER):9000 $(MINIO_ACCESS_KEY) $(MINIO_SECRET_KEY) && mc mb --ignore-existing vexa/$(MINIO_BUCKET)" >/dev/null 2>&1 || true; \
 	fi; echo "  ✓ MinIO ready"; \
 	if [ -n "$(LOCAL_STT)" ]; then \
