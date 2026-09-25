@@ -615,6 +615,42 @@ def build_router(
             return _control_error(503, "upstream_unavailable", request_id=x_request_id)
         return _response(result, request_id=x_request_id)
 
+    @router.get("/api/zaki/control/v1/{user_id}/policy")
+    async def read_policy(
+        user_id: str,
+        x_zaki_control_token: str | None = Header(default=None),
+        x_zaki_tenant_id: str | None = Header(default=None),
+        x_zaki_user_id: str | None = Header(default=None),
+        x_request_id: str | None = Header(default=None),
+    ):
+        request_id = x_request_id if _valid_identifier(x_request_id) else "policy-request"
+        subject, code = _binding(
+            token=x_zaki_control_token, config=config, path_user_id=user_id,
+            tenant_header=x_zaki_tenant_id, user_header=x_zaki_user_id, body=None, now=now(),
+        )
+        if code:
+            return _control_error(401 if code == "auth_failed" else 403, code, request_id=request_id)
+        policy = await store.get_policy(subject)
+        if policy is None:
+            return _control_error(404, "policy_not_found", request_id=request_id)
+        return _response(
+            {
+                "api_version": "zaki-control.v1",
+                "subject": {"tenant_id": subject.tenant_id, "user_id": subject.user_id},
+                "policy": {
+                    "capture_enabled": policy.capture_enabled,
+                    "agent_read_enabled": policy.agent_read_enabled,
+                    "capture_notice_policy_version": policy.policy_version,
+                    "retention": {
+                        "audio_days": policy.audio_days,
+                        "transcript_days": policy.transcript_days,
+                        "summary_days": policy.summary_days,
+                    },
+                },
+            },
+            request_id=request_id,
+        )
+
     @router.post("/api/zaki/control/v1/{user_id}/captures")
     async def create_capture(
         user_id: str,
