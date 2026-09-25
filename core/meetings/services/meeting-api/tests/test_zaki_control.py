@@ -327,6 +327,34 @@ def test_policy_read_round_trips_the_stored_policy(monkeypatch):
     }
 
 
+def test_policy_read_round_trips_a_consent_off_policy(monkeypatch):
+    """This row is consent-truth: a user who turned capture OFF must read back OFF.
+    Each field is asserted on its own so the read cannot return a constant, and
+    the three retention windows are distinct so a swap cannot hide."""
+    client, _store, *_ = _client(monkeypatch)
+    consent_off = _ensure()
+    consent_off["policy"] = {
+        "capture_enabled": False,
+        "agent_read_enabled": False,
+        "capture_notice_policy_version": "notice-v1",
+        "retention": {"audio_days": 0, "transcript_days": 90, "summary_days": 14},
+    }
+    assert client.post(
+        "/api/zaki/control/v1/42/ensure", headers=_headers(), json=consent_off
+    ).status_code == 200
+
+    response = client.get("/api/zaki/control/v1/42/policy", headers=_headers())
+
+    assert response.status_code == 200
+    policy = response.json()["policy"]
+    assert policy["capture_enabled"] is False
+    assert policy["agent_read_enabled"] is False
+    assert policy["capture_notice_policy_version"] == "notice-v1"
+    assert policy["retention"]["audio_days"] == 0
+    assert policy["retention"]["transcript_days"] == 90
+    assert policy["retention"]["summary_days"] == 14
+
+
 def test_policy_read_refuses_a_foreign_or_mismatched_subject(monkeypatch):
     """Same binding as every control route: one disagreeing identity copy fails
     closed, and a cleanly bound foreign subject gets the same 404 as absence —
