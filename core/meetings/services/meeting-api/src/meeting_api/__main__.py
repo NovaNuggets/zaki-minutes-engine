@@ -68,6 +68,10 @@ def _require_config(env: "os._Environ | dict | None" = None) -> None:
 
 def build_production_app():
     """Wire the unified meeting-api with the real adapters + the lifespan-driven loops."""
+    from . import error_sink
+
+    # L-0990: error sink first (inert without SENTRY_DSN — no init, no middleware, no network).
+    error_sink_live = error_sink.init("meeting-api")
     _require_config()  # A4: refuse to boot a misconfigured deploy (no ADMIN_TOKEN → every spawn 500s).
 
     import redis.asyncio as aioredis
@@ -228,6 +232,8 @@ def build_production_app():
         zaki_control_retention_storage=zaki_control_retention_storage,
         zaki_control_callback=zaki_control_callback,
     )
+    if error_sink_live:
+        app.add_middleware(error_sink.ErrorSinkMiddleware)
 
     _attach_background_loops(
         app, transcript_store, segment_bus, redis_client, meeting_repo, runtime_client,

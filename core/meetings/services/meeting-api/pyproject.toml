@@ -9,6 +9,7 @@ dependencies = [
     "jsonschema>=4.21,<5",
     "referencing>=0.34,<1",
     "redis>=5,<6",
+    "sentry-sdk>=2,<3",
     "fakeredis>=2.21,<3",
     "croniter>=2,<4",
     "python-multipart>=0.0.9",   # recordings chunk upload — FastAPI UploadFile/Form parsing

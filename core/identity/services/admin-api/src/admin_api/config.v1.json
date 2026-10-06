@@ -94,6 +94,28 @@
    "default": "8001",
    "description": "uvicorn bind port",
    "targets": ["lite"]
+  },
+  {
+   "key": "SENTRY_DSN",
+   "class": "defaulted",
+   "default": "(unset or blank: the error sink is fully inert — no SDK init, no middleware, no network)",
+   "secret": true,
+   "description": "GlitchTip/Sentry DSN for the L-0990 error sink (one event per unhandled exception and per answered 5xx; scrubbed per L-0989). Plumbed by the deployment's own chart, not this repo's stock surfaces.",
+   "targets": []
+  },
+  {
+   "key": "SENTRY_ENVIRONMENT",
+   "class": "defaulted",
+   "default": "(unset: the SDK omits the environment tag)",
+   "description": "environment tag on error-sink events (staging/prod)",
+   "targets": []
+  },
+  {
+   "key": "SENTRY_RELEASE",
+   "class": "defaulted",
+   "default": "(unset: the SDK omits the release tag)",
+   "description": "release tag on error-sink events",
+   "targets": []
   }
  ]
 }
