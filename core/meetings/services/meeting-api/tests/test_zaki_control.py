@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import pytest
 import base64
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -16,7 +17,7 @@ from meeting_api import create_app
 from meeting_api.bot_spawn.fakes import FakeRuntimeClient, InMemoryMeetingRepo
 from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher
 from meeting_api.retention.fakes import InMemoryRetentionRepo, InMemoryRetentionStorage
-from meeting_api.zaki_control.callbacks import ControlCallbackDispatcher
+from meeting_api.zaki_control.callbacks import ControlCallbackDispatcher, capture_seconds_at
 from meeting_api.zaki_control.fakes import InMemoryControlStore
 from meeting_api.zaki_control.ports import CallbackEvent, Subject
 from meeting_api.zaki_control.router import ControlConfig, build_router
@@ -469,10 +470,15 @@ def test_capture_owner_limit_clamps_lifetime_and_arms_leave_after(monkeypatch):
     capture = asyncio.run(store.get_capture(
         subject=Subject("tenant-1", "42"), capture_id=capture_id
     ))
-    # The owner's 15-minute bound clamps BOTH the runtime teardown ceiling and the
-    # persisted settlement cap below the reserve and platform ceilings (3600s).
+    # The owner's 15-minute bound clamps the persisted settlement cap below the reserve and
+    # platform ceilings (3600s), and the bot's leave-after rides the invocation at exactly
+    # the bound. The runtime's teardown ceiling gets headroom OVER the bound instead: its
+    # clock starts at workload create while the bot's leave timer starts at `active`, so an
+    # equal value lets the reaper's SIGTERM pre-empt the bot's own announced leave.
+    # Headroom = 600s waiting-room bound + 60s join ramp + 8s announce + 8s leave + 15s
+    # emit/sweep slack = 691s (bot_spawn/service.py LEAVE_AFTER_HEADROOM_SEC).
     assert capture.max_capture_seconds == 900
-    assert runtime.specs[-1]["maxLifetimeSec"] == 900
+    assert runtime.specs[-1]["maxLifetimeSec"] == 900 + 691
     assert _workload_invocation(runtime)["leaveAfterMs"] == 900_000
 
 
@@ -492,9 +498,10 @@ def test_capture_owner_limit_never_exceeds_reserve_or_deployment_cap(monkeypatch
         subject=Subject("tenant-1", "42"), capture_id=response.json()["capture_id"]
     ))
     # A 240-minute setting on a 30-minute reserve runs to the reserve: the announced
-    # bound is the effective one, never the owner's pick alone.
+    # bound is the effective one, never the owner's pick alone. The headroom extends the
+    # runtime's wall-clock teardown only — never the settlement cap.
     assert capture.max_capture_seconds == 1800
-    assert runtime.specs[-1]["maxLifetimeSec"] == 1800
+    assert runtime.specs[-1]["maxLifetimeSec"] == 1800 + 691
     assert _workload_invocation(runtime)["leaveAfterMs"] == 1_800_000
 
 
@@ -513,6 +520,34 @@ def test_capture_without_owner_limit_carries_no_leave_after(monkeypatch):
         subject=Subject("tenant-1", "42"), capture_id=response.json()["capture_id"]
     ))
     assert capture.max_capture_seconds == 3600
+    # No owner bound ⇒ no headroom either: the runtime's silent `max_lifetime` teardown
+    # stays exactly at the enforced cap, as on main.
+    assert runtime.specs[-1]["maxLifetimeSec"] == 3600
+
+
+def test_leave_headroom_never_inflates_the_billing_cap(monkeypatch):
+    """The headroom extends the workload's WALL-CLOCK, not the settlement bound: a capture
+    that ran its owner limit plus the entire headroom still bills `max_capture_seconds`
+    (`capture_seconds_at` clamps the active window at the persisted cap)."""
+    client, store, _repo, _runtime, *_ = _client(monkeypatch)
+    ensure = _ensure()
+    ensure["policy"]["max_meeting_minutes"] = 15
+    assert client.post("/api/zaki/control/v1/42/ensure", headers=_headers(), json=ensure).status_code == 200
+
+    response = client.post(
+        "/api/zaki/control/v1/42/captures",
+        headers=_headers("capture-request", "capture-key"), json=_capture(reserved_units=60),
+    )
+
+    assert response.status_code == 200
+    capture = asyncio.run(store.get_capture(
+        subject=Subject("tenant-1", "42"), capture_id=response.json()["capture_id"]
+    ))
+    overran = replace(capture, started_at=NOW, captured_seconds_total=0)
+    billed = capture_seconds_at(
+        overran, NOW + timedelta(seconds=900 + 691 + 120),
+    )
+    assert billed == 900
 
 
 def test_limit_reached_rides_the_terminal_status_callback_and_response(monkeypatch):
