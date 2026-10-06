@@ -48,6 +48,7 @@ from .url_validation import validate_meeting_url
 # already do ``from .service import DuplicateMeeting`` (the router) keep working.
 __all__ = [
     "request_bot", "construct_meeting_url", "DuplicateMeeting", "DEFAULT_AUTOMATIC_LEAVE",
+    "LEAVE_AFTER_HEADROOM_SEC",
 ]
 
 # Non-terminal statuses (parent's active set) — a prior meeting in one of these blocks a new spawn.
@@ -67,6 +68,22 @@ _TERMINAL_STATUSES = ("completed", "failed")
 # ``test_reap_window_never_undercuts_the_bots_own_lobby_timeout`` asserts the relation off THIS
 # value rather than a copy of it.
 DEFAULT_AUTOMATIC_LEAVE = {"waitingRoomTimeout": 600000, "everyoneLeftTimeout": 120000}
+
+# A leave-after bound is armed by the BOT once it reaches `active`; the runtime's reaper
+# clock starts at workload CREATE (runtime_kernel enforcement sweep, `maxLifetimeSec`).
+# Equal values let the SIGTERM pre-empt the bot's own announced leave whenever
+# spawn → active outlasts one sweep — the run then ends `stopped` with no line posted and
+# `limit_reached` unset. An armed leave-after therefore carries lifetime headroom over the
+# bound: the worst-case spawn → active (the join's waiting-room bound off THIS value, plus
+# the ramp before it) then the bounded announce → leave → completed emit. Billing is
+# untouched — `capture_seconds_at` clamps the settlement to `max_capture_seconds`.
+LEAVE_AFTER_HEADROOM_SEC = (
+    DEFAULT_AUTOMATIC_LEAVE["waitingRoomTimeout"] // 1000
+    + 60   # pod start, browser launch, navigation and the join click before the wait begins
+    + 8    # the bounded in-meeting announcement (bot orchestrator)
+    + 8    # the bounded platform leave (bot orchestrator)
+    + 15   # the completed lifecycle emit plus one enforcement sweep of slack
+)
 
 
 def _stt_verdict_max_age_s() -> float:
@@ -186,6 +203,7 @@ async def request_bot(
     webhook_secret: Optional[str] = None,
     webhook_events: Optional[dict] = None,
     max_lifetime_sec: Optional[int] = None,
+    leave_after_ms: Optional[int] = None,
 ) -> dict:
     """Run the spawn flow and return a MeetingResponse-shaped dict.
 
@@ -420,6 +438,7 @@ async def request_bot(
         s3_access_key=auth_s3.get("s3_access_key"),
         s3_secret_key=auth_s3.get("s3_secret_key"),
         automatic_leave=DEFAULT_AUTOMATIC_LEAVE,
+        leave_after_ms=leave_after_ms,
     )
 
     # 5. Spawn over runtime.v1.
@@ -427,7 +446,11 @@ async def request_bot(
         workload_id=f"mtg-{meeting_id}-{connection_id[:8]}",
         invocation=invocation,
         callback_url=f"{meeting_api_url}/runtime/callback",
-        max_lifetime_sec=max_lifetime_sec,
+        max_lifetime_sec=(
+            max_lifetime_sec + LEAVE_AFTER_HEADROOM_SEC
+            if leave_after_ms is not None and max_lifetime_sec is not None
+            else max_lifetime_sec
+        ),
     )
     try:
         result = await runtime.create_workload(spec)
