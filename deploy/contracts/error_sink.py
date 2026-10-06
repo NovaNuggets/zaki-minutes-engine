@@ -33,8 +33,12 @@ import re
 
 log = logging.getLogger("error_sink")
 
-# Probe paths the pods answer before warmup (k8s startup/readiness/liveness): never an event.
-_PROBE_PATHS = frozenset({"/health", "/healthz", "/livez", "/readyz"})
+# Probe paths answered before warmup: k8s startup/readiness/liveness, plus the hub's
+# startup poll (zaki-api answers 503 {"state":"starting"} every 2 s until its control
+# tables are prepared — deployment.yaml:37, app.py:256-262). Never an event.
+_PROBE_PATHS = frozenset(
+    {"/health", "/healthz", "/livez", "/readyz", "/api/zaki/control/v1/ready"}
+)
 
 # ENOENT, SQLITE_BUSY, ERR_INVALID_ARG_TYPE: constants, never content.
 _CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
@@ -95,7 +99,11 @@ def scrub_event(event: dict, hint: dict) -> dict:
         value.pop("value", None)
         for frame in (value.get("stacktrace") or {}).get("frames") or []:
             frame.pop("vars", None)
-    code = _error_code(hint.get("original_exception"))
+    exc = hint.get("original_exception")
+    if exc is None:
+        exc_info = hint.get("exc_info")
+        exc = exc_info[1] if exc_info else None
+    code = _error_code(exc)
     if code and values:
         values[-1]["value"] = code
     return event

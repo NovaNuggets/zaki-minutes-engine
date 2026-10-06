@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import logging
 import os
 import subprocess
 import sys
@@ -25,6 +26,22 @@ SERVICE = "meeting-api"
 FAKE_DSN = "https://0123456789abcdef0123456789abcdef@o0.ingest.example.test/1"
 TRANSCRIPT_LINE = "Alice: the merger closes at two billion euros"
 EMAIL = "alice@example.com"
+MEETING_ID = "mtg-PLANTED-9f8e7d6c5b4a"
+LOG_LINE = "collector heartbeat: planted breadcrumb marker"
+FREE_TEXT_CODE = "the widget frobnicated near the fridge"
+CAPS_CODE = "INGEST_STALLED"
+
+
+class FreeTextCodeError(RuntimeError):
+    """An error whose ``.code`` is prose, not an ALL-CAPS constant."""
+
+    code = FREE_TEXT_CODE
+
+
+class CapsCodeError(RuntimeError):
+    """An error carrying an ALL-CAPS constant code (``ENOENT``-style)."""
+
+    code = CAPS_CODE
 
 
 def _capture_transport():
@@ -72,6 +89,35 @@ def _app():
     async def degraded():
         return JSONResponse(status_code=503, content={"detail": "downstream"})
 
+    @app.get("/meetings/{meeting_id}")
+    async def meeting(meeting_id: str):
+        return JSONResponse(status_code=503, content={"detail": "degraded"})
+
+    @app.get("/health")
+    async def health():
+        return JSONResponse(status_code=503, content={"state": "down"})
+
+    @app.get("/api/zaki/control/v1/ready")
+    async def control_ready():
+        return JSONResponse(status_code=503, content={"state": "starting"})
+
+    @app.get("/forbidden")
+    async def forbidden():
+        return JSONResponse(status_code=403, content={"detail": "not yours"})
+
+    @app.get("/boom-code")
+    async def boom_code():
+        raise FreeTextCodeError("ingest blew up")
+
+    @app.get("/boom-caps")
+    async def boom_caps():
+        raise CapsCodeError("ingest blew up")
+
+    @app.get("/boom-log")
+    async def boom_log():
+        logging.getLogger("meeting_api").warning(LOG_LINE)
+        raise RuntimeError("capture died mid-ingest")
+
     app.add_middleware(error_sink.ErrorSinkMiddleware)
     return app
 
@@ -106,6 +152,63 @@ def test_planted_pii_absent_from_envelope_bytes(sink):
     assert len(sink.payloads) == 1
     assert TRANSCRIPT_LINE.encode() not in sink.payloads[0]
     assert EMAIL.encode() not in sink.payloads[0]
+
+
+def test_5xx_title_holds_the_route_template_not_the_raw_path(sink):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get(f"/meetings/{MEETING_ID}")
+    assert resp.status_code == 503
+    assert len(sink.payloads) == 1
+    assert b"HTTP 503 GET /meetings/{meeting_id}" in sink.payloads[0]
+    assert MEETING_ID.encode() not in sink.payloads[0]
+
+
+@pytest.mark.parametrize("path", ["/health", "/api/zaki/control/v1/ready"])
+def test_probe_path_5xx_is_not_an_event(sink, path):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get(path)
+    assert resp.status_code == 503
+    assert sink.payloads == []
+
+
+@pytest.mark.parametrize("path", ["/forbidden", "/not-a-route"])
+def test_4xx_is_not_an_event(sink, path):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get(path)
+    assert resp.status_code in (403, 404)
+    assert sink.payloads == []
+
+
+def test_free_text_error_code_is_not_the_title(sink):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get("/boom-code")
+    assert resp.status_code == 500
+    assert len(sink.payloads) == 1
+    assert b"FreeTextCodeError" in sink.payloads[0]
+    assert FREE_TEXT_CODE.encode() not in sink.payloads[0]
+
+
+def test_all_caps_error_code_is_the_title(sink):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get("/boom-caps")
+    assert resp.status_code == 500
+    assert len(sink.payloads) == 1
+    assert b"CapsCodeError" in sink.payloads[0]
+    assert CAPS_CODE.encode() in sink.payloads[0]
+
+
+def test_log_line_is_not_a_breadcrumb_in_the_envelope(sink):
+    from fastapi.testclient import TestClient
+
+    resp = TestClient(_app(), raise_server_exceptions=False).get("/boom-log")
+    assert resp.status_code == 500
+    assert len(sink.payloads) == 1
+    assert LOG_LINE.encode() not in sink.payloads[0]
 
 
 @pytest.mark.parametrize("dsn", [None, ""])

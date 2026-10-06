@@ -4,4 +4,6 @@
   and `SENTRY_RELEASE`. With `SENTRY_DSN` unset or blank the sink is fully inert — no SDK init, no
   middleware, no network. Events are scrubbed before send per L-0989: no request data, identity,
   breadcrumbs, frame locals or free-text messages; exception titles keep the type plus an ALL-CAPS
-  code only. Chart wiring of `SENTRY_*` and egress to the sink host are deployment follow-ups.
+  code only. Kubelet probe paths and the hub's `/api/zaki/control/v1/ready` startup poll (503 while
+  starting) never report. Chart wiring of `SENTRY_*` and egress to the sink host are deployment
+  follow-ups.
