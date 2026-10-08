@@ -175,6 +175,97 @@ async function main(): Promise<void> {
     check('time-cap: completed(max_bot_time_exceeded)', res.status === 'completed' && last(lc.events).completion_reason === 'max_bot_time_exceeded');
   }
 
+  // ── the owner's leave-after bound → announce BEFORE leave → completed(user_limit_reached) ──
+  // The CEO-approved pin: at the user-set bound the bot posts one in-meeting chat line
+  // (en/ar by invocation.language) and only then hangs up. Ordering is asserted against a
+  // driver that records the call sequence.
+  {
+    const lc = recordingSink();
+    const order: string[] = [];
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async announce(text) { order.push(`announce:${text}`); return true; },
+      async leave() { order.push('leave'); },
+      async withdraw() {},
+    };
+    const res = await createOrchestrator(inv(), { lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs() })
+      .run({ leaveAfterMs: 5, maxActiveMs: 60_000 });
+    check('leave-after: completed(user_limit_reached)', res.status === 'completed' && last(lc.events).completion_reason === 'user_limit_reached');
+    check('leave-after: lifecycle event conforms', allConform(lc.events), ajv.errorsText(validateLifecycle.errors));
+    check('leave-after: announcement precedes the leave',
+      order.length === 2 && order[0] === 'announce:ZAKI notetaker is leaving: the 1-minute limit was reached. Notes will be ready shortly.' && order[1] === 'leave',
+      JSON.stringify(order));
+  }
+
+  // ── leave-after in Arabic ──
+  {
+    const lc = recordingSink();
+    const texts: string[] = [];
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async announce(text) { texts.push(text); return true; },
+      async leave() {}, async withdraw() {},
+    };
+    await createOrchestrator(inv({ language: 'ar' }), { lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs() })
+      .run({ leaveAfterMs: 5 });
+    check('leave-after(ar): Arabic line sent',
+      texts.length === 1 && texts[0] === 'يغادر مُدوِّن ZAKI: تم بلوغ حدّ 1 دقيقة. ستكون الملاحظات جاهزةً قريبًا.', texts[0] ?? '');
+  }
+
+  // ── a lane with no chat writer (announce absent or false) still leaves on time ──
+  {
+    const lc = recordingSink();
+    let left = 0;
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async leave() { left++; }, async withdraw() {},
+    };
+    const res = await createOrchestrator(inv(), { lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs() })
+      .run({ leaveAfterMs: 5 });
+    check('leave-after(no writer): still completed(user_limit_reached) + left',
+      res.status === 'completed' && last(lc.events).completion_reason === 'user_limit_reached' && left === 1);
+  }
+
+  // ── the generic backstop still wins when it is the tighter ceiling ──
+  {
+    const lc = recordingSink();
+    const calls: string[] = [];
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async announce() { calls.push('announce'); return true; },
+      async leave() { calls.push('leave'); }, async withdraw() {},
+    };
+    const res = await createOrchestrator(inv(), { lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs() })
+      .run({ leaveAfterMs: 60_000, maxActiveMs: 5 });
+    check('leave-after>backstop: max_bot_time_exceeded wins, no announcement',
+      last(lc.events).completion_reason === 'max_bot_time_exceeded' && !calls.includes('announce'), calls.join(','));
+  }
+
+  // ── owner limit EQUAL to the backstop: the tie still ends user_limit_reached + line ──
+  // Reachable live: an owner limit at the platform ceiling ties the bot's 4h default
+  // backstop (BOT_MAX_ACTIVE_MS unset in the chart). The leave-after timer is armed
+  // BEFORE the backstop, so same-deadline timers resolve in creation order and the
+  // bound — not the generic cap — ends the run with its announcement.
+  {
+    const lc = recordingSink();
+    const calls: string[] = [];
+    const join: JoinDriver = {
+      async join(report) { await report('awaiting_admission'); await report('active'); return 'admitted'; },
+      onRemoval() { return () => {}; },
+      async announce() { calls.push('announce'); return true; },
+      async leave() { calls.push('leave'); }, async withdraw() {},
+    };
+    const res = await createOrchestrator(inv(), { lifecycle: lc, join, pipeline: noopPipeline(), acts: noopActs() })
+      .run({ leaveAfterMs: 5, maxActiveMs: 5 });
+    check('leave-after==backstop: user_limit_reached wins the tie, line posted',
+      res.status === 'completed' && last(lc.events).completion_reason === 'user_limit_reached'
+        && calls[0] === 'announce' && calls[1] === 'leave', calls.join(','));
+  }
+
   // ── a fake transcript.v1 segment routes through the pipeline → TranscriptSink ──
   {
     const published: TranscriptSegment[] = [];

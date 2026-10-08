@@ -31,6 +31,7 @@ import type {
   RecordingSink,
   ControlPlaneProbe,
 } from './ports.js';
+import { leaveAfterAnnouncement } from './announce.js';
 
 export interface OrchestratorDeps {
   lifecycle: LifecycleSink;
@@ -58,6 +59,13 @@ export const CONTROL_PLANE_UNREACHABLE_EXIT = 3;
  *  no-seal-bump path: existing reason + liberal reason-text, LifecycleEvent additionalProperties:true). */
 export const CONTROL_PLANE_UNREACHABLE = 'control_plane_unreachable';
 
+// The bounded best-effort teardown windows (ms): a hung withdraw/announce/leave never stalls
+// the run. NAMED, not inline — the runtime's leave-after lifetime headroom (meeting-api
+// `bot_spawn/service.py` LEAVE_AFTER_HEADROOM_SEC) is sized from the announce + leave bounds.
+const WITHDRAW_BOUND_MS = 8_000;
+const ANNOUNCE_BOUND_MS = 8_000;
+const LEAVE_BOUND_MS = 8_000;
+
 export interface MeetingResult {
   exitCode: number;
   status: BotStatus;
@@ -77,6 +85,10 @@ export interface RunOptions {
   /** A hard cap on the active phase (ms). Resolves the run with max_bot_time_exceeded.
    *  Defaults to off (0) — the live composition root derives it from automaticLeave. */
   maxActiveMs?: number;
+  /** The owner-set duration bound (ms, invocation.v1 `leaveAfterMs`). Resolves the run with
+   *  `user_limit_reached` and — when the platform lane can write chat — posts the en/ar
+   *  leave line in-meeting BEFORE the leave itself. Off when absent. */
+  leaveAfterMs?: number;
 }
 
 /**
@@ -205,7 +217,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
         // `failed` (stage = the pre-active stage it was stopped in), attributed to the user stop.
         await Promise.race([
           deps.join.withdraw('stopped').catch(() => { /* best-effort */ }),
-          new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+          new Promise<void>((resolve) => setTimeout(resolve, WITHDRAW_BOUND_MS)),
         ]);
         const stage = cur === 'awaiting_admission' ? 'awaiting_admission' : 'joining';
         await emit('failed', {
@@ -247,6 +259,15 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
       inv.automaticLeave?.everyoneLeftTimeout ?? 120_000,
     ) ?? (() => { /* lane without a detector — max-active backstop bounds it */ });
     const unsubscribe = deps.acts.subscribe(handle);
+    // The owner's leave-after bound ends the run with its OWN reason, earlier than the
+    // generic backstop whenever it is the tighter ceiling (the composition root clamps it
+    // to the platform/reserve bound before it ever reaches here). It is armed FIRST so a
+    // tied deadline — an owner limit at the platform ceiling equal to the backstop, e.g.
+    // Meet's 240-min cap vs the 4h default — resolves to `user_limit_reached` and still
+    // posts the line: same-deadline timers fire in creation order.
+    const leaveAfter = opts.leaveAfterMs && opts.leaveAfterMs > 0
+      ? setTimeout(() => signalEnd?.('user_limit_reached'), opts.leaveAfterMs)
+      : null;
     const cap = opts.maxActiveMs && opts.maxActiveMs > 0
       ? setTimeout(() => signalEnd?.('max_bot_time_exceeded'), opts.maxActiveMs)
       : null;
@@ -255,9 +276,20 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
 
     // ── graceful teardown (best-effort; never masks the completion reason) ──
     if (cap) clearTimeout(cap);
+    if (leaveAfter) clearTimeout(leaveAfter);
     unsubscribe();
     stopRemoval();
     stopAloneness();
+    // A leave-after exit announces itself in-meeting BEFORE hanging up — the CEO-approved
+    // user-facing line. Best-effort and bounded: a lane with no chat writer, a failed send,
+    // or a hung evaluate must never block or delay the leave itself.
+    if (reason === 'user_limit_reached' && deps.join.announce) {
+      const text = leaveAfterAnnouncement(inv.language, opts.leaveAfterMs ?? 0);
+      await Promise.race([
+        deps.join.announce(text).catch(() => false),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ANNOUNCE_BOUND_MS)),
+      ]);
+    }
     await deps.pipeline.stop().catch(() => { /* best-effort */ });
     deps.recording?.close(recordingKey);
     // Bound the leave: a hung platform leave (e.g. a slow Zoom web-client teardown) must not stall
@@ -265,7 +297,7 @@ export function createOrchestrator(inv: Invocation, deps: OrchestratorDeps) {
     // assembly + the `completed` callback flush. Best-effort, raced against an 8s cap.
     await Promise.race([
       deps.join.leave(reason).catch(() => { /* best-effort */ }),
-      new Promise<void>((resolve) => setTimeout(resolve, 8000)),
+      new Promise<void>((resolve) => setTimeout(resolve, LEAVE_BOUND_MS)),
     ]);
 
     console.error(`[bot] orchestrator: emitting completed (reason=${reason}, from=${cur})`);
