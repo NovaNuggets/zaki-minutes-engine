@@ -129,10 +129,14 @@ def _kernel_grace_sec() -> float:
 def build_production_app():
     """Wire the runtime API with the env-selected spawn backend + the env-driven profile registry,
     plus the durable cron scheduler (REDIS_URL) with a background tick loop."""
+    from . import error_sink
     from .api import create_app
     from .config_preflight import preflight
     from .kernel import Runtime
     from .profiles import apply_command_overrides, default_registry, worker_image_for
+
+    # L-0990: error sink first (inert without SENTRY_DSN — no init, no middleware, no network).
+    error_sink_live = error_sink.init("runtime")
 
     # config.v1 boot preflight (ADR-0026): validate the declaration against the env — the runtime has
     # no required-explicit keys today, so this logs the capability tri-states (scheduler · bot_spawn ·
@@ -191,7 +195,10 @@ def build_production_app():
     for record in runtime.store.list():
         enforcer.track(record.status.workloadId)
     _start_enforcer(enforcer)
-    return create_app(runtime, scheduler=scheduler, enforcer=enforcer)
+    app = create_app(runtime, scheduler=scheduler, enforcer=enforcer)
+    if error_sink_live:
+        app.add_middleware(error_sink.ErrorSinkMiddleware)
+    return app
 
 
 def _start_enforcer(enforcer) -> None:

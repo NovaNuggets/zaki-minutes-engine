@@ -25,11 +25,15 @@ def _database_url() -> str:
 
 def build_production_app():
     """Configure the DB engine + assemble the app; converge the schema on startup."""
+    from . import error_sink
     from .app import db as app_db
     from .app.main import create_app
     from .config_preflight import preflight
     from .schema.models import Base
     from .schema.sync import ensure_schema
+
+    # L-0990: error sink first (inert without SENTRY_DSN — no init, no middleware, no network).
+    error_sink_live = error_sink.init("admin-api")
 
     # #526: refuse to boot a misconfigured deploy — a missing INTERNAL_API_SECRET makes the
     # fail-closed /internal/validate guard 503 every gateway validation hop, but the process would
@@ -44,6 +48,8 @@ def build_production_app():
         max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
     )
     app = create_app()
+    if error_sink_live:
+        app.add_middleware(error_sink.ErrorSinkMiddleware)
 
     @app.on_event("startup")
     async def _converge_schema() -> None:
