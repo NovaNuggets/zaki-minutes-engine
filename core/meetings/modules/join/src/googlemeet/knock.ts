@@ -102,6 +102,18 @@ export function markGoogleKnock(page: Page): void {
   installListeners(page, diagnostics);
 }
 
+/** Feed one line from the embedder's page-fault relay (a window `error` or
+ *  `unhandledrejection` in any frame of the page) into the knock collector.
+ *  Google can report a refused knock on that route alone, with no Playwright
+ *  `console` or `pageerror` event. It sets the same per-knock fault the two
+ *  Playwright routes set, and markGoogleKnock clears it for the next knock. */
+export function noteGooglePageFault(page: Page, line: unknown): void {
+  const text = String(line);
+  if (text.includes("DisconnectedError") && /EndCause\s*=/.test(text)) {
+    diagnosticsFor(page).disconnectedError = true;
+  }
+}
+
 /** Record that a waiting-room TEXT indicator was visible for this knock. */
 export function noteGoogleWaitingRoomTextSeen(page: Page): void {
   diagnosticsFor(page).waitingTextSeen = true;
