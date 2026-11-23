@@ -18,8 +18,11 @@
  *
  *   1  bridge route only, fault inside the "Ask to join" click
  *   3  bridge route only, the 11-23 order: ~1 s after the click, during the first admission check
+ *   3c bridge route only, 11-23 order, ONE event: a single `error`, a single `unhandledrejection`,
+ *      and a single `error` with another code (`EndCause = 5`)
  *   3b the same fault at the same moment through Playwright `console` only, then `pageerror` only
  *   N  bridged lines without `DisconnectedError` or without `EndCause =` are not a refusal
+ *   W  waiting-room text seen first, then gone, then the bridge fault: never a refusal (#73's rule)
  *
  * Run: npx tsx src/capture-bridge.knock-fault.test.ts
  */
@@ -118,7 +121,7 @@ function meetPage(s: Scenario): any {
     waitForTimeout: async (ms: number) => {
       fakeNow += ms;
       await new Promise<void>((resolve) => setImmediate(resolve));   // the real wait yields the loop
-      s.onWait?.(++waits);
+      if (clickedAt !== null) s.onWait?.(++waits);
     },
     mouse: {
       // The admission indicator check moves the pointer; its first call after the click is the
@@ -274,6 +277,28 @@ async function main(): Promise<void> {
     await session.close();
   }
 
+  // 3c. Bridge route only, the 11-23 order, ONE event of ONE type: either event alone is a refusal,
+  //     and so is any `EndCause =` code, not just 72.
+  for (const [label, type, event] of [
+    ['3c bridge, one error event', 'error', errorEvent()],
+    ['3c bridge, one unhandledrejection event', 'unhandledrejection', rejectionEvent()],
+    ['3c bridge, one error event with EndCause = 5', 'error', {
+      type: 'error', isTrusted: true,
+      error: { name: 'CustomError', message: 'Error in protected function: DisconnectedError, EndCause = 5, StartupCode = 200', stack: 'DisconnectedError: DisconnectedError, EndCause = 5, StartupCode = 200\n    at <cut>' },
+    }],
+  ] as const) {
+    let faultAt = 0;
+    const page = meetPage({ afterClick: [RETURN_BUTTON], onFirstAdmissionCheck: () => { faultAt = fakeNow; dispatch(type, event); } });
+    const { session, frame } = await bridgeFor(page);
+    const dispatch = frame();
+    const run = await runJoin(page);
+    expectRefused(label, run);
+    check(`${label}: denial within one poll cycle of the fault`, run.endedAt - faultAt <= POLL_INTERVAL_MS, true);
+    check(`${label}: exactly one [page-fault] line crossed the bridge`, run.lines.filter((l) => l.startsWith('[page] [page-fault] ')).length, 1);
+    check(`${label}: no Playwright console/pageerror event was emitted`, page.playwrightEvents, 0);
+    await session.close();
+  }
+
   // 3b. The same fault at the same moment through Playwright's `console` only — then `pageerror`
   //     only. The bridge is wired but nothing is dispatched into it.
   {
@@ -353,6 +378,31 @@ async function main(): Promise<void> {
     let threw: unknown = null;
     try { logBot!(undefined); logBot!({ m: 1 }); } catch (e) { threw = e; } finally { console.log = original; }
     check('logBot handler accepts a non-string page argument', threw === null ? 'no throw' : String(threw), 'no throw');
+    await session.close();
+  }
+
+  // W. #73's waiting-room-first rule on the bridge route: the click shows waiting-room text, the
+  //    text is gone after the first wait (never admitted), and only then does the 11-23 fault cross
+  //    the bridge. A dropped waiting room is not a refused knock: join_failure, no diagnostic.
+  //    Runs last: it waits out the window, which arms the join layer's escalation extension.
+  {
+    const page = meetPage({
+      afterClick: [WAITING_TEXT],
+      onWait: (waits) => {
+        if (waits === 1) page.show([]);
+        if (waits === 2) {
+          dispatch('error', errorEvent());
+          dispatch('unhandledrejection', rejectionEvent());
+        }
+      },
+    });
+    const { session, frame } = await bridgeFor(page);
+    const dispatch = frame();
+    const run = await runJoin(page);
+    check('W lobby, then gone, then bridge fault: both lines crossed the bridge', run.lines.filter((l) => l.startsWith('[page] [page-fault] ')).length, 2);
+    check('W lobby, then gone, then bridge fault: outcome is join_failure', outcomeOf(run), 'join_failure');
+    check('W lobby, then gone, then bridge fault: no refusal diagnostic', diagnosticsIn(run).length, 0);
+    check('W lobby, then gone, then bridge fault: awaiting_admission sent once', run.states.filter((s) => s === 'awaiting_admission').length, 1);
     await session.close();
   }
 
