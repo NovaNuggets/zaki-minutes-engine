@@ -35,7 +35,7 @@ import {
   type Page,
   type BrowserContext,
 } from '@vexa/remote-browser';
-import { getJoinBrowserArgs } from '@vexa/join';
+import { getJoinBrowserArgs, noteGooglePageFault } from '@vexa/join';
 import type { RecordingMasterFormat } from '@vexa/recording';
 import { isMixedLanePlatform, type Invocation } from './config.js';
 import type { BotPipeline } from './pipeline.js';
@@ -212,7 +212,12 @@ export async function launchBrowser(inv: Invocation): Promise<BrowserSession> {
   // calls window.logBot?.(...) ("stream N connected", "capture started with N stream(s)", …); without
   // exposing it those vanish and the capture is invisible. context.exposeFunction persists across the
   // navigation to the meeting URL. Also forward page console errors/capture markers so faults surface.
-  await context.exposeFunction('logBot', (m: string) => console.log(`[page] ${m}`)).catch(() => { /* already registered */ });
+  // Every relayed line also reaches @vexa/join's knock collector: Google's refusal of a Meet knock can
+  // arrive through the [page-fault] listener above alone, with no Playwright console/pageerror event.
+  await context.exposeFunction('logBot', (m: string) => {
+    console.log(`[page] ${m}`);
+    noteGooglePageFault(page, m);
+  }).catch(() => { /* already registered */ });
   page.on('console', (msg) => {
     const t = msg.text();
     if (/perspeaker|capture|stream|vexabrowser|audiocontext|error|fail/i.test(t)) console.log(`[page-console:${msg.type()}] ${t}`);

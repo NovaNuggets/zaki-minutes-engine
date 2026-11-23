@@ -21,7 +21,7 @@ import {
   waitForGoogleMeetingAdmission,
 } from "./admission";
 import { joinGoogleMeeting } from "./join";
-import { markGoogleKnock } from "./knock";
+import { markGoogleKnock, noteGooglePageFault } from "./knock";
 import {
   googleNameInputSelectors,
   googleJoinButtonSelectors,
@@ -489,6 +489,71 @@ async function main() {
     check('text-gone-with-fault outcome is join_failure', (error as AdmissionError)?.outcome, 'join_failure');
     const goneDiagnostics = lines.filter((line) => line.includes('Google Meet refused the join knock'));
     check('text-gone-with-fault emits no diagnostic', goneDiagnostics.length, 0);
+  }
+
+  // 12. The embedder's page-fault relay (noteGooglePageFault): ONE relayed
+  //     `[page-fault] error:` line with another code than 72 refuses the
+  //     knock. The page emits no console/pageerror event at all.
+  {
+    states.length = 0;
+    resetEscalation();
+    installFakeClock();
+    const page = mockPage([RETURN_BUTTON]);
+    markGoogleKnock(page);
+    noteGooglePageFault(
+      page,
+      '[page-fault] error: CustomError: Error in protected function: DisconnectedError, EndCause = 5, StartupCode = 200 :: DisconnectedError: …',
+    );
+
+    const { result: error, lines } = await captureLogs(async () => {
+      try {
+        await waitForGoogleMeetingAdmission(page, 6_000, {});
+        return null;
+      } catch (err) {
+        return err;
+      }
+    });
+    restoreRealClock();
+
+    check('relayed page fault outcome is denial', (error as AdmissionError)?.outcome, 'denial');
+    const relayedDiagnostics = lines.filter((line) => line.includes('Google Meet refused the join knock'));
+    check('relayed page fault emits exactly one diagnostic', relayedDiagnostics.length, 1);
+    check('relayed page fault diagnostic reason is disconnected_error', (relayedDiagnostics[0] ?? '').includes('"reason":"disconnected_error"'), true);
+    check('relayed page fault never sends awaiting_admission', states.includes('awaiting_admission'), false);
+  }
+
+  // 13. Fixture 11 on the relay route: waiting-room TEXT seen, then gone, then
+  //     a relayed fault, never admitted: join_failure, never denial.
+  {
+    states.length = 0;
+    resetEscalation();
+    installFakeClock();
+    const page = mockPage([WAITING_TEXT], {
+      onWait: (waits) => {
+        if (waits === 1) page.state.visible.delete(WAITING_TEXT);
+        if (waits === 2) {
+          noteGooglePageFault(
+            page,
+            '[page-fault] unhandledrejection: DisconnectedError: DisconnectedError, EndCause = 72, StartupCode = 200 :: …',
+          );
+        }
+      },
+    });
+    markGoogleKnock(page);
+
+    const { result: error, lines } = await captureLogs(async () => {
+      try {
+        await waitForGoogleMeetingAdmission(page, 6_000, {});
+        return null;
+      } catch (err) {
+        return err;
+      }
+    });
+    restoreRealClock();
+
+    check('text-gone-then-relayed-fault outcome is join_failure', (error as AdmissionError)?.outcome, 'join_failure');
+    const relayGoneDiagnostics = lines.filter((line) => line.includes('Google Meet refused the join knock'));
+    check('text-gone-then-relayed-fault emits no diagnostic', relayGoneDiagnostics.length, 0);
   }
 
   setHooks({});

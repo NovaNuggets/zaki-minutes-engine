@@ -138,6 +138,9 @@ export async function joinMeeting(page: Page, opts: JoinOptions): Promise<JoinRe
 
 export { joinGoogleMeeting, waitForGoogleMeetingAdmission, checkForGoogleAdmissionSilent, prepareForRecording, leaveGoogleMeet, startGoogleRemovalMonitor };
 export { startGoogleAlonenessMonitor } from "./googlemeet/removal";
+// The embedder relays its page-side fault listener's lines here: a refused Meet
+// knock can reach Node on that route alone (no Playwright console/pageerror event).
+export { noteGooglePageFault } from "./googlemeet/knock";
 // In-meeting chat send (gmeet DOM; jitsi already ships a sender inside @vexa/jitsi-capture's
 // `sendJitsiChatMessage` on the page's own conference API). Teams/Zoom have no writer yet —
 // their join-driver `announce` reports false and the leave proceeds without a line.
